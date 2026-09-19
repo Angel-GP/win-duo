@@ -139,9 +139,8 @@ powershell -ExecutionPolicy Bypass -File tools\setup_env.ps1
 
 ## 许可
 
-**GPL-3.0**，见 [LICENSE](LICENSE)。因为依赖 PyQt6（GPL-3.0-only）与
-PyQt6-Fluent-Widgets（GPL-3.0），整个衍生作品必须跟着 GPL-3.0。
+**GPL-3.0**，见 [LICENSE](LICENSE)（含完整许可证正文）。因为依赖 PyQt6（GPL-3.0-only）
+与 PyQt6-Fluent-Widgets（GPL-3.0），整个衍生作品必须跟着 GPL-3.0。
 
 动画渲染衍生自 [WindowsDuo](https://github.com/KaedeharaKazuha1029/WindowsDuo)（MIT），
-其版权声明保留在 LICENSE 中。完整第三方依赖清单见
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+其版权声明与完整第三方依赖清单见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

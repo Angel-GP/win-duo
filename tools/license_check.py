@@ -99,13 +99,24 @@ def main():
     for pkg, lics in COPYLEFT.items():
         check("%s 标了 %s" % (pkg, lics.split("-")[0]), pkg in src and "GPL" in src)
     check("LICENSE 明确声明 GPL-3.0", "GPL-3.0" in lic or "GPLv3" in lic)
+    # GPL-3.0 §4 要求随程序附上**许可证完整正文**, 只给一个 URL 不合规。
+    # 所以这里卡死"正文在不在", 而不是只看有没有写 "GPL-3.0" 这几个字。
+    check("LICENSE 含 GPL-3.0 完整正文",
+          "GNU GENERAL PUBLIC LICENSE" in lic
+          and "Version 3, 29 June 2007" in lic
+          and "TERMS AND CONDITIONS" in lic
+          and "END OF TERMS AND CONDITIONS" in lic
+          and "How to Apply These Terms" in lic,
+          "%d 行" % lic.count("\n"))
     check("README 也说明了 GPL-3.0", "GPL-3.0" in rd)
     check("写明了改用宽松许可的条件", "PySide6" in src)
 
     print("\n⑥ 上游出处是否如实:")
     check("列了 WindowsDuo (MIT)", "WindowsDuo" in src and "MIT" in src)
-    check("MIT 版权声明原样保留", "KaedeharaKazuha1029" in lic
-          and "Permission is hereby granted" in lic)
+    # MIT 要求保留版权声明 + 许可声明。现在 LICENSE 是纯 GPL 正文, 所以这两样
+    # 落在 THIRD_PARTY_NOTICES.md 里 —— 校验要跟着改, 否则会误报。
+    check("MIT 版权声明原样保留", "KaedeharaKazuha1029" in src
+          and "Permission is hereby granted" in src)
 
     print("\n⑦ 文档里的最低版本要求不高于实际装的:")
     # 文档写的是**最低要求** (如 `Pillow>=10.0`), 实际装的通常更高 (11.3)。

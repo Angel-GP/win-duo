@@ -54,10 +54,35 @@ win-duo 使用了以下开源软件。**分发本程序时必须一并保留本�
 
 - 仓库：<https://github.com/KaedeharaKazuha1029/WindowsDuo>
 - 许可：MIT License，Copyright (c) 2026 KaedeharaKazuha1029
-- 用途：**动画效果的来源**。`render/shader.py`、`render/overlay.py`、
-  `render/capture.py` 的逆投影"悬浮玻璃"渲染方式移植自它。
+- 用途：**动画效果的来源**。`render/shader.py`、`render/overlay.py` 的逆投影
+  「悬浮玻璃」渲染方式衍生自它。
 
-其原始版权声明已逐字保留在 [LICENSE](LICENSE) 中（MIT 要求保留）。
+MIT 要求「上述版权声明和本许可声明应包含在本软件的所有副本或实质性部分中」，
+故其原文**逐字保留**如下（本项目自身以 GPL-3.0 发布，见 [LICENSE](LICENSE)）：
+
+```
+MIT License
+
+Copyright (c) 2026 KaedeharaKazuha1029
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 `windowsduo` 自己的着色器又是以下项目的融合复刻，**均为 MIT**：
 
@@ -97,9 +122,9 @@ win-duo 使用了以下开源软件。**分发本程序时必须一并保留本�
 2. 移除 `PyQt6-Fluent-Widgets` 依赖 —— 代码已经支持，设 `WIN_DUO_NO_FLUENT=1`
    即走普通 Qt + QSS 的界面路径，该路径有回归测试覆盖
    （`tools/ui_test.py`）；
-3. 从 [LICENSE](LICENSE) 里删掉上游 WindowsDuo 的 MIT 版权声明段
-   （MIT 允许这么做，但**只在不再包含其衍生代码时**才成立 —— 也就是说你得
-   重写着色器，或用别的方式实现那个逆投影效果）。
+3. 去掉 [C.1](#c1-windowsduo--mit-) 里上游 WindowsDuo 的 MIT 声明段，并重写
+   `render/shader.py` / `render/overlay.py`（MIT 允许删除声明，但**只在不再包含
+   其衍生代码时**才成立 —— 也就是说你得用别的方式实现那个逆投影效果）。
 
 ---
 
@@ -125,8 +150,8 @@ GL 初始化这些必然写法占了大部分，属于"看过它之后自己写�
 `render/capture.py`、`angles/serial_source.py` 与对应上游几乎没有重合，是本项目
 为解决实际问题新写的（DXGI 抓屏、冻结帧检测、后端回退、串口角度源）。
 
-前两行是 MIT，**允许**衍生，只要保留版权声明 —— 完整 MIT 原文在
-[LICENSE](LICENSE) 末尾，请勿删除。
+前两行是 MIT，**允许**衍生，只要保留版权声明 —— 完整 MIT 原文见上面的
+[C.1 节](#c1-windowsduo--mit-)，请勿删除。
 
 最后一列是实测的文本相似度，用 `difflib.SequenceMatcher` 算的。列出来是为了
 让"哪些是衍生、哪些是重写"有据可查，而不是靠声称。
