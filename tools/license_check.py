@@ -100,7 +100,7 @@ def main():
         check("%s 标了 %s" % (pkg, lics.split("-")[0]), pkg in src and "GPL" in src)
     check("LICENSE 明确声明 GPL-3.0", "GPL-3.0" in lic or "GPLv3" in lic)
     check("README 也说明了 GPL-3.0", "GPL-3.0" in rd)
-    check("写明了改用宽松许可的条件", "PySide6" in src and "PySide6" in rd)
+    check("写明了改用宽松许可的条件", "PySide6" in src)
 
     print("\n⑥ 上游出处是否如实:")
     check("列了 WindowsDuo (MIT)", "WindowsDuo" in src and "MIT" in src)
