@@ -98,7 +98,10 @@ def main():
     print("\n⑤ GPL 传染性链条是否说清了:")
     for pkg, lics in COPYLEFT.items():
         check("%s 标了 %s" % (pkg, lics.split("-")[0]), pkg in src and "GPL" in src)
-    check("LICENSE 明确声明 GPL-3.0", "GPL-3.0" in lic or "GPLv3" in lic)
+    # LICENSE 现在是**纯 GPL-3.0 正文** (前面不加说明段, 否则 GitHub 的 licensee
+    # 哈希匹配不上, 会被标成 NOASSERTION)。所以"GPL-3.0"这几个字在声明文件里查,
+    # LICENSE 里查的是**正文标志**, 见下一条。
+    check("本项目声明了 GPL-3.0", "GPL-3.0" in src or "GPLv3" in src)
     # GPL-3.0 §4 要求随程序附上**许可证完整正文**, 只给一个 URL 不合规。
     # 所以这里卡死"正文在不在", 而不是只看有没有写 "GPL-3.0" 这几个字。
     check("LICENSE 含 GPL-3.0 完整正文",
@@ -108,6 +111,10 @@ def main():
           and "END OF TERMS AND CONDITIONS" in lic
           and "How to Apply These Terms" in lic,
           "%d 行" % lic.count("\n"))
+    # 正文必须**从头开始** —— 前面挂一段自己的说明会让 GitHub 识别不出 GPL-3.0
+    check("LICENSE 以正文开头(便于自动识别)",
+          lic.lstrip().startswith("GNU GENERAL PUBLIC LICENSE"),
+          lic.splitlines()[0].strip()[:40] if lic.strip() else "(空)")
     check("README 也说明了 GPL-3.0", "GPL-3.0" in rd)
     check("写明了改用宽松许可的条件", "PySide6" in src)
 

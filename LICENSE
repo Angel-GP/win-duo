@@ -1,16 +1,3 @@
-win-duo
-=======
-
-本项目以 GNU General Public License version 3 (GPL-3.0) 发布。
-
-原因：依赖 PyQt6 (GPL-3.0-only) 与 PyQt6-Fluent-Widgets (GPL-3.0)，二者都是强传染性
-copyleft，链接并分发它们，整个衍生作品就必须跟着 GPL-3.0。
-
-下面第 4 节起是 GPL-3.0 的完整正文（分发时必须随附）。
-第三方组件清单见 THIRD_PARTY_NOTICES.md，上游 WindowsDuo 的 MIT 声明也在那里。
-
---------------------------------------------------------------------------------
-
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

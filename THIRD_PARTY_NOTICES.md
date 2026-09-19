@@ -113,8 +113,12 @@ SOFTWARE.
 
 ## D. 本项目的许可证
 
-由于依赖 **PyQt6（GPL-3.0-only）** 与 **PyQt6-Fluent-Widgets（GPL-3.0）**，
-本项目作为衍生作品**整体以 GPL-3.0 发布**。详见 [LICENSE](LICENSE)。
+**本项目以 GNU General Public License version 3（GPL-3.0）发布。**
+完整许可证正文见 [LICENSE](LICENSE)（该文件是 GPL-3.0 正文本身，请勿改动）。
+
+原因：依赖 **PyQt6（GPL-3.0-only）** 与 **PyQt6-Fluent-Widgets（GPL-3.0）**，
+二者都是强传染性 copyleft，链接并分发它们，本项目作为衍生作品必须整体以
+GPL-3.0 发布。
 
 如果你想改用更宽松的许可证（例如 MIT），需要同时满足：
 
