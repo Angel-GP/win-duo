@@ -1,0 +1,30 @@
+# venv 与安装缓存: setup_env.ps1 建在工作区内, 不入库
+.venv/
+.tmp/
+.pipcache/
+
+__pycache__/
+*.pyc
+
+# 运行产物: 都能用 tools/ 里的脚本重新生成
+smoke_widget.png
+smoke_grab.png
+smoke_frame.png
+*_log.txt
+dbg*.txt
+*.log
+
+# 本地背景图 (用户自己的壁纸)
+desk_bg.png
+
+# 摄像头自检输出的画面
+frame_camera_probe.png
+
+# 着色器对照图 (offscreen_test.py 生成, 每次跑都重画)
+offscreen_tilt*.png
+
+# PyInstaller 打包产物: exe 约 94MB, 不该进仓库
+# (发布时另外传 release, 或让用户自己跑 tools/build_exe.py)
+build/
+dist/
+*.spec

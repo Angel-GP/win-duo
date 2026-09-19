@@ -1,0 +1,458 @@
+"""桌面截屏。
+
+**优先走 DXGI Desktop Duplication，退回 GDI BitBlt (mss)。**
+
+为什么换: mss 走 GDI BitBlt, 每次都把整屏重拷一遍。本机 2560x1600 实测:
+
+    后端          单帧耗时    实际帧率上限
+    mss          27~29 ms     ~37 Hz
+    bettercam    1.1 ms       ~156 Hz   (DXGI, output_color="BGRA")
+
+真正能拿到的帧率上限是**显示器刷新率** (本机 165Hz) —— 合成器每秒最多产
+那么多帧。mss 那 29ms 才是瓶颈, 换掉之后上限就抬到刷新率了。
+
+后端返回 None 只表示"这一瞬没有新帧", 按目标频率继续跑即可。
+
+**别再做"内容有没有变"的过滤。** 我加过一个全图平均差的静止检测
+(`_signature_changed`, 阈值 1.5), 结果把整个画面冻死了: 日常操作
+(打字、滚动、小窗口刷新) 只影响几万像素, 摊到 400 万像素上平均差只有
+**0.2~0.3**, 永远够不到 1.5 —— 于是帧号永不推进, 玻璃层停在第一帧。
+
+注意 DPI: DXGI 报的是**物理**像素, 但只在进程 DPI-aware 时才准, 否则
+Windows 会按缩放比例虚拟化 (本机 2560x1600 会变成 1707x1067)。运行
+`ensure_dpi_aware()` 兜底。
+"""
+import ctypes
+import sys
+import threading
+import time
+
+import mss
+import numpy as np
+
+
+def ensure_dpi_aware():
+    """让 DXGI 报出物理分辨率。
+
+    Qt 一般已经设过; mss 在初始化时也会设。这里再兜一次底, 因为进程一旦先
+    建了 DXGI 设备、后设 DPI 感知, 拿到的尺寸就是错的, 分辨率匹配会失败。
+    """
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _co_initialize():
+    """在当前线程初始化 COM (STA)。返回 True 表示"该由我们负责反初始化"。
+
+    **为什么必须显式做**: `bettercam` 通过 comtypes 调 DXGI 的 COM 接口, 而
+    comtypes **不会**自己 `CoInitialize` —— 翻过 bettercam 源码, CoInitialize
+    出现 **0 次**。而 COM 是**按线程**初始化的:
+
+      - 主线程能用, 是因为 Qt 启动时已经替它初始化过了;
+      - 采集线程是我们自己建的, 没人给它初始化 —— 在里面调 DXGI 会直接
+        **native 崩溃** (0xC0000409), Python 侧连异常都抓不到, 只看到
+        "Unhandled Python exception"。
+
+    实测症状: 玻璃层一显示、采集线程起来抓第一帧时进程就没了; 而
+    `tools/capture_backend_test.py` 里几乎一样的代码却好好的 —— 差别就是
+    那个测试是在**主线程**里调的。查了好几轮才定位到。
+
+    参数用 `COINIT_APARTMENTTHREADED` (STA): DXGI 的桌面复制接口要求 STA。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        # 0x2 = COINIT_APARTMENTTHREADED, 0x4 = COINIT_DISABLE_OLE1DDE
+        hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2 | 0x4)
+    except Exception:  # noqa: BLE001
+        return False
+    if hr in (0, 1):            # S_OK / S_FALSE (本线程已初始化过)
+        return True
+    # RPC_E_CHANGED_MODE (0x80010106 -> 有符号 -2147417850): 线程已经是别的
+    # 模式了, 不是错误, 只是不该由我们反初始化。
+    return False
+
+
+def _co_uninitialize():
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.ole32.CoUninitialize()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def frame_bgr(frame):
+    """把帧转成 cv2 用的 BGR ndarray。DXGI 给 BGRA, mss 给 BGRA。
+
+    ⚠️ **必须返回"连续且可写"的数组。** 这里踩过一个会**崩进程**的坑:
+
+    原来的写法是 `np.frombuffer(data, ...).reshape(h, w, 4)[:, :, :3]`。
+    - `np.frombuffer` 对 **ndarray** 也能成功 (走缓冲协议), 但它返回的是
+      **只读视图**, 底层并不拥有数据;
+    - 最后那个 `[:, :, :3]` 是**跨步切片, 内存不连续** (每行跳过第 4 个通道)。
+
+    把这个非连续只读视图交给 OpenCV (`cv2.resize` / `cv2.GaussianBlur`) 时,
+    OpenCV 在 native 层按"连续三通道"去读 —— **直接崩**, Python 侧一个异常
+    都看不到 (`Unhandled Python exception`, 退出码 0xC0000409)。
+
+    触发路径: 玻璃层第一次上传纹理后 `_build_backdrop` -> `_fallback_backdrop`
+    -> 这里 -> `cv2.resize`。所以表现为"玻璃层一显示就整个崩掉"。
+
+    现在统一走 `np.ascontiguousarray(...)` 把切片拷成连续数组 —— 顺便也拿到
+    了可写性。代价是一次 12MB 的拷贝 (只在建背景图时发生一次, 不在每帧路径上)。
+    """
+    data, w, h, _seq, fmt = frame
+    if fmt == "RGBA":
+        arr = np.asarray(data)
+        return np.ascontiguousarray(arr[:, :, 2::-1])      # RGB -> BGR
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)
+    else:
+        arr = np.asarray(data).reshape(h, w, 4)
+    # 切片是跨步的, 交给 OpenCV 之前必须拷成连续内存 (见上面说明)
+    return np.ascontiguousarray(arr[:, :, :3])
+
+
+class _DxgiSource:
+    """DXGI Desktop Duplication 封装 (bettercam 优先, 退化到 dxcam)。"""
+
+    #: **必须用 BGRA。** DXGI 桌面复制的原生格式就是 BGRA; 请求 RGBA 会让
+    #: bettercam 在 16MB 缓冲上多做一次逐像素换 R/B, 实测单次调用从 1.12ms
+    #: 涨到 4.42ms —— 而 4ms 直接把采集线程忙住, 重截频率就上不去了。
+    #: 顺带好处: 和 mss 的 BGRA 统一, frame_bgr() 只剩一条路径。
+    COLOR = "BGRA"
+
+    #: 连续错这么多次才认定 DXGI 真的坏了 (掉回 mss 的代价是每帧 30ms, 别轻易)
+    MAX_ERRORS = 5
+
+    def __init__(self, size):
+        self.mod = None
+        self.cam = None
+        self.name = ""
+        self.output_idx = 0
+        self.errors = 0
+        for name in ("bettercam", "dxcam"):
+            try:
+                mod = __import__(name)
+            except Exception:  # noqa: BLE001
+                continue
+            if self._open_matching(mod, size):
+                return
+        raise RuntimeError("DXGI 不可用 (没装 bettercam/dxcam, 或没有分辨率匹配的显示器)")
+
+    def _open_matching(self, mod, size):
+        """边探测边保留: 找到分辨率匹配的 output 就**直接留着用**。
+
+        不能"先遍历一遍探测、再 create 一次" —— bettercam 对同一个 output
+        返回的是**单例**, 探测时 release() 掉的正是后面要用的那个对象, 结果
+        拿到手的是个已销毁的 camera (`'NoneType' has no attribute
+        'AcquireNextFrame'`)。
+        多显示器时也不能假定 0 就是目标屏: 本机 output 0 是 2560x1600,
+        output 1 是 1920x1080, 选错整张图就错位。
+        """
+        try:
+            count = len([ln for ln in mod.output_info().strip().splitlines()
+                         if ln.strip()])
+        except Exception:  # noqa: BLE001
+            count = 1
+        for idx in range(max(1, count)):
+            try:
+                cam = mod.create(output_idx=idx, output_color=self.COLOR)
+            except Exception:  # noqa: BLE001
+                continue
+            wh = (getattr(cam, "width", 0), getattr(cam, "height", 0))
+            if not size or wh == tuple(size):
+                self.mod, self.cam, self.name, self.output_idx = mod, cam, mod.__name__, idx
+                return True
+            try:                                   # 不是目标屏, 放掉继续找
+                cam.release()
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    def grab(self):
+        """返回 (h, w, 4) 的 RGBA ndarray; 桌面没变时返回 None。
+
+        DXGI 偶发 `DXGI_ERROR_INVALID_CALL` (输出切换、桌面锁定、上一帧没来得及
+        释放等)。这种情况**不要立刻放弃 DXGI** —— 掉回 mss 就是每帧 30ms,
+        代价太大。先容忍几次 (期间当作"没有新帧", 渲染层会继续用上一帧),
+        连续失败才真的抛出去让上层退回 mss。
+        """
+        if self.cam is None:
+            raise RuntimeError("DXGI camera 已释放")
+        try:
+            frame = self.cam.grab()
+        except Exception as exc:  # noqa: BLE001
+            self.errors += 1
+            if self.errors >= self.MAX_ERRORS:
+                raise
+            print("[capture] DXGI 抓帧出错 (%d/%d), 先当作没有新帧: %s"
+                  % (self.errors, self.MAX_ERRORS, exc))
+            return None
+        self.errors = 0
+        return frame
+
+    def release(self):
+        if self.cam is not None:
+            try:
+                self.cam.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self.cam = None
+
+
+class CaptureWorker(threading.Thread):
+    def __init__(self, region, size=None, backend="auto", display_hz=60.0):
+        super().__init__(daemon=True, name="capture")
+        self.region = region
+        self.size = tuple(size) if size else (region.get("width"), region.get("height"))
+        self.want_backend = backend
+        self.display_hz = float(display_hz or 60.0)
+
+        self.request = threading.Event()
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.frame = None          # (data, w, h, seq, "BGRA")
+        self.busy = False
+        # **不能叫 `_stop`** —— threading.Thread 内部有个 `_stop()` 方法,
+        # 用同名属性会把它遮蔽掉, `join()` 一调就
+        # `TypeError: 'bool' object is not callable`。踩过一次。
+        self._halt = False
+        self.last_ms = 0.0
+        self.backend = "?"
+        self._dxgi = None
+        self._sct = None
+        # 实测计数: 用来回答"设了 137Hz 到底跑到了多少"
+        self.kicks = 0
+        self.pumps = 0
+        self.grabs = 0
+        #: 后端真正返回了数组的次数 (None = 那一瞬没有新帧)
+        self.frames_in = 0
+        self.rate_hz = 0.0
+        self._rate_t = time.time()
+        self._rate_n = 0
+        #: >0 时采集线程**自己连续跑** (按这个频率), 不走 kick 往返。
+        #: "主线程 kick -> 唤醒线程 -> 抓 -> 回信"一个来回要 ~7ms, 这条路
+        #: 只能跑到 ~100 次/秒; 设 137 就永远差一截。连续模式绕开这个开销。
+        #: 玻璃层关着/收起来时由渲染层置 0, 线程回到等待状态, 不白烧 CPU。
+        self.target_hz = 0.0
+
+    # ------------------------------------------------------------ 生命周期
+    def _open(self):
+        """幂等 —— start() 里会调一次, 外部也可能先调一次做探测。
+
+        不幂等的话第二次会再走一遍 _DxgiSource 的探测, 而 bettercam 是**单例**,
+        探测时的 release() 会把手上正在用的 camera 销毁掉。
+        """
+        if self.backend != "?":
+            return
+        ensure_dpi_aware()
+        if self.want_backend in ("auto", "dxgi"):
+            try:
+                self._dxgi = _DxgiSource(self.size)
+                self.backend = self._dxgi.name
+                print("[capture] 后端 %s (DXGI), output=%d, %dx%d"
+                      % (self._dxgi.name, self._dxgi.output_idx, *self.size))
+                return
+            except Exception as exc:  # noqa: BLE001
+                if self.want_backend == "dxgi":
+                    print("[capture] DXGI 不可用: %s" % exc)
+                else:
+                    print("[capture] DXGI 不可用, 退回 mss: %s" % exc)
+        self.backend = "mss"
+        self._sct = mss.mss()
+        print("[capture] 后端 mss (GDI BitBlt), %dx%d" % self.size)
+
+    def _drop_dxgi(self):
+        if self._dxgi is not None:
+            self._dxgi.release()
+            self._dxgi = None
+        if self._sct is None:
+            self._sct = mss.mss()
+        self.backend = "mss"
+
+    def stop(self):
+        """停掉采集线程。
+
+        **必须先等线程退出再释放设备。** 连续模式下线程一直在 native 层跑
+        `grab()`, 从主线程直接 `release()` 会让它踩到已释放的对象 ——
+        实测直接 `access violation reading 0x...168`, 而且是 native 崩溃,
+        Python 侧什么都抓不到。改成"先停后等, 再释放"。
+        """
+        self._halt = True
+        self.target_hz = 0.0
+        self.request.set()
+        if self.is_alive():
+            self.join(timeout=2.0)
+        if self._dxgi is not None:
+            self._dxgi.release()
+        if self._sct is not None:
+            try:
+                self._sct.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sct = None
+
+    # ------------------------------------------------------------ 能力查询
+    def max_hz(self):
+        """重截频率的**最高可用值** —— 就是显示器刷新率。
+
+        合成器每秒最多产出那么多帧, 抓得再勤也拿不到更新的画面。所以这是一个
+        **固定值** (本机 165Hz), 不随负载浮动。
+
+        DXGI 抓一帧只要 0.1ms, 完全跟得上; 万一退回了 mss (没装 bettercam),
+        实际只跑得到 ~37Hz —— 但上限仍然按刷新率给: 那是"可用"的目标, 填高了
+        也不会出错 (采集线程忙的时候 `kick()` 会自己跳过)。
+        """
+        return max(60.0, self.display_hz)
+
+    def latest(self):
+        with self.lock:
+            return self.frame
+
+    def kick(self):
+        if not self.busy:
+            self.kicks += 1
+            self.request.set()
+
+    def set_region(self, region):
+        with self.lock:
+            self.region = region
+            self.size = (region.get("width"), region.get("height"))
+            self.frame = None
+        self.kick()
+
+    # ------------------------------------------------------------ 主循环
+    def run(self):
+        # **必须在采集线程里初始化 COM。**
+        # bettercam 底层是 DXGI 的 COM 接口 (通过 comtypes 调), 而 comtypes
+        # 自己**不会** CoInitialize —— 实测 bettercam 源码里 CoInitialize
+        # 出现 0 次。
+        # 主线程能用是因为 Qt 早就替它初始化过了; 采集线程是新线程, COM 是
+        # **按线程**初始化的, 没初始化就在里面调 DXGI 会直接 native 崩溃
+        # (0xC0000409, Python 侧抓不到任何异常, 只看到 "Unhandled Python
+        # exception")。这就是"玻璃层一显示、截屏线程起来就崩"的原因。
+        com_ready = _co_initialize()
+        try:
+            self._open()
+        except Exception:  # noqa: BLE001
+            if com_ready:
+                _co_uninitialize()
+            raise
+        seq = 0
+        try:
+            seq = self._run_loop(seq)
+        finally:
+            if com_ready:
+                _co_uninitialize()
+
+    def _run_loop(self, seq):
+        while not self._halt:
+            hz = self.target_hz
+            if hz <= 0:
+                # 空闲: 等主线程 kick (玻璃层关着/收起来了, 不要白烧)。
+                # 超时说明**没人叫我**, 直接回去等 —— 别顺手抓一帧, 那样
+                # 空闲时也会以 1/timeout 的频率白抓。
+                if not self.request.wait(timeout=0.5):
+                    continue
+                self.request.clear()
+                if self._halt:
+                    break
+            t0 = time.perf_counter()
+            self.busy = True
+            try:
+                self.pumps += 1
+                # 实测**抓屏速率** (每秒抓了几次)。这才是"重截频率"的真实值;
+                # 别用 _store 的次数 —— 那只是"内容真的变了"的帧数, 桌面静止
+                # 时近乎 0, 看起来像"帧率 0"。
+                _now = time.time()
+                if _now - self._rate_t >= 0.5:
+                    self.rate_hz = self._rate_n / (_now - self._rate_t)
+                    self._rate_t, self._rate_n = _now, 0
+                self._rate_n += 1
+                seq = self._pump_once(seq)
+            except Exception as exc:  # noqa: BLE001
+                print("[capture] 抓屏失败: %s" % exc)
+                time.sleep(0.05)
+            finally:
+                self.busy = False
+                self.done.set()
+            if hz > 0:
+                spare = (1.0 / hz) - (time.perf_counter() - t0)
+                if spare > 0:
+                    time.sleep(spare)
+        if self._dxgi is not None:
+            self._dxgi.release()
+
+    def _pump_once(self, seq):
+        if self._dxgi is not None:
+            t0 = time.perf_counter()
+            try:
+                arr = self._dxgi.grab()
+            except Exception as exc:  # noqa: BLE001
+                print("[capture] DXGI 出错, 退回 mss: %s" % exc)
+                self._drop_dxgi()
+                arr = None
+            if arr is not None:
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                self.last_ms = elapsed if self.last_ms <= 0 else \
+                    self.last_ms * 0.8 + elapsed * 0.2
+                self.frames_in += 1
+                return self._store(arr, arr.shape[1], arr.shape[0], seq + 1, "BGRA")
+            # 没帧 = 这一瞬没有新帧
+            if self.frame is None:
+                # 初始兜底种子帧
+                self._grab_mss(seq)
+            return seq
+        return self._grab_mss(seq)
+
+    def _grab_mss(self, seq):
+        if self._sct is None:
+            self._sct = mss.mss()
+        t0 = time.perf_counter()
+        shot = self._sct.grab(self.region)
+        raw = shot.raw
+        if self._dxgi is None:
+            self.last_ms = (time.perf_counter() - t0) * 1000.0
+        return self._store(raw, shot.width, shot.height, seq + 1, "BGRA")
+
+    def _store(self, data, w, h, seq, fmt):
+        # **DXGI 的数组不拥有自己的内存** —— bettercam 只维护几个缓冲轮换
+        # (`flags["OWNDATA"] == False`, 实测只有 3 个 id 交替)。必须**真的拷贝
+        # 一份**再存, 否则渲染层上传纹理时读到的是已经被下一次 grab 覆写的
+        # 内存 —— 轻则撕裂、看到旧图, 重则踩到失效缓冲**直接 native 崩溃**
+        # (0xC0000409, Python 侧抓不到)。
+        #
+        # ⚠️ **不能用 `np.ascontiguousarray`**: 它对"内存已经连续"的数组
+        # **原样返回、不做拷贝**。而 bettercam 给的数组恰好就是 C_CONTIGUOUS,
+        # 于是 `ascontiguousarray` 返回同一个对象 (`b is a == True`, data 指针
+        # 完全相同, OWNDATA 仍然是 False) —— 那个"保护"从来就没生效过。
+        # 我原来就是这么写的, 一直以为有拷贝, 直到它真的崩了才量出来。
+        # 必须用 `.copy()` (或用 `np.array(..., copy=True)`)。
+        # 16MB 拷一次约 1.5~3ms, 在 refresh_hz=30 下可接受 —— 这是**正确性**
+        # 的成本, 不能省。
+        if not isinstance(data, (bytes, bytearray)):
+            arr = np.asarray(data)
+            if not arr.flags["OWNDATA"]:
+                data = arr.copy()
+        with self.lock:
+            self.frame = (data, w, h, seq, fmt)
+        self.grabs += 1
+        return seq
+
+
+def make_capture(region, cfg, display_hz=60.0):
+    """按 config 建 CaptureWorker。三个调用点共用, 免得哪天漏传参数。"""
+    return CaptureWorker(
+        region,
+        size=(region.get("width"), region.get("height")),
+        backend=str(cfg.get("capture_backend", "auto")),
+        display_hz=float(display_hz or 60.0))

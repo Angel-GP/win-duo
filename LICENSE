@@ -1,0 +1,102 @@
+win-duo —— 折叠屏「悬浮玻璃」模拟器
+=====================================
+
+  实现方式: 笔记本上盖摄像头 ORB 特征匹配测开合角 (独立实现)
+
+  动画效果: 衍生自 WindowsDuo
+            https://github.com/KaedeharaKazuha1029/WindowsDuo
+            PyQt6 + GLSL 逆投影「悬浮玻璃」
+            MIT License, Copyright (c) 2026 KaedeharaKazuha1029
+
+本项目的对外许可证是 **GPL-3.0**（原因见下）。上游 WindowsDuo 的 MIT 版权
+声明按 MIT 的要求一并保留在本文件中。
+
+
+为什么是 GPL-3.0
+----------------
+
+本项目依赖:
+
+  PyQt6                  GPL-3.0-only
+  PyQt6-Fluent-Widgets   GPL-3.0
+
+二者都是强传染性的 copyleft 许可证。链接并分发它们，整个衍生作品就必须以
+GPL-3.0 发布，不能是 MIT。详见 THIRD_PARTY_NOTICES.md 的 D 节 —— 那里也写了
+如果想改用宽松许可证需要怎么做。
+
+
+出处与移植关系
+--------------
+
+1. render/shader.py, render/overlay.py
+   衍生自 WindowsDuo (MIT) —— 实测文本相似度 87% / 17%。
+   其原始版权声明保留在下方。
+   (render/capture.py、angles/serial_source.py 为本项目自写,
+    与对应上游仅 2% / 7% 重合)
+
+   WindowsDuo 自身的着色器又是以下项目的融合复刻，均为 MIT:
+     elijah-semyonov/DuoLikeAnimation   MIT
+     chuspeeism/iphone-duo              MIT
+     DhananjayBhosale/MacDuo            MIT
+     askmaddyy/FrostFold                MIT
+
+2. angles/camera.py  —— **本项目独立实现**
+
+   摄像头测角是本项目独立实现的, 数学路线自成一套:
+
+   | 环节 | 本项目的做法 |
+   |---|---|
+   | 求旋转 | 归一化平面上的 **Kabsch/SVD** (3 自由度), 见 `solve_rotation` |
+   | 取角度 | 把旋转向量**投影到铰链轴**上, 见 `angle_about_axis` |
+   | 抗漂移 | 按角度均匀采样 + **回访绝对校正**, 见 `_visit_correction` |
+   | 参考帧 | 滞后重建 + 失败时重建, 累积角不丢 |
+   | 内点判据 | RANSAC 的**角度**残差 |
+
+   验证见 tools/tracker_test.py —— 稳态测角误差 0.02 度, 往返归零 0.02 度。
+
+3. 其余代码 (ui/, tools/, main.py, angles/hub.py 等) 为本项目新增。
+
+
+第三方组件清单
+--------------
+
+见 THIRD_PARTY_NOTICES.md。分发时必须一并保留该文件。
+
+
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+Everyone is permitted to copy and distribute verbatim copies
+of this license document, but changing it is not allowed.
+
+本项目的完整 GPL-3.0 文本:
+  https://www.gnu.org/licenses/gpl-3.0.txt
+  （GitHub 会依据本文件的声明自动识别为 GPL-3.0）
+
+
+--------------------------------------------------------------------------------
+上游 WindowsDuo 的 MIT 版权声明（按 MIT 要求原样保留）
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 KaedeharaKazuha1029
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
