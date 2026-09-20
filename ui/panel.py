@@ -226,10 +226,14 @@ class SettingsPanel(QWidget):
         self._adv_dialog = QDialog(self)
         self._adv_dialog.setWindowTitle("win-duo 高级设置")
         self._adv_dialog.setWindowIcon(make_icon())
-        self._adv_dialog.setFixedWidth(430)
-        # 去掉问号帮助按钮, 保留关闭
+        # 可缩放 / 可最大化 (只给最小尺寸, 不锁宽)
+        self._adv_dialog.setMinimumSize(400, 320)
+        self._adv_dialog.resize(430, 400)
+        # Qt 的 QDialog 默认旗标**不含**最大化/最小化按钮, 要显式加上才能最大化。
         self._adv_dialog.setWindowFlags(
-            self._adv_dialog.windowFlags()
+            (self._adv_dialog.windowFlags()
+             | Qt.WindowType.WindowMinimizeButtonHint
+             | Qt.WindowType.WindowMaximizeButtonHint)
             & ~Qt.WindowType.WindowContextHelpButtonHint)
         body = QVBoxLayout(self._adv_dialog)
         body.setContentsMargins(16, 14, 16, 14)
@@ -330,7 +334,9 @@ class SettingsPanel(QWidget):
     # ---------------------------------------------------------- 状态行
     def _build_status(self):
         self.lbl_status = CaptionLabel("")
-        self.lbl_status.setWordWrap(True)
+        # 单行 + 超出省略号 —— 关掉自动换行, 否则状态一长就折成两三行、占掉
+        # 窗口底部一大块高度。文本在 _refresh_status 里按当前宽度 elide。
+        self.lbl_status.setWordWrap(False)
         self.lbl_status.setObjectName("hint")
         return self.lbl_status
 
@@ -468,7 +474,11 @@ class SettingsPanel(QWidget):
             if "angle" in detail:
                 bits.append("%.1f°" % detail["angle"])
         bits.append("浓度 %.0f%%" % ((level or 0) * 100))
-        self.lbl_status.setText("  ·  ".join(b for b in bits if b))
+        text = "  ·  ".join(b for b in bits if b)
+        # 单行显示, 放不下就省略号截断 (宽度变化时实时重算)
+        fm = self.lbl_status.fontMetrics()
+        avail = max(80, self.lbl_status.width() or (self.width() - 36))
+        self.lbl_status.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, avail))
         self._loading = True
         self.sw_glass.setChecked(self.controller.glass_on)
         self.lbl_glass_state.setText("显示中" if self.controller.glass_on else "待机")
@@ -490,8 +500,12 @@ class SettingsPanel(QWidget):
     def _open_advanced(self):
         """弹出高级设置窗 (modeless, 跟随主窗但不阻塞)。"""
         d = self._adv_dialog
+        first = not d.isVisible()
         d.show()
-        d.adjustSize()          # 贴合当前页内容
+        if first:
+            # **只在首次显示时贴合内容**。之后用户可能拉大/最大化了, 再调
+            # adjustSize 会把它强行缩回去, 跟最大化打架。
+            d.adjustSize()
         d.raise_()
         d.activateWindow()
 
@@ -509,8 +523,10 @@ class SettingsPanel(QWidget):
         mapping = {"effect": 0, "launch": 1, "debug": 2}
         if key in mapping:
             self.stack_adv.setCurrentIndex(mapping[key])
-            # 换页后弹窗高度贴合新页内容
-            QTimer.singleShot(0, self._adv_dialog.adjustSize)
+            # 换页后贴合新页内容 —— 但用户已拉大/最大化时别动, 否则会缩回去
+            d = self._adv_dialog
+            if not d.isMaximized():
+                QTimer.singleShot(0, d.adjustSize)
 
     def _switch_adv_tab(self, key):
         self.tab_adv.set_current(key)
