@@ -16,7 +16,7 @@ win-duo 以 **GPL-3.0** 发布（正文见 [LICENSE](LICENSE)）。**分发本�
 | [mss](https://github.com/BoboTiG/python-mss) | MIT | 桌面截屏（GDI 兜底） |
 | [bettercam](https://github.com/Blaze396/bettercam) / [dxcam](https://github.com/ra1nty/DXcam) | MIT | 桌面截屏（DXGI 首选，缺失退回 mss） |
 | [comtypes](https://github.com/enthought/comtypes) | MIT | bettercam 的 COM 依赖 |
-| [Pillow](https://python-pillow.org/) | MIT-CMU | 读背景图、图标 |
+| [windows-capture](https://github.com/qlands/python-windows-capture) | MIT | 桌面截屏（WGC 后端，优先于 DXGI） |
 | [pyserial](https://github.com/pyserial/pyserial) | BSD-3-Clause | ESP32 串口角度源 |
 | [darkdetect](https://github.com/albertosottile/darkdetect) | BSD-3-Clause | 跟随系统主题（传递依赖） |
 | [pywin32](https://github.com/mhammond/pywin32) | PSF-2.0 | qfluentwidgets 的 Windows 依赖 |

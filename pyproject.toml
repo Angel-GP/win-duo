@@ -25,6 +25,5 @@ dependencies = [
     # 走 WGC 合成节点, 不经 OEM 显示驱动, Intel Arc 上"驱动无视排除"的正反馈
     # 问题 (scripts/wgc_affinity_probe.py) 对它无效。需要 Win10 2004+。
     "windows-capture>=2.0",
-    "Pillow>=10.0",
     "pyserial>=3.5",
 ]
