@@ -67,6 +67,11 @@ class AppController(QObject):
         #: 连续"该显示了"的计数 (防噪声抖动, 见 _RECREATE_CONFIRM)
         self._recreate_streak = 0
         self._shutting_down = False
+        #: ═══ 分级释放·软裁剪 (替代低内存模式的默认行为) ═══
+        #: 周期检查定时器 (与 _release_timer 共用轮询) + 隐藏起点/"已裁过"标记
+        self._soft_timer = None
+        self._soft_trimmed = False
+        self._soft_hidden_since = None
 
         # 全局热键由 controller 管: 键盘模式那几个键要随角度源切换动态注册/注销
         self.hotkeys = HotkeyManager(self)
@@ -314,6 +319,10 @@ class AppController(QObject):
         self._last_hidden_at = None
         #: 连续的"该显示了"次数 (防抖, 见 `_RECREATE_CONFIRM`)
         self._recreate_streak = 0
+        # 硬释放把窗口销毁了, 软裁剪的状态一并复位 (软检查对 None 窗口本就空转,
+        # 这里清标记是防止窗口重建后沿用上一轮隐藏的"已裁过"状态)
+        self._soft_trimmed = False
+        self._soft_hidden_since = None
         # 回收要**延迟**做: 实测紧跟在 `deleteLater()` 之后调, 工作集几乎不降
         # (214MB 还是 214MB) —— 那时窗口/上下文还没真正销毁完, 而
         # `SetProcessWorkingSetSize` 是异步的 (只设目标, 裁剪要等系统处理),
@@ -337,9 +346,14 @@ class AppController(QObject):
         **窗口已经建回来时直接跳过。** 裁剪会把驱动 DLL 的页从工作集里挤出
         去, 紧接着玻璃层要用就得缺页调回 —— 那一瞬间会明显拖慢重绘 (实测
         重绘从 ~28/s 掉到 4~10/s)。所以只在"窗口确实不存在"时才裁。
+        软裁剪路径 (窗口还活着) 走 `_force_trim_working_set`。
         """
         if self.overlay is not None:
             return False
+        return self._force_trim_working_set()
+
+    def _force_trim_working_set(self):
+        """裁工作集的核心实现 (无前置条件)。硬/软两条释放路径共用。"""
         try:
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
             psapi = ctypes.WinDLL("psapi", use_last_error=True)
@@ -357,7 +371,7 @@ class AppController(QObject):
             h = k32.OpenProcess(0x0400 | 0x0100, False,       # QUERY_INFO|SET_QUOTA
                                 k32.GetCurrentProcessId())
             if not h:
-                print("[glass] 低内存模式: OpenProcess 失败 err=%d"
+                print("[glass] 裁剪: OpenProcess 失败 err=%d"
                       % ctypes.get_last_error())
                 return False
             try:
@@ -366,10 +380,9 @@ class AppController(QObject):
                 psapi.EmptyWorkingSet(h)
             finally:
                 k32.CloseHandle(h)
-            print("[glass] 低内存模式: 工作集已裁剪")
             return True
         except Exception as exc:  # noqa: BLE001
-            print("[glass] 低内存模式: 裁剪失败 %s" % exc)
+            print("[glass] 裁剪失败 %s" % exc)
             return False
 
     def _touch_idle_timer(self):
@@ -379,6 +392,76 @@ class AppController(QObject):
         self._last_hidden_at = None
         if self.cfg.get("low_memory_mode", False):
             self._start_release_poll()
+
+    # ------------------------------------------------------------ 分级释放·软裁剪
+    #: 玻璃层隐藏持续多久后把驱动 DLL 页从工作集裁出去 (秒)。
+    SOFT_TRIM_SEC = 3.0
+    #: 软裁剪周期检查 (毫秒)。复用一个惰性定时器。
+    _SOFT_POLL_MS = 500
+
+    def _start_soft_poll(self):
+        """软裁剪轮询只在 glass_on=True 期间需要 (隐藏 -> 裁 -> 显示 -> 复位)。"""
+        if self._soft_timer is None:
+            self._soft_timer = QTimer(self)
+            self._soft_timer.timeout.connect(self._maybe_soft_trim)
+        if not self._soft_timer.isActive():
+            self._soft_timer.start(self._SOFT_POLL_MS)
+
+    def _stop_soft_poll(self):
+        if self._soft_timer is not None:
+            self._soft_timer.stop()
+        self._soft_trimmed = False
+
+    def _overlay_hidden_since(self):
+        """玻璃层开着但已隐藏的起点时刻; 正显示着返回 None。
+
+        判据与低内存模式的 _overlay_visible 相同: 玻璃层开 + 未被临时收起 +
+        真的不可见。隐藏起点由本函数自行记录 (首个"观察到隐藏"的轮询拍),
+        不依赖 overlay 逐个 hide() 点打桩。
+        """
+        if not self.glass_on or self.overlay is None:
+            return None
+        ov = self.overlay
+        if not getattr(ov, "suppressed", False) and getattr(ov, "_visible", False):
+            return None
+        # 窗口建过 GL (initializeGL 跑过) 才有驱动 DLL 页可裁; 从未 show 过
+        # 的待命窗口没加载过驱动页, 裁了也白裁, 还会把预热的页误裁掉。
+        if not getattr(ov, "_gl_ready", False):
+            return None
+        # 已隐藏 -> 起点第一次观察到时打上
+        if self._soft_hidden_since is None:
+            self._soft_hidden_since = time.time()
+        return self._soft_hidden_since
+
+    def _maybe_soft_trim(self):
+        """软裁剪周期检查: 玻璃层隐藏满 SOFT_TRIM_SEC -> 裁工作集, **不销毁窗口**。
+
+        这是低内存模式的替代方案。分级:
+          - 本层 (软): 隐藏 3 秒 -> EmptyWorkingSet 把 ~120MB 驱动 DLL 映射页
+            挤出工作集。GL 上下文/窗口还活着 —— 下次合盖**零重建延迟**。被挤出
+            的页是共享只读映射, 系统级多半还热着 (DWM 也在用同一份驱动 DLL),
+            软缺页回填是微秒级, 首帧重绘几乎无感。
+          - 低内存模式 (硬, 若用户开了): 隐藏 3 秒 -> 整个销毁窗口。省得更多,
+            代价是下次 ~180ms 重建 + 驱动重初始化。两者不叠加: 硬路径先触发
+            时窗口已销毁, 软检查自然空转。
+        """
+        if self._shutting_down or not self.glass_on or self.overlay is None:
+            return
+        since = self._overlay_hidden_since()
+        if since is None:
+            # 正在显示 (或窗口没了): 复位计时与"已裁过", 下次隐藏重新来
+            self._soft_trimmed = False
+            self._soft_hidden_since = None
+            return
+        if self._soft_trimmed:
+            return                          # 本轮隐藏已经裁过, 不重复
+        if time.time() - since < self.SOFT_TRIM_SEC:
+            return
+        # 注意走 _force_trim_working_set: reclaim_memory 有 "窗口不存在才裁"
+        # 的守卫, 那是给硬释放 (低内存模式) 用的; 软路径窗口故意保留。
+        if self._force_trim_working_set():
+            self._soft_trimmed = True
+            print("[glass] 隐藏待命: 已裁工作集 (窗口保留, 下次展开零重建)")
 
     def start_glass(self, recalibrate=True):
         """开启玻璃层。
@@ -407,6 +490,9 @@ class AppController(QObject):
         # level>0 时画的是真实内容, 两种都不会出现黑场。
         self._show_overlay_when_ready()
         self.glass_on = True
+        # 分级释放·软裁剪: 开着玻璃层的整个期间轮询"隐藏是否满 3 秒"。
+        # 与低内存模式 (硬释放) 不冲突 —— 硬路径触发时窗口被销毁, 软检查自然空转。
+        self._start_soft_poll()
         self.glassChanged.emit(True)
         # 角度源是**异步**打开的 (CameraAngleSource.start 里说明过原因), 这里
         # 还判断不出可用性, 过一会儿再回来看
@@ -531,6 +617,7 @@ class AppController(QObject):
         if not self.glass_on:
             return
         self.glass_on = False
+        self._stop_soft_poll()          # 软裁剪只对"开着但隐藏"有意义
         if self.overlay is not None:
             try:
                 self.overlay.close_debug()   # 调试窗也是 OpenCV 的独立窗口, 一并收掉
@@ -754,6 +841,7 @@ class AppController(QObject):
     def shutdown(self):
         self._shutting_down = True
         self._stop_release_poll()
+        self._stop_soft_poll()
         try:
             self.release_hotkeys()
         except Exception:  # noqa: BLE001
