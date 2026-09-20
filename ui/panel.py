@@ -15,8 +15,8 @@ from pathlib import Path
 import time
 
 from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QScrollArea,
-                             QStackedWidget, QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QStackedWidget,
+                             QVBoxLayout, QWidget)
 
 from angles.hub import LABELS
 
@@ -112,6 +112,13 @@ class SettingsPanel(QWidget):
         self.setWindowTitle("win-duo 设置")
         self.setWindowIcon(make_icon())
         self.setFixedWidth(470)
+        # **显式去掉最大化按钮。** 光靠固定尺寸在有的机器上不会让 Windows 禁用
+        # 最大化 (尤其是首次 show 之后才把高度固定的话)。这里在建窗口之前就把
+        # 最大化 hint 摘掉, 保留最小化/关闭。这样最大化不会再把窄窗拉成长条。
+        self.setWindowFlags(self.windowFlags()
+                            | Qt.WindowType.WindowMinimizeButtonHint)
+        self.setWindowFlags(self.windowFlags()
+                            & ~Qt.WindowType.WindowMaximizeButtonHint)
         self._build()
         # 顺序很重要: 先建控件 -> 用真实配置填充 -> **最后**才接信号。
         # 反过来的话, 填充时每个 setValue/setChecked 都会触发一次"用户改动",
@@ -141,26 +148,16 @@ class SettingsPanel(QWidget):
 
     # ================================================================ 构建
     def _build(self):
-        # 内容全部放进一个可滚动区域: 展开高级设置后就算内容超过屏幕高度, 也是
-        # **内部滚动**, 而不是把窗口拉成一条超出屏幕的长条 (见 _fit_height)。
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        self._scroll = QScrollArea(self)
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._inner = QWidget()
-        root = QVBoxLayout(self._inner)
+        # 主窗只放常用卡片 + 一个"高级设置..."按钮, 保持紧凑、高度固定。
+        # 高级设置(那一大堆参数)挪进独立弹窗 `self._adv_dialog`, 点按钮才开 ——
+        # 主窗永远不会被撑长。
+        root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
         root.addWidget(self._build_glass_card())
         root.addWidget(self._build_source_card())
         root.addWidget(self._build_advanced_card())
         root.addWidget(self._build_status())
-        root.addStretch(1)
-        self._scroll.setWidget(self._inner)
-        outer.addWidget(self._scroll)
 
     # ---------------------------------------------------------- 悬浮玻璃
     def _build_glass_card(self):
@@ -218,19 +215,30 @@ class SettingsPanel(QWidget):
 
     # ---------------------------------------------------------- 高级设置
     def _build_advanced_card(self):
+        """主窗里只放一个入口按钮; 真正的高级设置在独立弹窗里 (见下)。"""
         card = CardWidget()
         lay = card_layout(card, spacing=6)
-
-        self.btn_adv = TransparentPushButton("▸   高级设置")
-        self.btn_adv.clicked.connect(self._toggle_advanced)
+        self.btn_adv = TransparentPushButton("高级设置...")
+        self.btn_adv.clicked.connect(self._open_advanced)
         lay.addWidget(self.btn_adv)
+        # 弹窗内容此刻就建好 (控件要在 refresh_all / _wire 之前存在), 但不显示。
+        self._build_advanced_dialog()
+        return card
 
-        self.adv_body = QWidget()
-        body = QVBoxLayout(self.adv_body)
-        body.setContentsMargins(0, 6, 0, 0)
+    def _build_advanced_dialog(self):
+        # 独立弹窗: 分三个标签页, 一次只显示一页 —— 高度天然受控, 不会撑长主窗。
+        self._adv_dialog = QDialog(self)
+        self._adv_dialog.setWindowTitle("win-duo 高级设置")
+        self._adv_dialog.setWindowIcon(make_icon())
+        self._adv_dialog.setFixedWidth(430)
+        # 去掉问号帮助按钮, 保留关闭
+        self._adv_dialog.setWindowFlags(
+            self._adv_dialog.windowFlags()
+            & ~Qt.WindowType.WindowContextHelpButtonHint)
+        body = QVBoxLayout(self._adv_dialog)
+        body.setContentsMargins(16, 14, 16, 14)
         body.setSpacing(9)
 
-        # 用分页切换取代超长纵向展开，避免撑爆屏幕
         self.tab_adv = SegmentBar()
         self.tab_adv.add("效果参数", "effect")
         self.tab_adv.add("启动与标定", "launch")
@@ -320,10 +328,8 @@ class SettingsPanel(QWidget):
 
         body.addWidget(self.stack_adv)
         self.tab_adv.changed.connect(self._on_adv_tab)
-
-        self.adv_body.setVisible(False)
-        lay.addWidget(self.adv_body)
-        return card
+        # 默认停在第一页
+        self.stack_adv.setCurrentIndex(0)
 
     # ---------------------------------------------------------- 状态行
     def _build_status(self):
@@ -476,29 +482,20 @@ class SettingsPanel(QWidget):
 
     # ================================================================ 交互
     def _fit_height(self):
-        """窗口高度贴合内容, 但封顶在屏幕可用高度 —— 超出就靠滚动区滚动。
+        """主窗高度贴合内容。宽高都固定 -> Windows 自动禁用最大化按钮,
+        所以不会再出现"最大化把窄窗拉成长条"。
 
-        为什么这么做:
-          - 展开高级设置后内容变多, 老代码用 adjustSize 让窗口**无上限**长高,
-            内容一多就超出屏幕、还没法最大化 (宽度固定)。
-          - 现在: 宽度固定 470, 高度 = min(内容高度, 屏幕高度*0.88)。宽高都
-            固定后 Windows 会**自动禁用最大化按钮**, "最大化变长条"的问题一并
-            根除; 内容真超过封顶就由 QScrollArea 内部滚动。
+        高级设置已移到独立弹窗, 主窗内容本来就短, 不需要滚动条。
         """
-        hint = self._inner.sizeHint().height()
-        try:
-            avail = QApplication.primaryScreen().availableGeometry().height()
-        except Exception:  # noqa: BLE001
-            avail = 900
-        self.setFixedHeight(min(hint + 2, int(avail * 0.88)))
+        self.setFixedHeight(self.sizeHint().height())
 
-    def _toggle_advanced(self):
-        # 用 isHidden() 而不是 isVisible(): 后者在窗口自己没显示时恒为 False,
-        # 会导致"展开"永远只往一个方向切
-        show = self.adv_body.isHidden()
-        self.adv_body.setVisible(show)
-        self.btn_adv.setText("▾   高级设置" if show else "▸   高级设置")
-        QTimer.singleShot(0, self._fit_height)
+    def _open_advanced(self):
+        """弹出高级设置窗 (modeless, 跟随主窗但不阻塞)。"""
+        d = self._adv_dialog
+        d.show()
+        d.adjustSize()          # 贴合当前页内容
+        d.raise_()
+        d.activateWindow()
 
     def _on_glass_switch(self, checked):
         if self._loading:
@@ -514,7 +511,8 @@ class SettingsPanel(QWidget):
         mapping = {"effect": 0, "launch": 1, "debug": 2}
         if key in mapping:
             self.stack_adv.setCurrentIndex(mapping[key])
-            QTimer.singleShot(0, self._fit_height)
+            # 换页后弹窗高度贴合新页内容
+            QTimer.singleShot(0, self._adv_dialog.adjustSize)
 
     def _switch_adv_tab(self, key):
         self.tab_adv.set_current(key)
