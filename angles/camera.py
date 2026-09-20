@@ -64,11 +64,17 @@
 """
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .base import AngleSource
+
+try:
+    import paths  # main.py 已把项目根放进 sys.path
+except ImportError:  # pragma: no cover - 脱离 main 单独跑时退到 angles/.. :
+    paths = None
 
 # ═══════════════════════════════════════════════════════════════════
 # 取流
@@ -105,6 +111,9 @@ CAMERA_MIN_CUTOFF = 1.0        # One Euro 滤波: 最小截止频率
 CAMERA_BETA = 0.05             # One Euro 滤波: 速度系数 (调大更跟手但更抖)
 CAMERA_D_CUTOFF = 1.0          # One Euro 滤波: 导数截止频率
 CAMERA_OPENCV_THREADS = 2      # OpenCV 内部线程上限 (默认 32 会空转烧 CPU)
+#: 打开后先丢弃这么多帧再做冻结帧检测 —— 传感器刚打开的前若干帧还不稳定
+#: (虚拟摄像头尤甚), 丢一小段避免拿半初始化的帧做判断。30fps 下 ≈ 1 秒。
+CAMERA_AE_SETTLE_FRAMES = 30
 
 
 def _limit_opencv_threads(n):
@@ -144,6 +153,26 @@ def _picture_is_moving(cap, warmup=5, sample=3, min_diff=0.5):
     return (max(d) if d else 0.0) > min_diff, frames[-1]
 
 
+def _dump_dir():
+    """冻结帧 dump 目录: <数据目录>/camera_dump。取不到 paths 时返回 None。"""
+    if paths is None:
+        return None
+    try:
+        d = Path(paths.writable_data_dir()) / "camera_dump"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except Exception:  # noqa: BLE001  dump 失败不该影响主流程
+        return None
+
+
+def _drain_frames(cap, n):
+    """打开后丢 n 帧 (传感器刚上电的前几帧不稳定)。读不到就提前停。"""
+    for _ in range(n):
+        ok, _ = cap.read()
+        if not ok:
+            break
+
+
 def open_camera(index=0, backend="auto", warmup=5,
                 threads=DEFAULT_OPENCV_THREADS):
     """打开摄像头, 返回 (VideoCapture, 后端名)。
@@ -159,32 +188,45 @@ def open_camera(index=0, backend="auto", warmup=5,
              if backend == "auto" else [(backend, _BACKEND_APIS[backend])])
 
     tried = []
+    dump_dir = _dump_dir()
     for name, api in order:
         cap = cv2.VideoCapture(index, api)
         if not cap.isOpened():
             cap.release()
             tried.append("%s: 打不开" % name)
             continue
+        # 先丢一小段帧, 避免拿传感器刚上电的半初始化画面做检测/dump。
+        _drain_frames(cap, CAMERA_AE_SETTLE_FRAMES)
         moving, frame = _picture_is_moving(cap, warmup=warmup)
+        if moving:
+            # 注意: 成功路径不 release —— 返回的就是这个 cap 给上层继续用。
+            return cap, name
+        cap.release()
         if frame is None:
-            cap.release()
             tried.append("%s: 打开了但读不到帧" % name)
-            continue
-        if not moving:
-            cap.release()
+        else:
             tried.append("%s: 读到的是冻结帧(虚拟摄像头)" % name)
-            continue
-        return cap, name
+            # 把抓到的最后一帧存下来方便查验是"哪种冻结" (纯色? 占位图?).
+            if dump_dir is not None:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                fp = dump_dir / ("index%d_%s_%s.png" % (index, name, ts))
+                try:
+                    cv2.imwrite(str(fp), frame)
+                    tried[-1] += " (画面已存到 %s)" % fp
+                except Exception:  # noqa: BLE001
+                    pass
 
     raise RuntimeError(
         "摄像头 index=%d 没有可用组合。逐个后端的尝试结果: %s。\n"
         "  排查建议:\n"
+        "    0) 冻结帧画面已 dump 到 %s (路径也标在各条尝试结果后), 可直接看抓到的是什么;\n"
         "    1) 在设置窗口点「扫描」逐个探测 index x 后端 (会跳过冻结帧);\n"
         "    2) 注意 index 与设备的对应关系**随后端而变**, 且虚拟摄像头\n"
         "       (如手机投屏) 常常排在前面并给出冻结帧;\n"
         "    3) 设置 -> 隐私和安全性 -> 相机: 打开\"让桌面应用访问相机\";\n"
         "    4) 确认没有别的程序(微信/钉钉/相机应用)正占用摄像头。"
-        % (index, "; ".join(tried) if tried else "无"))
+        % (index, "; ".join(tried) if tried else "无",
+           str(dump_dir) if dump_dir else "(dump 目录创建失败, 略过)"))
 
 
 # ═══════════════════════════════════════════════════════════════════
