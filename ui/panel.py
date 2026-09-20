@@ -15,8 +15,8 @@ from pathlib import Path
 import time
 
 from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QFileDialog, QStackedWidget,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QScrollArea,
+                             QStackedWidget, QVBoxLayout, QWidget)
 
 from angles.hub import LABELS
 
@@ -141,13 +141,26 @@ class SettingsPanel(QWidget):
 
     # ================================================================ 构建
     def _build(self):
-        root = QVBoxLayout(self)
+        # 内容全部放进一个可滚动区域: 展开高级设置后就算内容超过屏幕高度, 也是
+        # **内部滚动**, 而不是把窗口拉成一条超出屏幕的长条 (见 _fit_height)。
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._inner = QWidget()
+        root = QVBoxLayout(self._inner)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
         root.addWidget(self._build_glass_card())
         root.addWidget(self._build_source_card())
         root.addWidget(self._build_advanced_card())
         root.addWidget(self._build_status())
+        root.addStretch(1)
+        self._scroll.setWidget(self._inner)
+        outer.addWidget(self._scroll)
 
     # ---------------------------------------------------------- 悬浮玻璃
     def _build_glass_card(self):
@@ -462,13 +475,30 @@ class SettingsPanel(QWidget):
         self._loading = False
 
     # ================================================================ 交互
+    def _fit_height(self):
+        """窗口高度贴合内容, 但封顶在屏幕可用高度 —— 超出就靠滚动区滚动。
+
+        为什么这么做:
+          - 展开高级设置后内容变多, 老代码用 adjustSize 让窗口**无上限**长高,
+            内容一多就超出屏幕、还没法最大化 (宽度固定)。
+          - 现在: 宽度固定 470, 高度 = min(内容高度, 屏幕高度*0.88)。宽高都
+            固定后 Windows 会**自动禁用最大化按钮**, "最大化变长条"的问题一并
+            根除; 内容真超过封顶就由 QScrollArea 内部滚动。
+        """
+        hint = self._inner.sizeHint().height()
+        try:
+            avail = QApplication.primaryScreen().availableGeometry().height()
+        except Exception:  # noqa: BLE001
+            avail = 900
+        self.setFixedHeight(min(hint + 2, int(avail * 0.88)))
+
     def _toggle_advanced(self):
         # 用 isHidden() 而不是 isVisible(): 后者在窗口自己没显示时恒为 False,
         # 会导致"展开"永远只往一个方向切
         show = self.adv_body.isHidden()
         self.adv_body.setVisible(show)
         self.btn_adv.setText("▾   高级设置" if show else "▸   高级设置")
-        QTimer.singleShot(0, self.adjustSize)
+        QTimer.singleShot(0, self._fit_height)
 
     def _on_glass_switch(self, checked):
         if self._loading:
@@ -484,7 +514,7 @@ class SettingsPanel(QWidget):
         mapping = {"effect": 0, "launch": 1, "debug": 2}
         if key in mapping:
             self.stack_adv.setCurrentIndex(mapping[key])
-            QTimer.singleShot(0, self.adjustSize)
+            QTimer.singleShot(0, self._fit_height)
 
     def _switch_adv_tab(self, key):
         self.tab_adv.set_current(key)
@@ -637,6 +667,7 @@ class SettingsPanel(QWidget):
         self.raise_()
         self.activateWindow()
         self.refresh_all()
+        QTimer.singleShot(0, self._fit_height)
         # 首次打开时才扫描摄像头: 没必要在程序启动、还待在托盘里的时候就做。
         #
         # **加 `_scan_scheduled` 门闩**: showEvent 会被调用多次 (隐藏后再显示、
