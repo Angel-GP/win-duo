@@ -1,0 +1,7 @@
+# 统一换行:仓库内一律存 LF,检出时按平台还原。
+# 消除每次提交的 "LF will be replaced by CRLF" 警告。
+* text=auto eol=lf
+
+# 二进制文件不做换行/文本转换
+*.ico binary
+*.png binary
