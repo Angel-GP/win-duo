@@ -32,9 +32,6 @@ powershell -ExecutionPolicy Bypass -File tools\setup_env.ps1
 .venv\Scripts\python.exe main.py --level 0.5
 ```
 
-也可以双击启动器（都用 `pythonw.exe`，不留控制台窗口）：
-`run_camera.bat` / `run_now.bat` / `run_settings.bat`。
-
 ## 界面与托盘
 
 程序启动后只驻留托盘。**双击托盘图标**或**右键 → 设置...** 打开设置窗口：
