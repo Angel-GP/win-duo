@@ -106,7 +106,6 @@ class SettingsPanel(QWidget):
         self._loading = False
         self._scan = None
         self._scan_result = None
-        self._scan_scheduled = False
         self._inputs = {}
 
         self.setWindowTitle("win-duo 设置")
@@ -697,18 +696,15 @@ class SettingsPanel(QWidget):
         self.activateWindow()
         self.refresh_all()
         QTimer.singleShot(0, self._fit_height)
-        # 首次打开时才扫描摄像头: 没必要在程序启动、还待在托盘里的时候就做。
+        # **打开设置窗口不再自动扫描摄像头。**
         #
-        # **加 `_scan_scheduled` 门闩**: showEvent 会被调用多次 (隐藏后再显示、
-        # 以及一些 processEvents 场景), 每次都在这里排一个 `singleShot(150,
-        # start_scan)` 的话, 前一个扫描线程还在跑时又会排一个 —— 而且
-        # `start_scan` 里的守卫只看"当前 _scan 是否在跑", 挡不住这种情况。
-        # 线程对象一旦被覆盖, Qt 就会在销毁它时 abort
-        # (`QThread: Destroyed while thread is still running` -> 0xC0000409)。
-        if (not self._scan_scheduled and self._scan_result is None
-                and not (self._scan and self._scan.isRunning())):
-            self._scan_scheduled = True
-            QTimer.singleShot(150, self.start_scan)
+        # 原因: 扫描要**独占**摄像头 (CameraScanThread 逐个 open_camera 探测),
+        # 所以 begin_scan() 会先 stop_source("camera") 把正在跑的摄像头停掉, 扫完
+        # end_scan() 再重启 —— 于是"一打开设置窗口, 正在追踪的摄像头就被重启",
+        # 用户看到画面/角度短暂中断。而多数时候用户开设置只是改个参数, 根本不需要
+        # 重新枚举摄像头。改成: **只在用户主动点「摄像头」那一行的「扫描」按钮时才
+        # 扫** (btn_scan 已接 start_scan)。不扫时下拉框给 index 0..3 的占位项,
+        # 够用; 要枚举真实设备就点一次「扫描」。
 
     def changeEvent(self, ev):
         """最小化 -> 直接收进托盘。
