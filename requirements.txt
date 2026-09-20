@@ -13,5 +13,9 @@ mss>=9.0
 # 装了之后 0.1ms/帧, 上限直接到显示器刷新率 (本机 165Hz)。
 # 装不上也没关系: render/capture.py 会自动退回 mss。
 bettercam>=1.0
+# WGC (Windows.Graphics.Capture) 抓屏, 优先于 bettercam/DDA: affinity 排除
+# 走 WGC 合成节点, 不经 OEM 显示驱动, Intel Arc 上"驱动无视排除"的正反馈
+# 问题 (scripts/wgc_affinity_probe.py) 对它无效。需要 Win10 2004+。
+windows-capture>=2.0
 Pillow>=10.0
 pyserial>=3.5

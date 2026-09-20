@@ -1,0 +1,30 @@
+[project]
+name = "win-duo"
+version = "1.0.0"
+description = "笔记本上盖摄像头测开合角 + 悬浮玻璃动画 (Windows)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "PyQt6>=6.5",
+    # Fluent Design 界面 (Windows 11 观感)。没装也能跑, ui/widgets.py 会退回
+    # 普通 Qt 控件 + 一份 QSS。
+    "PyQt6-Fluent-Widgets>=1.7",
+    "PyOpenGL>=3.1.6",
+    "numpy>=1.24",
+    # opencv 锁在 4.x: 5.0.0.93 在本机与 4.11 行为一致, 但 4.11 是部署更广的版本。
+    # 摄像头取流要走 DSHOW/MSMF 后端回退, 见 angles/camera.py::open_camera。
+    "opencv-python>=4.8,<5",
+    "mss>=9.0",
+    # DXGI Desktop Duplication 抓屏。**强烈建议装** —— 没有它就只能走 mss 的
+    # GDI BitBlt, 本机 2560x1600 实测 27ms/帧, 重截频率上限被卡在 ~37Hz;
+    # 装了之后 0.1ms/帧, 上限直接到显示器刷新率 (本机 165Hz)。
+    # 装不上也没关系: render/capture.py 会自动退回 mss。
+    "bettercam>=1.0",
+    # WGC (Windows.Graphics.Capture) 抓屏, 优先于 bettercam/DDA: affinity 排除
+    # 走 WGC 合成节点, 不经 OEM 显示驱动, Intel Arc 上"驱动无视排除"的正反馈
+    # 问题 (scripts/wgc_affinity_probe.py) 对它无效。需要 Win10 2004+。
+    "windows-capture>=2.0",
+    "Pillow>=10.0",
+    "pyserial>=3.5",
+]

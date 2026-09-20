@@ -1,15 +1,23 @@
 """桌面截屏。
 
-**优先走 DXGI Desktop Duplication，退回 GDI BitBlt (mss)。**
+**优先走 WGC (Windows.Graphics.Capture), 退回 DXGI Desktop Duplication, 再退 GDI BitBlt (mss)。**
 
-为什么换: mss 走 GDI BitBlt, 每次都把整屏重拷一遍。本机 2560x1600 实测:
+为什么 WGC 优先: 玻璃层靠 SetWindowDisplayAffinity 把自己排除出捕获, 否则就是
+"截到已渲染的上一帧 -> 再叠一层效果" 的正反馈回路。DDA (Desktop Duplication) 的
+排除是否生效取决于显示驱动 —— 实测 Intel Arc 曾出现"API 收下、合成器不执行"。
+WGC 的排除发生在 Windows.Graphics.Capture 的合成节点里, **不走 OEM 显示驱动**,
+驱动无法绕过 (scripts/wgc_affinity_probe.py 在本机 Intel Arc 上实测: affinity
+测试窗在 DDA/WGC 下命中均 0%, 基线 100%)。
+
+为什么换掉 mss: mss 走 GDI BitBlt, 每次都把整屏重拷一遍。本机 2560x1600 实测:
 
     后端          单帧耗时    实际帧率上限
     mss          27~29 ms     ~37 Hz
     bettercam    1.1 ms       ~156 Hz   (DXGI, output_color="BGRA")
+    wgc          ~0.5 ms      合成器节拍 (同 DDA)
 
 真正能拿到的帧率上限是**显示器刷新率** (本机 165Hz) —— 合成器每秒最多产
-那么多帧。mss 那 29ms 才是瓶颈, 换掉之后上限就抬到刷新率了。
+那么多帧。
 
 后端返回 None 只表示"这一瞬没有新帧", 按目标频率继续跑即可。
 
@@ -23,12 +31,15 @@ Windows 会按缩放比例虚拟化 (本机 2560x1600 会变成 1707x1067)。运
 `ensure_dpi_aware()` 兜底。
 """
 import ctypes
+import json
 import sys
 import threading
 import time
 
 import mss
 import numpy as np
+
+import paths
 
 
 def ensure_dpi_aware():
@@ -135,6 +146,114 @@ def frame_bgra_to_rgba(data, w, h):
         arr = np.asarray(data).reshape(h, w, 4)
     # BGRA -> RGBA: R/B 互换。np.ascontiguousarray 保证连续 (切片会跨步)。
     return np.ascontiguousarray(arr[:, :, [2, 1, 0, 3]])
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 后端记忆: 与 angles/camera.py 的"记住上次成功的后端"同思路。
+# DDA 在部分驱动 (Intel Arc) 上会无视 SetWindowDisplayAffinity -> 反馈回路,
+# 所以顺序是 wgc -> dda -> mss。哪台机器上次哪个后端真的在用, 下次优先试它。
+# ═══════════════════════════════════════════════════════════════════
+_STATE_PATH = None
+
+
+def _backend_state_path():
+    global _STATE_PATH
+    if _STATE_PATH is None:
+        try:
+            _STATE_PATH = paths.config_file("capture_backend.json")
+        except Exception:  # noqa: BLE001
+            return None
+    return _STATE_PATH
+
+
+def load_good_capture_backend():
+    p = _backend_state_path()
+    if p is None or not p.exists():
+        return None
+    try:
+        return str(json.loads(p.read_text(encoding="utf-8")).get("backend") or "") or None
+    except Exception:  # noqa: BLE001  坏了就当没有
+        return None
+
+
+def remember_capture_backend(name):
+    p = _backend_state_path()
+    if p is None:
+        return
+    try:
+        if load_good_capture_backend() == name:
+            return
+        p.write_text(json.dumps({"backend": name}, ensure_ascii=False) + "\n",
+                     encoding="utf-8")
+    except Exception:  # noqa: BLE001  静默, 别让记忆失败影响采集
+        pass
+
+
+class _WgcSource:
+    """Windows.Graphics.Capture 封装 (windows-capture 包, 优先于 DDA)。
+
+    为什么优先: affinity 排除走 WGC 合成节点, 不经 OEM 显示驱动, 驱动无法
+    "收下不执行" (见模块 docstring)。缺包 / Win10 2004 以下时创建失败,
+    上层自动退回 DDA。
+
+    windows-capture 的 API 坑 (实测):
+      - `start_free_threaded()` 前必须注册 on_closed 回调, 否则直接抛异常;
+      - monitor_index 从 1 起, 不传默认主屏 —— 正好匹配 bettercam 那边
+        "按分辨率找 output" 之前的默认行为 (主屏);
+      - 帧 frame_buffer 是 BGRA ndarray (OWNDATA, 独占内存), 直接可用。
+    """
+
+    COLOR = "BGRA"
+
+    def __init__(self, size):
+        self.w, self.h = int(size[0]), int(size[1])
+        self._warned_size = False
+        from windows_capture import WindowsCapture   # noqa: PLC0415  探测导入
+        # 不传 monitor_index = 主屏; 多屏时 region 由 controller 换算到物理像素,
+        # 与 DDA 全屏帧的裁剪策略一致 (上层只关心匹配分辨率的整屏帧)。
+        self.cap = WindowsCapture(cursor_capture=False, draw_border=False)
+        self._latest = None
+        self._ctrl = None
+
+        @self.cap.event
+        def on_frame_arrived(frame, _ctx):
+            self._latest = frame
+
+        @self.cap.event
+        def on_closed():
+            self._latest = None
+
+        self._ctrl = self.cap.start_free_threaded()
+
+    def grab(self):
+        """返回 (h, w, 4) 的 BGRA ndarray; 没有新帧返回 None。"""
+        frame = self._latest
+        if frame is None:
+            return None
+        self._latest = None          # 取走即清: 与 DDA "AcquireNextFrame 语义" 对齐
+        arr = frame.frame_buffer
+        fh, fw = arr.shape[0], arr.shape[1]
+        if fw != self.w or fh != self.h:
+            # 不要硬失败: WGC 会话的帧尺寸跟着**进程 DPI 感知**走 (DPI 不感知时
+            # 2560x1600@133% 会给 1920x1200 的虚拟化尺寸), 但我们 probe 实测
+            # ensure_dpi_aware 后仍可能拿到虚拟化尺寸 —— 与其炸掉回退 DDA,
+            # 不如按实际尺寸用: overlay 上传纹理时用的是 _uploaded_size, 天然适配。
+            # 只警告一次, 防止每帧刷屏。
+            if not self._warned_size:
+                self._warned_size = True
+                print("[capture] WGC 帧尺寸 %dx%d != 预期 %dx%d (DPI 虚拟化?), "
+                      "按实际尺寸用" % (fw, fh, self.w, self.h))
+            self.w, self.h = fw, fh
+        return arr
+
+    def release(self):
+        if self._ctrl is not None:
+            try:
+                self._ctrl.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ctrl = None
+        self._latest = None
 
 
 class _DxgiSource:
@@ -298,6 +417,7 @@ class CaptureWorker(threading.Thread):
         self.last_ms = 0.0
         self.backend = "?"
         self._dxgi = None
+        self._wgc = None
         self._sct = None
         #: set_region() 换屏后置 True; 采集线程在安全点重挑 DXGI output。
         self._reopen_pending = False
@@ -320,25 +440,53 @@ class CaptureWorker(threading.Thread):
     def _open(self):
         """幂等 —— start() 里会调一次, 外部也可能先调一次做探测。
 
-        不幂等的话第二次会再走一遍 _DxgiSource 的探测, 而 bettercam 是**单例**,
-        探测时的 release() 会把手上正在用的 camera 销毁掉。
+        不幂等的话第二次会再走一遍探测 —— bettercam 是**单例**, 探测时的
+        release() 会把手上正在用的 camera 销毁掉。
+
+        auto 的顺序: 上次成功并记住的后端优先, 否则 wgc -> dda -> mss。
+        WGC 优先于 DDA 的原因见模块 docstring (affinity 排除的可靠性)。
         """
         if self.backend != "?":
             return
         ensure_dpi_aware()
-        if self.want_backend in ("auto", "dxgi"):
-            try:
-                self._dxgi = _DxgiSource(self.size, origin=self.origin)
-                self.backend = self._dxgi.name
-                print("[capture] 后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
-                      % (self._dxgi.name, self._dxgi.output_idx, *self.size,
-                         self.origin))
-                return
-            except Exception as exc:  # noqa: BLE001
-                if self.want_backend == "dxgi":
-                    print("[capture] DXGI 不可用: %s" % exc)
-                else:
-                    print("[capture] DXGI 不可用, 退回 mss: %s" % exc)
+        good = load_good_capture_backend() if self.want_backend == "auto" else None
+        if good:
+            print("[capture] 上次成功的采集后端是 %s, 优先试它" % good)
+        order = ["wgc", "dxgi"] if good != "wgc" else ["dxgi", "wgc"]
+        if good == "wgc":
+            order = ["wgc", "dxgi"]
+        elif good == "mss":
+            order = []
+        for name in order:
+            if self.want_backend not in ("auto", name):
+                continue
+            if name == "wgc":
+                try:
+                    self._wgc = _WgcSource(self.size)
+                    self.backend = "wgc"
+                    print("[capture] 后端 wgc (Windows.Graphics.Capture), %dx%d"
+                          % self.size)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    print("[capture] WGC 不可用%s: %s"
+                          % (" (记住的后端, 回退继续试)" if good == "wgc" else "",
+                             exc))
+                    if self.want_backend == "wgc":
+                        raise
+                    continue
+            if name == "dxgi":
+                try:
+                    self._dxgi = _DxgiSource(self.size, origin=self.origin)
+                    self.backend = self._dxgi.name
+                    print("[capture] 后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
+                          % (self._dxgi.name, self._dxgi.output_idx, *self.size,
+                             self.origin))
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    if self.want_backend == "dxgi":
+                        print("[capture] DXGI 不可用: %s" % exc)
+                    else:
+                        print("[capture] DXGI 不可用, 退回 mss: %s" % exc)
         self.backend = "mss"
         self._sct = mss.mss()
         print("[capture] 后端 mss (GDI BitBlt), %dx%d" % self.size)
@@ -350,7 +498,6 @@ class CaptureWorker(threading.Thread):
         if self._sct is None:
             self._sct = mss.mss()
         self.backend = "mss"
-
     def stop(self):
         """停掉采集线程。
 
@@ -366,6 +513,8 @@ class CaptureWorker(threading.Thread):
             self.join(timeout=2.0)
         if self._dxgi is not None:
             self._dxgi.release()
+        if self._wgc is not None:
+            self._wgc.release()
         if self._sct is not None:
             try:
                 self._sct.close()
@@ -518,6 +667,26 @@ class CaptureWorker(threading.Thread):
 
     def _pump_once(self, seq):
         self._maybe_reopen()
+        if self._wgc is not None:
+            t0 = time.perf_counter()
+            try:
+                arr = self._wgc.grab()
+            except Exception as exc:  # noqa: BLE001
+                print("[capture] WGC 出错, 退回 DXGI/mss: %s" % exc)
+                self._wgc.release()
+                self._wgc = None
+                arr = None
+            if arr is not None:
+                elapsed = (time.perf_counter() - t0) * 1000.0
+                self.last_ms = elapsed if self.last_ms <= 0 else \
+                    self.last_ms * 0.8 + elapsed * 0.2
+                self.frames_in += 1
+                remember_capture_backend("wgc")
+                return self._store(arr, arr.shape[1], arr.shape[0], seq + 1, "BGRA")
+            # 没帧 = 这一瞬没有新帧
+            if self.frame is None:
+                self._grab_mss(seq)      # 初始兜底种子帧
+            return seq
         if self._dxgi is not None:
             t0 = time.perf_counter()
             try:
@@ -531,6 +700,7 @@ class CaptureWorker(threading.Thread):
                 self.last_ms = elapsed if self.last_ms <= 0 else \
                     self.last_ms * 0.8 + elapsed * 0.2
                 self.frames_in += 1
+                remember_capture_backend(self._dxgi.name)
                 return self._store(arr, arr.shape[1], arr.shape[0], seq + 1, "BGRA")
             # 没帧 = 这一瞬没有新帧
             if self.frame is None:
