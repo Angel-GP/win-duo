@@ -120,6 +120,23 @@ def frame_bgr(frame):
     return np.ascontiguousarray(arr[:, :, :3])
 
 
+def frame_bgra_to_rgba(data, w, h):
+    """把一帧的 BGRA 缓冲换成 RGBA (给 GL 上传用, 走规范安全的 GL_RGBA 外部格式)。
+
+    为什么要换: `GL_BGRA` 作为 `glTexImage2D` 的**外部格式**不属 OpenGL 3.3 core
+    的核心保证 (是 GL_EXT_bgra)。NVIDIA 宽松接受, 但 **Intel 核显常拒绝** ->
+    纹理上传失败、玻璃层全黑。所以统一在 CPU 侧换一次通道, 上传只用 GL_RGBA。
+
+    返回**连续且可写**的 RGBA 数组 (GL 需要连续内存; 换通道本身就产生了新数组)。
+    """
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)
+    else:
+        arr = np.asarray(data).reshape(h, w, 4)
+    # BGRA -> RGBA: R/B 互换。np.ascontiguousarray 保证连续 (切片会跨步)。
+    return np.ascontiguousarray(arr[:, :, [2, 1, 0, 3]])
+
+
 class _DxgiSource:
     """DXGI Desktop Duplication 封装 (bettercam 优先, 退化到 dxcam)。"""
 

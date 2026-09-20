@@ -25,7 +25,7 @@ from angles.hub import LABELS
 
 import paths
 
-from .capture import frame_bgr
+from .capture import frame_bgr, frame_bgra_to_rgba
 from .shader import FS_DUO, VS
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -277,6 +277,16 @@ class GlassOverlay(QOpenGLWidget):
 
     # ------------------------------------------------------------ GL
     def initializeGL(self):
+        # 打印驱动信息 —— 排查"某类显卡上玻璃层黑屏"时, 这一行能直接说明
+        # 拿到的是什么上下文 (版本/厂商/prof ile), 不用再猜。
+        try:
+            print("[GL] %s | %s | %s | GLSL %s" % (
+                GL.glGetString(GL.GL_VERSION).decode("latin-1"),
+                GL.glGetString(GL.GL_VENDOR).decode("latin-1"),
+                GL.glGetString(GL.GL_RENDERER).decode("latin-1"),
+                GL.glGetString(GL.GL_SHADING_LANGUAGE_VERSION).decode("latin-1")))
+        except Exception:  # noqa: BLE001
+            pass
         print("[GL] initializeGL, context valid =", self.context().isValid(),
               self.context().format().majorVersion(),
               self.context().format().minorVersion())
@@ -286,8 +296,12 @@ class GlassOverlay(QOpenGLWidget):
             QOpenGLShader.ShaderTypeBit.Vertex, VS)
         ok_f = self.prog.addShaderFromSourceCode(
             QOpenGLShader.ShaderTypeBit.Fragment, FS_DUO)
-        if not (ok_v and ok_f and self.prog.link()):
-            print("[GL] 着色器编译失败:\n", self.prog.log())
+        ok_l = self.prog.link()
+        if not (ok_v and ok_f and ok_l):
+            print("[GL] 着色器编译/链接失败: vs=%s fs=%s link=%s\n%s"
+                  % (ok_v, ok_f, ok_l, self.prog.log()))
+        else:
+            print("[GL] 着色器编译链接 OK")
         self.prog.bind()
 
         # uniform 位置**在这里查一次就好**。`uniformLocation` 每次都要拿字符串
@@ -299,6 +313,9 @@ class GlassOverlay(QOpenGLWidget):
             for name in ("uTex", "uBackdrop", "uRes", "uTilt", "uEyeZ",
                          "uSpread", "uDark", "uMaxTaps", "uOutside", "uBgBlur")
         }
+        missing = [k for k, v in self._uloc.items() if v < 0]
+        if missing:
+            print("[GL] 警告: 这些 uniform 没找到 (驱动可能优化掉了): %s" % missing)
 
         self.cap_tex = self._new_tex()
         self.bd_tex = self._new_tex()
@@ -306,6 +323,8 @@ class GlassOverlay(QOpenGLWidget):
         # **core profile 必须有一个已绑定的 VAO 才能发起 draw call**, 哪怕不用
         # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
         self.vao = GL.glGenVertexArrays(1)
+        if not self.vao:
+            print("[GL] 警告: glGenVertexArrays 失败 (core 下会画不出东西)")
 
         self._gl_ready = True
 
@@ -332,14 +351,17 @@ class GlassOverlay(QOpenGLWidget):
         frame = self.capturer.latest()
         if frame and frame[3] != self._uploaded_seq:
             raw, fw, fh, seq, fmt = frame
-            # 两种后端给的内存布局不同:
-            #   DXGI (bettercam/dxcam) -> numpy (h,w,4) **RGBA**
-            #   mss (GDI BitBlt)       -> bytes        **BGRA**
-            # 数组能直接被 PyOpenGL 当缓冲协议吃下, 不用再拷一份。
-            gl_fmt = GL.GL_RGBA if fmt == "RGBA" else GL.GL_BGRA
+            # **上传一律用 GL_RGBA (内部格式和外部格式都是)** —— `GL_BGRA` 作为
+            # 外部格式**不是 OpenGL 3.3 core 的核心保证** (来自 GL_EXT_bgra):
+            # NVIDIA 宽松接受, 但 Intel 核显的严格 core 实现常拒绝 ->
+            # glTexImage2D 报 GL_INVALID_ENUM、纹理是空的 -> **玻璃层全黑**。
+            # 所以 capture 侧现在统一把帧转成 RGBA (见 capture._store / frame_bgra),
+            # 这里就只剩一条 GL_RGBA 路径, 对任何驱动都规范安全。
+            if fmt != "RGBA":
+                raw = frame_bgra_to_rgba(raw, fw, fh)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, fw, fh, 0,
-                            gl_fmt, GL.GL_UNSIGNED_BYTE, raw)
+                            GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
             GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             self._uploaded_seq = seq
@@ -476,9 +498,11 @@ class GlassOverlay(QOpenGLWidget):
 
     def _upload_backdrop(self, bgr):
         h, w = bgr.shape[:2]
+        # 同样避开 GL_BGR 外部格式 (非 core 保证, 核显可能拒绝): 换成 RGBA 上传。
+        rgba = np.ascontiguousarray(bgr[:, :, [2, 1, 0]])
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.bd_tex)
         GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0,
-                        GL.GL_BGR, GL.GL_UNSIGNED_BYTE, np.ascontiguousarray(bgr))
+                        GL.GL_RGB, GL.GL_UNSIGNED_BYTE, rgba)
         GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
