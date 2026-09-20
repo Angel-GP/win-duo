@@ -4,6 +4,7 @@ import sys
 import time
 
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QVBoxLayout
 
 from paths import data_file
@@ -83,11 +84,28 @@ class LogDialog(QDialog):
 
     def refresh_log(self):
         content = get_all_logs()
-        if content != self.text_edit.toPlainText():
-            self.text_edit.setPlainText(content)
-            sb = self.text_edit.verticalScrollBar()
-            if sb:
-                sb.setValue(sb.maximum())
+        if content == self.text_edit.toPlainText():
+            return                      # 没变化就别动, 免得白重设、白跳
+        sb = self.text_edit.verticalScrollBar()
+        # 刷新前先记住: 用户本来是不是就贴在底部? (留几像素容差)
+        # 只有"贴底"时才自动跟随滚到最新; 否则用户在往上翻历史, 别把人拽走。
+        follow = sb is None or sb.value() >= sb.maximum() - 4
+        prev = sb.value() if sb is not None else 0
+
+        self.text_edit.setPlainText(content)
+
+        if sb is None:
+            return
+        if follow:
+            # 跟随: 用光标移到末尾再滚到底 —— setPlainText 刚结束时 maximum()
+            # 可能还没重算, 直接 setValue(maximum) 会滚不到真正的底 (就是
+            # "有时候不自己动"的原因)。移光标到末尾最稳。
+            self.text_edit.moveCursor(QTextCursor.MoveOperation.End)
+            sb.setValue(sb.maximum())
+        else:
+            # 日志是只追加的, 顶部内容不变, 所以原来的滚动位置仍指向同一批行 ——
+            # 恢复它, 用户就停在原地不被弹走。
+            sb.setValue(min(prev, sb.maximum()))
 
     def _open_console(self):
         """新开一个原生控制台窗口, 实时 tail 日志文件。
