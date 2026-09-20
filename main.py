@@ -29,8 +29,27 @@ from pathlib import Path
 # **让 native 崩溃 (0xC0000409 / access violation) 也吐出 Python 栈。**
 # "Unhandled Python exception" 一行什么都说明不了 —— faulthandler 会在
 # 崩溃瞬间把所有线程的 Python 调用栈打到 stderr, 精确到是哪一行触发的。
-# stderr 已被 _TeeLogger 重定向到日志文件, 所以崩在日志里能查到。
-faulthandler.enable(file=__import__("sys").stderr, all_threads=True)
+# stderr 通常已被 _TeeLogger 重定向到日志文件, 所以崩在日志里能查到。
+#
+# ⚠️ **打包 exe (console=False) 下 sys.stderr 是 None**, 直接 enable 会
+# `RuntimeError: sys.stderr is None` (实测打包后启动即崩)。此时退而求其次:
+# 崩溃栈写到 _TeeLogger 马上要打开的那个日志文件 —— 它由 main() 里
+# _TeeLogger.open_log 创建, 这里只能先算出路径; open_log 失败时连日志
+# 文件也没有, 那 faulthandler 只好不启用 (总不能因此起不来)。
+def _enable_faulthandler():
+    import sys as _sys
+    if _sys.stderr is not None:
+        faulthandler.enable(file=_sys.stderr, all_threads=True)
+        return
+    try:
+        _log = _paths.log_file("win_duo.log")
+        _log.parent.mkdir(parents=True, exist_ok=True)
+        faulthandler.enable(file=open(_log, "a", encoding="utf-8"), all_threads=True)
+    except Exception:  # noqa: BLE001  连日志都开不了就放弃, 不挡启动
+        pass
+
+
+_enable_faulthandler()
 
 # ═══════════════════════════════════════════════════════════════════════
 # 限制 BLAS 线程数 —— **必须在 numpy 被 import 之前设**。
