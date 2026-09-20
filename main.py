@@ -102,7 +102,7 @@ class _TeeLogger:
                 pass
 
 
-_log_file_path = str(_paths.data_file("win_duo.log"))
+_log_file_path = str(_paths.log_file("win_duo.log"))
 sys.stdout = _TeeLogger(sys.stdout, _log_file_path)
 sys.stderr = _TeeLogger(sys.stderr, _log_file_path)
 
@@ -110,7 +110,8 @@ sys.stderr = _TeeLogger(sys.stderr, _log_file_path)
 #: 打包后 `__file__` 指向临时解包目录, 直接用它会把配置写到一个马上被删掉的
 #: 地方 —— 所以统一走 paths 模块 (见那里的说明)。
 BASE_DIR = _paths.data_dir()
-DEFAULT_CONFIG = BASE_DIR / "config.json"
+#: 配置统一放 <数据目录>/diagnostics/config/config.json (见 paths.config_file)
+DEFAULT_CONFIG = _paths.config_file("config.json")
 
 
 def config_path(explicit=None):
@@ -469,7 +470,7 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
         def dump_and_quit():
             try:
                 img = widget.grabFramebuffer()
-                out = str(BASE_DIR / "smoke_widget.png")
+                out = str(_paths.debug_file("smoke_widget.png"))
                 img.save(out)
                 print("\n[smoke] grabFramebuffer -> %s (%dx%d)"
                       % (out, img.width(), img.height()))
@@ -622,7 +623,7 @@ def _check_interpreter():
     print("    你现在用的是 : %s" % sys.executable)
     if venv_py.exists():
         print("    请改用       : %s" % venv_py)
-        print("    或直接双击   : %s" % (BASE_DIR / "run_camera.bat"))
+        print("    或直接运行   : .venv\\Scripts\\python.exe main.py")
     else:
         print("    还没建环境, 先跑:")
         print("      powershell -ExecutionPolicy Bypass -File scripts\\setup_env.ps1")

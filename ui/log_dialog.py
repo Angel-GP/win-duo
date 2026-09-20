@@ -7,11 +7,11 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QVBoxLayout
 
-from paths import data_file
+from paths import log_file
 from .widgets import BodyLabel, PlainTextEdit, PrimaryPushButton, TransparentPushButton, make_icon
 
-#: 日志文件和 config.json 放在一起 (打包后是 exe 旁边, 不是临时解包目录)
-LOG_FILE = data_file("win_duo.log")
+#: 日志文件: <数据目录>/diagnostics/debug/log/win_duo.log (打包后是 exe 旁边)
+LOG_FILE = log_file("win_duo.log")
 
 
 def get_all_logs() -> str:

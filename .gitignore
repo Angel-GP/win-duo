@@ -6,7 +6,11 @@
 __pycache__/
 *.pyc
 
-# 用户配置: 首次运行由 main.DEFAULT_CFG 在程序旁边现生成, 不入库
+# 用户配置 + 调试产物: 全部收在 diagnostics/ 下, 运行时生成, 不入库
+#   diagnostics/config/config.json          用户配置
+#   diagnostics/debug/log/win_duo.log       运行日志
+#   diagnostics/debug/camera_dump/          冻结帧抓图
+diagnostics/
 config.json
 
 # 运行产物: 大多能重新生成
@@ -23,7 +27,7 @@ desk_bg.png
 # 摄像头自检输出的画面
 frame_camera_probe.png
 
-# 冻结帧 dump (angles/camera.py 检测到冻结帧时转储, 运行时产物)
+# 冻结帧 dump (旧的根级路径; 新路径由上面的 diagnostics/ 覆盖)
 camera_dump/
 
 # 着色器对照图 (offscreen_test.py 生成, 每次跑都重画)

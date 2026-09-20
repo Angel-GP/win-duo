@@ -114,6 +114,9 @@ CAMERA_OPENCV_THREADS = 2      # OpenCV 内部线程上限 (默认 32 会空转�
 #: 打开后先丢弃这么多帧再做冻结帧检测 —— 传感器刚打开的前若干帧还不稳定
 #: (虚拟摄像头尤甚), 丢一小段避免拿半初始化的帧做判断。30fps 下 ≈ 1 秒。
 CAMERA_AE_SETTLE_FRAMES = 30
+#: **dshow 专用**的自动曝光取值: 0.25=手动, 0.75=自动。这是 dshow 的语义,
+#: 对 msmf/其它后端**没有意义**, 所以只在 dshow 链路里设 (见 _configure_dshow)。
+DSHOW_AUTO_EXPOSURE = 0.75
 
 
 def _limit_opencv_threads(n):
@@ -154,11 +157,14 @@ def _picture_is_moving(cap, warmup=5, sample=3, min_diff=0.5):
 
 
 def _dump_dir():
-    """冻结帧 dump 目录: <数据目录>/camera_dump。取不到 paths 时返回 None。"""
+    """冻结帧 dump 目录: <数据目录>/diagnostics/debug/camera_dump。
+
+    取不到 paths 时返回 None (dump 只是诊断, 失败不影响主流程)。
+    """
     if paths is None:
         return None
     try:
-        d = Path(paths.writable_data_dir()) / "camera_dump"
+        d = Path(paths.debug_dir()) / "camera_dump"
         d.mkdir(parents=True, exist_ok=True)
         return d
     except Exception:  # noqa: BLE001  dump 失败不该影响主流程
@@ -171,6 +177,26 @@ def _drain_frames(cap, n):
         ok, _ = cap.read()
         if not ok:
             break
+
+
+def _configure_dshow(cap):
+    """dshow 链路专有的初始化: 打开自动曝光。
+
+    `CAP_PROP_AUTO_EXPOSURE` 的 0.25/0.75 是 **dshow 专有语义** (0.25=手动,
+    0.75=自动)。老代码设 0.25(手动) 却从不给 `CAP_PROP_EXPOSURE` 值, 驱动回退到
+    默认 1/64s, 室内画面亮度只有 ~5, ORB 提不出特征 -> 无法标定/检测。这里改成
+    自动 (0.75)。
+
+    **只对 dshow 调用。** 对 msmf/其它后端, 这个属性没有该语义, 硬设可能破坏原本
+    正常的曝光 (实测日志: 成功的是 msmf)。
+
+    必须在 `_drain_frames` **之前**调用 —— 丢帧的目的就是等自动曝光收敛, 先丢帧
+    再设曝光等于白丢。
+    """
+    try:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, DSHOW_AUTO_EXPOSURE)
+    except Exception:  # noqa: BLE001  个别设备不支持, 忽略
+        pass
 
 
 def open_camera(index=0, backend="auto", warmup=5,
@@ -195,7 +221,10 @@ def open_camera(index=0, backend="auto", warmup=5,
             cap.release()
             tried.append("%s: 打不开" % name)
             continue
-        # 先丢一小段帧, 避免拿传感器刚上电的半初始化画面做检测/dump。
+        # **先按后端做专有初始化 (仅 dshow 需要设自动曝光), 再丢帧** ——
+        # 丢帧就是为了等自动曝光收敛, 顺序反了等于白丢。
+        if name == "dshow":
+            _configure_dshow(cap)
         _drain_frames(cap, CAMERA_AE_SETTLE_FRAMES)
         moving, frame = _picture_is_moving(cap, warmup=warmup)
         if moving:
@@ -403,16 +432,11 @@ class OrbTracker:
         self.cap = None
         self.backend_name = None
         if with_camera:
+            # 打开 + 曝光等后端专有初始化都在 open_camera 里做完了 (见
+            # _configure_dshow) —— 这里不再重复设曝光, 免得对 msmf 也设上
+            # dshow 专有的值而破坏曝光。
             self.cap, self.backend_name = open_camera(camera_index, backend,
                                                       threads=threads)
-            try:
-                # dshow: 0.75=自动曝光。之前这里设 0.25(手动)却从没给过
-                # EXPOSURE 值, 驱动停在默认 1/64s, 室内画面亮度只有 ~5,
-                # 特征点根本提不出来 (实测开自动后 ~93)。亮度漂移由
-                # _prepare 里的 CLAHE 兜底, 不怕自动曝光。
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
-            except Exception:  # noqa: BLE001
-                pass
 
         self.orb = cv2.ORB_create(nfeatures=nfeatures)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)

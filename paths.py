@@ -95,6 +95,47 @@ def data_file(name):
     return writable_data_dir() / name
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 分类目录: 配置 / 调试产物
+# ═══════════════════════════════════════════════════════════════════════
+# 让程序旁边不再是"一地散file": 配置进 diagnostics/config/, 日志与调试抓图进
+# diagnostics/debug/。都建在**可写数据目录**下 (打包后 = exe 旁边)。
+def config_dir():
+    """配置文件目录: <数据目录>/diagnostics/config"""
+    d = writable_data_dir() / "diagnostics" / "config"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def debug_dir():
+    """调试产物目录: <数据目录>/diagnostics/debug (日志 + 抓图)"""
+    d = writable_data_dir() / "diagnostics" / "debug"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def log_dir():
+    """日志目录: <数据目录>/diagnostics/debug/log"""
+    d = debug_dir() / "log"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def config_file(name):
+    """配置目录里的一个文件路径。"""
+    return config_dir() / name
+
+
+def log_file(name):
+    """日志目录里的一个文件路径。"""
+    return log_dir() / name
+
+
+def debug_file(name):
+    """调试目录里的一个文件路径 (日志的子目录同级)。"""
+    return debug_dir() / name
+
+
 def resource_file(name):
     """只读资源目录里的一个文件路径。"""
     return resource_dir() / name

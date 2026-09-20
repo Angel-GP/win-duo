@@ -125,9 +125,10 @@ def build(onedir=False, clean=False, console=False, name=NAME):
     print("""
 使用说明:
   1. 双击 %s 即可 —— 默认驻留托盘, 不弹窗。
-  2. **config.json 在 exe 旁边**, 首次启动会自动生成。
-     想在别的机器上用, 把 exe 和 config.json 一起拷过去。
-  3. 日志也在 exe 旁边: win_duo.log (或界面里「高级设置 -> 调试 -> 查看运行日志」)。
+  2. 配置在 exe 旁边的 diagnostics\\config\\config.json, 首次启动自动生成。
+     想在别的机器上用, 把 exe 和整个 diagnostics 目录一起拷过去。
+  3. 日志在 diagnostics\\debug\\log\\win_duo.log
+     (或界面里「高级设置 -> 调试 -> 查看运行日志」)。
   4. 关不掉时按 Ctrl+Alt+Shift+Esc (关玻璃层并退出)。
 """ % (name + ".exe"))
     return 0
