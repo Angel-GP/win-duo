@@ -1,4 +1,6 @@
 """日志查看与导出弹窗。"""
+import subprocess
+import sys
 import time
 
 from PyQt6.QtCore import QTimer
@@ -52,6 +54,14 @@ class LogDialog(QDialog):
         self.btn_refresh.clicked.connect(self.refresh_log)
         btn_row.addWidget(self.btn_refresh)
 
+        # 弹一个**原生命令行窗口**实时滚动日志 —— 打包成无控制台 exe 后, 这是
+        # 唯一能"调出命令框看实时输出"的入口。
+        self.btn_console = TransparentPushButton("弹出命令行日志")
+        self.btn_console.clicked.connect(self._open_console)
+        if sys.platform != "win32":
+            self.btn_console.setEnabled(False)
+        btn_row.addWidget(self.btn_console)
+
         btn_row.addStretch(1)
 
         self.btn_save = PrimaryPushButton("保存日志文件...")
@@ -78,6 +88,34 @@ class LogDialog(QDialog):
             sb = self.text_edit.verticalScrollBar()
             if sb:
                 sb.setValue(sb.maximum())
+
+    def _open_console(self):
+        """新开一个原生控制台窗口, 实时 tail 日志文件。
+
+        为什么这么做: 打包成 exe 是 **--windowed** 的, 进程没有控制台, 平时看不到
+        stdout。而 main.py 把所有 stdout/stderr 都 tee 进了 win_duo.log, 所以这里
+        另起一个控制台窗口去实时跟随那个文件, 就等于"随时调出一个命令行日志窗"。
+        (不动主进程的流, 只读文件 —— 安全、不影响运行。)
+
+        - chcp 65001: 把控制台切到 UTF-8, 否则中文日志会乱码 (默认 cp936)。
+        - Get-Content -Wait: PowerShell 的实时 tail, 新写入的行会自动冒出来。
+        - CREATE_NEW_CONSOLE (0x10): 给子进程分配独立的控制台窗口。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            # 文件不存在时 Get-Content -Wait 会直接报错, 先确保它在
+            LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            LOG_FILE.touch(exist_ok=True)
+            log = str(LOG_FILE).replace("'", "''")   # PowerShell 单引号转义
+            cmd = (
+                'cmd /k chcp 65001>nul & title win-duo log & '
+                'powershell -NoProfile -ExecutionPolicy Bypass -Command '
+                '"Get-Content -LiteralPath \'%s\' -Encoding utf8 -Wait -Tail 400"'
+                % log)
+            subprocess.Popen(cmd, creationflags=0x00000010)   # CREATE_NEW_CONSOLE
+        except Exception as exc:  # noqa: BLE001
+            print("[log] 打开命令行日志窗口失败:", exc)
 
     def save_log(self):
         target, _ = QFileDialog.getSaveFileName(
