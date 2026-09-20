@@ -25,7 +25,15 @@
    （`_maybe_reopen`）**重挑 DXGI output** —— 不在主线程直接 release，避免踩到 native
    崩溃。挑不到就退回 mss。
 
-已在本机双屏（2560x1600 主屏 + 1920x1080 副屏）验证：Qt[0]→output 0、Qt[1]→output 1。
+已在本机双屏（2560x1600 主屏 + 1920x1080 副屏）验证：Qt[0]→output 0、Qt[1]→output 1；
+反复切屏 6 次（含连续选同一屏）并每次真抓帧，均返回目标屏分辨率、未踩到 bettercam
+单例已释放对象。
+
+**本次修复的已知残留（可接受）：**
+- dxcam 后端无法区分**同分辨率**双屏：`_cam_origin` 只从 bettercam 的
+  `_output.desc.DesktopCoordinates` 取坐标，dxcam 结构不同会返回 `None`，`dist` 恒为 0，
+  退化成"按分辨率选第一块"。bettercam 是首选后端，dxcam 只是退路，影响很小。
+- 走 mss 回退时仍受下面 #1 影响（本次没动 mss 路径）。
 
 ---
 
@@ -142,6 +150,20 @@ docstring 写"返回 ... RGBA ndarray"，但 `COLOR = "BGRA"`，实际全链路�
 `suppressed` 或 `enabled=False` 状态，这里会把它强行显示出来，与 tick 的显隐逻辑
 短暂打架（下一 tick 会纠正，但有一帧闪现）。
 
+### 12. `ui/controller.py::set_screen` — 换屏后没同步刷新率（二次审计新增）
+
+`set_screen` 更新了截屏区域和 overlay 几何，但没更新 `self.capture.display_hz`，
+overlay 的 `capture_hz` 也仍是旧屏的值。两块屏刷新率不同时（如 165Hz 主屏 + 60Hz
+副屏），重截频率上限不会跟着变。只影响性能调度，不影响画面正确性。
+建议：`set_screen` 里更新 `capture.display_hz` 并调 `overlay.apply_config()`。
+
+### 13. `ui/controller.py::set_screen` — 换屏瞬间可能闪一帧黑（二次审计新增）
+
+`capture.set_region` 会把 `frame=None`、`overlay.set_screen` 把 `_uploaded_seq=-1`，
+在下一帧到达前 `paintGL` 会 `glClear` 成黑。换屏没走 `start_glass` 里"等首帧就绪再
+显示"（`_show_overlay_when_ready`）的逻辑，合成器抓到那一帧会闪一下黑。
+建议：换屏后同样延迟到首帧就绪再重绘。
+
 ---
 
 ## 四、说明（非 bug）
@@ -157,7 +179,9 @@ docstring 写"返回 ... RGBA ndarray"，但 `COLOR = "BGRA"`，实际全链路�
 
 建议优先处理用户能实际感知到的：
 
-1. **#1** 截屏区域错位（多显示器 + 缩放）
-2. **#3** 摄像头后端被硬编码覆盖
-3. **#4** 日志无限增长
-4. **#7** `_loading` 异常后卡死界面
+1. ~~选副屏仍捕获主屏~~ —— 已修复（见〇）
+2. **#1** mss 路径截屏区域错位（多显示器 + 缩放）
+3. **#3** 摄像头后端被硬编码覆盖
+4. **#4** 日志无限增长
+5. **#7** `_loading` 异常后卡死界面
+6. **#13** 换屏闪黑（用户可感知，但只在切换那一瞬）

@@ -148,9 +148,21 @@ class AppController(QObject):
         self.cfg["screen_name"] = screen.name()
         self.cfg["screen_index"] = monitors.index_of(screen)
         self.capture.set_region(monitors.region_for(screen))
+        # #12: 换屏后刷新率可能变了 (如 165Hz 主屏 -> 60Hz 副屏), 更新采集上限,
+        # 否则 max_hz() 仍按旧屏给, 重截频率上限不对。
+        try:
+            self.capture.display_hz = float(screen.refreshRate() or 60.0)
+        except Exception:  # noqa: BLE001
+            pass
         if self.overlay is not None:
             self.overlay.set_screen(screen)
             self.overlay.enabled = self.glass_on
+            # 换屏清掉了 frame/上传纹理, 下一帧到达前 paintGL 会清成黑 -> 闪一下。
+            # 和"首帧闪黑"同源: 让窗口先藏起来, 等新屏首帧就绪再显示。
+            self.overlay.apply_config()      # 让 capture_hz 等按新屏重算
+            if self.glass_on and not self.overlay.suppressed:
+                self.overlay.hide()
+                self._show_overlay_when_ready()
 
     # ------------------------------------------------------------ 玻璃层
     def _ensure_overlay(self):
