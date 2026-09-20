@@ -259,24 +259,27 @@ class SettingsPanel(QWidget):
         l2.setContentsMargins(0, 4, 0, 0)
         l2.setSpacing(8)
 
+        # 全部走 _labeled: 标签右对齐在统一的 78px 列, 控件紧跟其后 ——
+        # 和「效果参数」「调试」两页一致, 标签列上下对齐, 不再一会儿靠左
+        # 一会儿靠右。
         self.sw_autocal = SwitchButton()
         self.sw_autocal.setOnText("开")
         self.sw_autocal.setOffText("关")
-        l2.addWidget(row(BodyLabel("自动标定"), None, self.sw_autocal, spacing=8)[0])
+        l2.addWidget(self._labeled("自动标定", self.sw_autocal))
 
         self.sw_autoglass = SwitchButton()
         self.sw_autoglass.setOnText("开")
         self.sw_autoglass.setOffText("关")
-        l2.addWidget(row(BodyLabel("自动启动"), None, self.sw_autoglass, spacing=8)[0])
+        l2.addWidget(self._labeled("自动启动", self.sw_autoglass))
 
         self.sw_autostart = SwitchButton()
         self.sw_autostart.setOnText("开")
         self.sw_autostart.setOffText("关")
-        l2.addWidget(row(BodyLabel("开机自启"), None, self.sw_autostart, spacing=8)[0])
+        l2.addWidget(self._labeled("开机自启", self.sw_autostart))
 
         self.edt_port = LineEdit()
         self.edt_port.setPlaceholderText("COM3")
-        l2.addWidget(self._labeled("ESP32 串口", self.edt_port, label_w=78))
+        l2.addWidget(self._labeled("ESP32 串口", self.edt_port))
         self.stack_adv.addWidget(p2)
 
         # 页面 3: 调试 (匹配调试窗、查看日志)
