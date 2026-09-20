@@ -340,6 +340,8 @@ def apply_args(cfg, args):
         cfg["camera_scale"] = args.scale
     if args.screen is not None:
         cfg["screen_index"] = args.screen
+    if args.capture_backend:
+        cfg["capture_backend"] = args.capture_backend
     if args.low_memory:
         cfg["low_memory_mode"] = True
     return cfg
@@ -698,6 +700,10 @@ def main():
     ap.add_argument("--camera-backend", dest="camera_backend",
                     choices=["auto", "dshow", "msmf", "any"],
                     help="摄像头取流后端 (默认 auto: 会跳过冻结帧)")
+    ap.add_argument("--capture-backend", dest="capture_backend",
+                    choices=["auto", "wgc", "dxgi", "mss"],
+                    help="桌面采集后端 (默认 auto: wgc -> dda -> mss)。"
+                         "多后端渲染验证用: --capture-backend mss --smoke 之类")
     ap.add_argument("--port", help="ESP32 串口, 如 COM3")
     ap.add_argument("--screen", type=int, help="用第几块显示器 (0 起)")
     ap.add_argument("--outside", choices=["black", "backdrop"],

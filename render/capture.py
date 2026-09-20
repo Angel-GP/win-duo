@@ -560,9 +560,10 @@ class CaptureWorker(threading.Thread):
                     return
                 except Exception as exc:  # noqa: BLE001
                     if self.want_backend == "dxgi":
-                        print("[capture] DXGI 不可用: %s" % exc)
-                    else:
-                        print("[capture] DXGI 不可用, 退回 mss: %s" % exc)
+                        # **强制 dxgi 失败就硬失败**: 验证某个后端的渲染时
+                        # 静默降到 mss 会让测试者以为自己还在测 dxgi。
+                        raise RuntimeError("强制 dxgi 后端不可用: %s" % exc)
+                    print("[capture] DXGI 不可用, 退回 mss: %s" % exc)
         self.backend = "mss"
         self._sct = mss.mss()
         print("[capture] 后端 mss (GDI BitBlt), %dx%d" % self.size)
