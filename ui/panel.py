@@ -111,14 +111,10 @@ class SettingsPanel(QWidget):
 
         self.setWindowTitle("win-duo 设置")
         self.setWindowIcon(make_icon())
-        self.setFixedWidth(470)
-        # **显式去掉最大化按钮。** 光靠固定尺寸在有的机器上不会让 Windows 禁用
-        # 最大化 (尤其是首次 show 之后才把高度固定的话)。这里在建窗口之前就把
-        # 最大化 hint 摘掉, 保留最小化/关闭。这样最大化不会再把窄窗拉成长条。
-        self.setWindowFlags(self.windowFlags()
-                            | Qt.WindowType.WindowMinimizeButtonHint)
-        self.setWindowFlags(self.windowFlags()
-                            & ~Qt.WindowType.WindowMaximizeButtonHint)
+        # 可自由缩放 / 最大化: 只给一个最小尺寸, 不锁死宽高。
+        # 控件都用"标签列 + 可拉伸控件"的自适应布局, 拉宽会自然铺开。
+        self.setMinimumSize(440, 420)
+        self.resize(470, 520)
         self._build()
         # 顺序很重要: 先建控件 -> 用真实配置填充 -> **最后**才接信号。
         # 反过来的话, 填充时每个 setValue/setChecked 都会触发一次"用户改动",
@@ -482,12 +478,14 @@ class SettingsPanel(QWidget):
 
     # ================================================================ 交互
     def _fit_height(self):
-        """主窗高度贴合内容。宽高都固定 -> Windows 自动禁用最大化按钮,
-        所以不会再出现"最大化把窄窗拉成长条"。
+        """首次显示时把窗口调到合适大小 (可缩放 / 可最大化)。
 
-        高级设置已移到独立弹窗, 主窗内容本来就短, 不需要滚动条。
+        **不再锁死宽高** —— 那会把最大化按钮禁掉。这里只在窗口还很小
+        (没被用户调整过) 时给一个贴合内容的高度, 之后用户可自由拉大/最大化。
         """
-        self.setFixedHeight(self.sizeHint().height())
+        if self.height() < self.minimumHeight() + 8:
+            h = min(self.sizeHint().height(), 640)
+            self.resize(self.width(), max(self.minimumHeight(), h))
 
     def _open_advanced(self):
         """弹出高级设置窗 (modeless, 跟随主窗但不阻塞)。"""
