@@ -62,6 +62,7 @@
 一套。角度 -> level 的映射 (angle_to_level) 是**产品参数** (SCALE/SIGN 的手感),
 不是算法核心。
 """
+import json
 import threading
 import time
 from pathlib import Path
@@ -179,6 +180,53 @@ def _drain_frames(cap, n):
             break
 
 
+# ═══════════════════════════════════════════════════════════════════
+# "上次成功的后端" 记忆 —— 根治"每次都先撞上虚拟摄像头"
+# ═══════════════════════════════════════════════════════════════════
+# 问题: `auto` 的后端顺序是写死的 dshow -> msmf -> any。但 index 与设备的对应
+# **随后端而变**, 而且**虚拟摄像头(手机投屏/联想超级互联)常常在 dshow 下排在
+# 最前面并给出冻结帧**。于是在这类机器上, 每次打开摄像头都要先"打开虚拟摄像头
+# -> 丢 30 帧 -> 检测到冻结 -> dump 一张 -> release", 再轮到真摄像头。
+#
+# 修法: 把**每个 index 上次真正成功的后端**记到一个小状态文件, 下次 auto 时把它
+# 排到最前, 直接命中真摄像头; 它若失败(拔了/换了设备)再退回完整列表。
+# 状态文件跟 config 放一起 (<数据目录>/diagnostics/config/camera_backend.json)。
+def _state_path():
+    if paths is None:
+        return None
+    try:
+        return paths.config_file("camera_backend.json")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_good_backends():
+    p = _state_path()
+    if p is None or not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001  坏了就当没有
+        return {}
+
+
+def _remember_backend(index, backend):
+    """记住某 index 成功的后端 (供下次 auto 优先)。失败静默。"""
+    p = _state_path()
+    if p is None:
+        return
+    try:
+        d = _load_good_backends()
+        if d.get(str(index)) == backend:
+            return
+        d[str(index)] = backend
+        p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n",
+                     encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _configure_dshow(cap):
     """dshow 链路专有的初始化: 打开自动曝光。
 
@@ -209,9 +257,17 @@ def open_camera(index=0, backend="auto", warmup=5,
     "auto" 依次试 dshow -> msmf -> any。
     """
     _limit_opencv_threads(threads)
-    order = ([("dshow", cv2.CAP_DSHOW), ("msmf", cv2.CAP_MSMF),
-              ("any", cv2.CAP_ANY)]
-             if backend == "auto" else [(backend, _BACKEND_APIS[backend])])
+    if backend == "auto":
+        full = [("dshow", cv2.CAP_DSHOW), ("msmf", cv2.CAP_MSMF),
+                ("any", cv2.CAP_ANY)]
+        # 把"上次成功的后端"提到最前 —— 避免每次都先撞上 dshow 下的虚拟摄像头。
+        # 找不到/记的后端不在列表里就保持原顺序。
+        good = _load_good_backends().get(str(index))
+        order = sorted(full, key=lambda kv: 0 if kv[0] == good else 1)
+        if good and order[0][0] == good:
+            print("[camera] index=%d 上次成功的后端是 %s, 优先试它" % (index, good))
+    else:
+        order = [(backend, _BACKEND_APIS[backend])]
 
     tried = []
     dump_dir = _dump_dir()
@@ -229,6 +285,7 @@ def open_camera(index=0, backend="auto", warmup=5,
         moving, frame = _picture_is_moving(cap, warmup=warmup)
         if moving:
             # 注意: 成功路径不 release —— 返回的就是这个 cap 给上层继续用。
+            _remember_backend(index, name)     # 记住它, 下次直接用
             return cap, name
         cap.release()
         if frame is None:
@@ -242,6 +299,8 @@ def open_camera(index=0, backend="auto", warmup=5,
                 try:
                     cv2.imwrite(str(fp), frame)
                     tried[-1] += " (画面已存到 %s)" % fp
+                    print("[camera] index=%d 后端 %s 是冻结帧(虚拟摄像头), "
+                          "画面 dump 到 %s" % (index, name, fp))
                 except Exception:  # noqa: BLE001
                     pass
 
