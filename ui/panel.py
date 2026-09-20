@@ -113,8 +113,11 @@ class SettingsPanel(QWidget):
         self.setWindowIcon(make_icon())
         # 可自由缩放 / 最大化: 只给一个最小尺寸, 不锁死宽高。
         # 控件都用"标签列 + 可拉伸控件"的自适应布局, 拉宽会自然铺开。
-        self.setMinimumSize(440, 420)
-        self.resize(470, 520)
+        # 初始高度先给个小的, 首次 show 时由 _fit_height 贴合真实内容
+        # (避免写死高度导致底部一大片空白)。
+        self.setMinimumSize(440, 300)
+        self.resize(470, 300)
+        self._fitted = False
         self._build()
         # 顺序很重要: 先建控件 -> 用真实配置填充 -> **最后**才接信号。
         # 反过来的话, 填充时每个 setValue/setChecked 都会触发一次"用户改动",
@@ -495,14 +498,18 @@ class SettingsPanel(QWidget):
 
     # ================================================================ 交互
     def _fit_height(self):
-        """首次显示时把窗口调到合适大小 (可缩放 / 可最大化)。
+        """首次显示时把窗口高度贴合内容 —— 不留底部空白。
 
-        **不再锁死宽高** —— 那会把最大化按钮禁掉。这里只在窗口还很小
-        (没被用户调整过) 时给一个贴合内容的高度, 之后用户可自由拉大/最大化。
+        只做一次 (`self._fitted`): 之后用户手动拉大/最大化都不再干预。
+        用 sizeHint 而不是 setFixedHeight, 所以窗口仍然可自由缩放/最大化。
         """
-        if self.height() < self.minimumHeight() + 8:
-            h = min(self.sizeHint().height(), 640)
-            self.resize(self.width(), max(self.minimumHeight(), h))
+        if self._fitted:
+            return
+        self._fitted = True
+        if self.isMaximized():
+            return
+        h = max(self.minimumHeight(), self.sizeHint().height())
+        self.resize(self.width(), h)
 
     def _open_advanced(self):
         """弹出高级设置窗 (modeless, 跟随主窗但不阻塞)。"""
