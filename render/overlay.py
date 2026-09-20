@@ -303,7 +303,6 @@ class GlassOverlay(QOpenGLWidget):
         else:
             print("[GL] 着色器编译链接 OK")
         self.prog.bind()
-        print("[GL] step: prog.bind 完成")
 
         # uniform 位置**在这里查一次就好**。`uniformLocation` 每次都要拿字符串
         # 去驱动里查表, 而 paintGL 每帧要设 9 个 uniform —— 每帧 9 次字符串查表
@@ -317,10 +316,8 @@ class GlassOverlay(QOpenGLWidget):
         missing = [k for k, v in self._uloc.items() if v < 0]
         if missing:
             print("[GL] 警告: 这些 uniform 没找到 (驱动可能优化掉了): %s" % missing)
-        print("[GL] step: uniform 缓存完成 %s" % self._uloc)
 
         self.cap_tex = self._new_tex(swizzle_bgra=True)   # BGRA 帧, 采样时硬件换通道
-        print("[GL] step: cap_tex=%s (含 swizzle 设置) 完成" % self.cap_tex)
         # bd_tex 同样走 swizzle: _upload_backdrop 手上的是 cv2 的 BGR 数据,
         # 灌成 RGBA 字节序再让采样器按 (B,G,R,1) 换回来, 省一次 CPU 换通道。
         self.bd_tex = self._new_tex(swizzle_bgra=True)
@@ -329,7 +326,6 @@ class GlassOverlay(QOpenGLWidget):
         GL.glTexParameteriv(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_RGBA,
                             (GL.GL_BLUE, GL.GL_GREEN, GL.GL_RED, GL.GL_ONE))
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
-        print("[GL] step: bd_tex=%s (含 swizzle 设置) 完成" % self.bd_tex)
 
         # **core profile 必须有一个已绑定的 VAO 才能发起 draw call**, 哪怕不用
         # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
@@ -337,17 +333,14 @@ class GlassOverlay(QOpenGLWidget):
         if not self.vao:
             print("[GL] 警告: glGenVertexArrays 失败 (core 下会画不出东西)")
 
-        print("[GL] step: initializeGL 全部完成, glError=0x%X"
-              % GL.glGetError())
-
         self._gl_ready = True
 
     @staticmethod
     def _gl_err_where(tag):
-        """打印并清掉当前 GL 错误旗标。调试用, 定位完就删。"""
+        """打印并清掉当前 GL 错误旗标 (调试辅助, 平时无错时零输出)。"""
         err = GL.glGetError()
         if err != 0:
-            print("[GL] step: %s 处 glError=0x%X" % (tag, err))
+            print("[GL] %s 处 glError=0x%X" % (tag, err))
 
     @staticmethod
     def _new_tex(swizzle_bgra=False):
@@ -403,16 +396,17 @@ class GlassOverlay(QOpenGLWidget):
             #     swizzle,采样时硬件换回 R/B —— 见 _new_tex 的说明。
             # 于是每帧的 CPU 换通道 (frame_bgra_to_rgba, 16MB 搬运) 整个删掉,
             # GL 调用本身对任何驱动都规范安全。
-            print("[GL] step: 首次上传 seq=%s %dx%d fmt=%s type=%s flags=%s"
-                  % (seq, fw, fh, fmt, type(raw).__name__,
-                     getattr(raw, "flags", None) and raw.flags["C_CONTIGUOUS"]))
+            #
+            # **fmt 契约**: 上传无条件按 BGRA 字节序灌 (swizzle 负责换通道)。
+            # 现存三个后端 (wgc/dda/mss) 都以 "BGRA" 登记, 这里 assert 钉死
+            # —— 未来若有人加 RGBA 后端而忘了改这里, 会在开发期立刻炸出来,
+            # 而不是上线后整屏红蓝反转还查不到原因。
+            assert fmt == "BGRA", "paintGL 假定帧是 BGRA, 实际 fmt=%r" % (fmt,)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, fw, fh, 0,
                             GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
-            self._gl_err_where("首次 glTexImage2D (BGRA 直灌)")
             GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
-            print("[GL] step: 首次上传完成")
             self._uploaded_seq = seq
             self._uploaded_size = (fw, fh)
             if not self._backdrop_ready:
