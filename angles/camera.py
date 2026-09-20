@@ -791,7 +791,8 @@ class CameraAngleSource(AngleSource):
         # 不再进 config.json (见本文件顶部的 CAMERA_* 常量)。
         self.nfeatures = CAMERA_NFEATURES
         self.deadzone = CAMERA_DEADZONE
-        self.autocal = CAMERA_AUTOCAL
+        # 自动标定由用户在设置里控制 (autocal_on_glass_open); 源码常量只是默认。
+        self.autocal = bool(cfg.get("autocal_on_glass_open", CAMERA_AUTOCAL))
         self.target_fps = CAMERA_FPS
         self.min_cutoff = CAMERA_MIN_CUTOFF
         self.beta = CAMERA_BETA
@@ -874,6 +875,22 @@ class CameraAngleSource(AngleSource):
     def opening(self):
         """还在打开设备中 (此时 available() 仍为 True, 但还不能下结论)。"""
         return self._thread is not None and self._tracker is None
+
+    def ready(self):
+        """设备**真的就绪**了吗 —— 打开成功且已经产出若干帧。
+
+        判据不能只看 `opening()` (那只表示"打开动作还没结束"): 打开成功但还在
+        抓头几帧时, 画面可能还没稳定(曝光/AE 未收敛)。自动标定必须等到这时机
+        之后, 否则会拿一张未就绪的帧当基准。`_frames > target_fps` 约等于"出图
+        满 1 秒", 与摄像头源自身的按帧自动标定判据一致。
+        """
+        if self._tracker is None or self._open_error is not None:
+            return False
+        return self._frames > int(self.target_fps)
+
+    def calibrated(self):
+        """是否已经标定过基准帧 (tracker 有参考帧)。"""
+        return bool(self._tracker is not None and self._tracker.has_reference)
 
     # ---------- 外部命令 ----------
     def request_calibration(self):

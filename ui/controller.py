@@ -413,7 +413,10 @@ class AppController(QObject):
         self._schedule_source_check()
         # 打开悬浮玻璃开关后自动标定一次基准帧 (仅限用户主动开启; 低内存重建不标定)
         if recalibrate and self.cfg.get("autocal_on_glass_open", True):
-            QTimer.singleShot(1600, self._auto_calibrate_on_open)
+            # **不能盲等固定时间再标定**: 摄像头是异步打开的 (最坏要 ~20 秒),
+            # 写死 1.6s 会在设备还没出图时就去标定 —— 基准帧是黑的/未稳定的,
+            # 之后测角全错。改成轮询到"真的就绪"再标定。
+            self._auto_calibrate_when_ready()
         print("[glass] 已开启")
 
     def _show_overlay_when_ready(self, tries=0):
@@ -431,6 +434,37 @@ class AppController(QObject):
             QTimer.singleShot(50, lambda: self._show_overlay_when_ready(tries + 1))
             return
         ov.show()
+
+    def _auto_calibrate_when_ready(self, tries=0):
+        """等摄像头**真的就绪** (打开成功 + 已出图) 后再自动标定一次。
+
+        为什么要等而不是定时: 设备异步打开, 最坏 ~20 秒。原来写死 1.6 秒, 摄像头
+        还没出图就去标定, 基准帧是黑的/未稳定的 -> 整条测角都不对。
+        这里每 250ms 查一次 `ready()`, 最多等 ~30 秒; 超时就放弃 (不硬标)。
+        """
+        if not self.glass_on or self.hub.active_name() != "camera":
+            return                              # 已关玻璃层/换了源 -> 不必标了
+        cam = self.hub.get("camera")
+        if cam is None:
+            return
+        # 出错/不可用就别等了
+        if getattr(cam, "available", lambda: True)() is False:
+            print("[camera] 不可用, 跳过自动标定")
+            return
+        if not getattr(cam, "ready", lambda: False)():
+            if tries < 120:                     # 120×250ms ≈ 30s 上限
+                QTimer.singleShot(
+                    250, lambda: self._auto_calibrate_when_ready(tries + 1))
+            else:
+                print("[camera] 等待就绪超时, 跳过自动标定 (可手动标定)")
+            return
+        # 摄像头源自己启动后也会自动标定一次 (~1 秒出图后)。如果它已经标好了,
+        # 这里就别再标 —— 否则同一段启动里白标两次, 第二次纯粹多余。
+        if getattr(cam, "calibrated", lambda: False)():
+            print("[camera] 摄像头源已自动标定, 无需重复")
+            return
+        print("[camera] 设备已就绪, 自动标定基准帧")
+        self.calibrate_camera()
 
     def _auto_calibrate_on_open(self):
         if self.glass_on and self.hub.active_name() == "camera":
