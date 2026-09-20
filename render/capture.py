@@ -153,6 +153,74 @@ def frame_bgra_to_rgba(data, w, h):
 # DDA 在部分驱动 (Intel Arc) 上会无视 SetWindowDisplayAffinity -> 反馈回路,
 # 所以顺序是 wgc -> dda -> mss。哪台机器上次哪个后端真的在用, 下次优先试它。
 # ═══════════════════════════════════════════════════════════════════
+
+
+def _enum_monitors():
+    """EnumDisplayMonitors 枚举所有显示器: [(origin, (w, h)), ...]。
+
+    顺序就是 Windows API 的枚举顺序, 与 windows-capture 的 monitor_index
+    (1-based) 一一对应: monitors[i] 的 index 是 i+1。实测单屏环境:
+    index=1 -> 主屏, index>=2 报 "Failed to find the specified monitor"。
+
+    用物理坐标 (进程 DPI-aware 时), 与 region_for() 换算出的 origin 同一坐标系。
+    """
+    if sys.platform != "win32":
+        return []
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
+                    ("rcWork", RECT), ("dwFlags", ctypes.c_ulong),
+                    ("szDevice", ctypes.c_wchar * 32)]
+
+    out = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.POINTER(RECT), ctypes.c_double)
+    def _cb(_hmon, _hdc, _rect, _data):
+        mi = MONITORINFOEXW()
+        mi.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if ctypes.windll.user32.GetMonitorInfoW(_hmon, ctypes.byref(mi)):
+            rc = mi.rcMonitor
+            out.append(((int(rc.left), int(rc.top)),
+                        (int(rc.right - rc.left), int(rc.bottom - rc.top))))
+        return True
+
+    ctypes.windll.user32.EnumDisplayMonitors(None, None, _cb, 0)
+    return out
+
+
+def _monitor_index_for(origin, size):
+    """按目标屏的桌面 origin (物理像素) 找 windows-capture 的 monitor_index (1-based)。
+
+    匹配规则与 _DxgiSource 的选屏一致: 先精确 origin, 再"最近 origin",
+    最后拿分辨率兜底。找不到返回 None (调用方退回主屏)。
+    """
+    if origin is None:
+        return None
+    monitors = _enum_monitors()
+    if not monitors:
+        return None
+    for i, (org, _wh) in enumerate(monitors):
+        if tuple(org) == tuple(origin):
+            return i + 1
+    best_i, best_d = None, None
+    for i, (org, _wh) in enumerate(monitors):
+        d = abs(org[0] - origin[0]) + abs(org[1] - origin[1])
+        if best_d is None or d < best_d:
+            best_i, best_d = i, d
+    if best_i is not None and best_d <= 64:
+        return best_i + 1
+    if size:
+        for i, (_org, wh) in enumerate(monitors):
+            if tuple(wh) == tuple(size):
+                return i + 1
+    return None
+
+
 _STATE_PATH = None
 
 
@@ -198,20 +266,25 @@ class _WgcSource:
 
     windows-capture 的 API 坑 (实测):
       - `start_free_threaded()` 前必须注册 on_closed 回调, 否则直接抛异常;
-      - monitor_index 从 1 起, 不传默认主屏 —— 正好匹配 bettercam 那边
-        "按分辨率找 output" 之前的默认行为 (主屏);
+      - monitor_index 从 1 起 (EnumDisplayMonitors 顺序), 0 会报
+        "must be greater than zero", 不传默认主屏;
       - 帧 frame_buffer 是 BGRA ndarray (OWNDATA, 独占内存), 直接可用。
     """
 
     COLOR = "BGRA"
 
-    def __init__(self, size):
+    def __init__(self, size, origin=None):
         self.w, self.h = int(size[0]), int(size[1])
         self._warned_size = False
         from windows_capture import WindowsCapture   # noqa: PLC0415  探测导入
-        # 不传 monitor_index = 主屏; 多屏时 region 由 controller 换算到物理像素,
-        # 与 DDA 全屏帧的裁剪策略一致 (上层只关心匹配分辨率的整屏帧)。
-        self.cap = WindowsCapture(cursor_capture=False, draw_border=False)
+        # 多屏时按 origin 选屏 —— 只按分辨率选会永远命中第一块, "选了副屏
+        # 还截主屏" (与 _DxgiSource 的 origin 消歧同一bug, 见它的注释)。
+        idx = _monitor_index_for(origin, (self.w, self.h))
+        if idx is not None:
+            print("[capture] WGC 选屏: origin=%s -> monitor_index=%d"
+                  % (origin, idx))
+        self.cap = WindowsCapture(cursor_capture=False, draw_border=False,
+                                  monitor_index=idx)
         self._latest = None
         self._ctrl = None
 
@@ -462,10 +535,10 @@ class CaptureWorker(threading.Thread):
                 continue
             if name == "wgc":
                 try:
-                    self._wgc = _WgcSource(self.size)
+                    self._wgc = _WgcSource(self.size, origin=self.origin)
                     self.backend = "wgc"
-                    print("[capture] 后端 wgc (Windows.Graphics.Capture), %dx%d"
-                          % self.size)
+                    print("[capture] 后端 wgc (Windows.Graphics.Capture), %dx%d @ 桌面坐标 %s"
+                          % (self.size + (self.origin,)))
                     return
                 except Exception as exc:  # noqa: BLE001
                     print("[capture] WGC 不可用%s: %s"
@@ -638,19 +711,40 @@ class CaptureWorker(threading.Thread):
             self._dxgi.release()
 
     def _maybe_reopen(self):
-        """换屏后重挑 DXGI output —— **只在采集线程里调**, 这是安全点。
+        """换屏后重挑采集设备 (WGC 会话 / DXGI output) —— **只在采集线程里调**。
 
-        DXGI 后端在 open 时绑定了某块 output, 只改 region 不会换屏。这里把旧的
-        DXGI 相机放掉, 按新的 size/origin 重新挑一块。挑不到 (比如新屏分辨率没
-        匹配上) 就退回 mss —— mss 直接用 region 抓, 不受 output 绑定影响。
+        WGC 和 DXGI 后端都在 open 时**绑定了某一块显示器**, 只改 region 不会
+        换屏 —— 它照旧抓原来那块屏。这正是"在设置里选了副屏, 画面却还是主屏"
+        的根因。这里把旧会话放掉, 按新的 size/origin 重挑。挑不到就退回 mss
+        —— mss 直接用 region 抓, 不受绑定影响。
+
+        注意顺序: 先 `_drop_dxgi` 再把 backend 改成 "mss" —— `_drop_dxgi`
+        只在 self._dxgi 非 None 时才动手, 所以这里不能用它清 WGC。
         """
         if not self._reopen_pending:
             return
         self._reopen_pending = False
-        if self._dxgi is None:
+        if self._wgc is None and self._dxgi is None:
             return                      # mss 后端: region 改了就行, 无需重开
         with self.lock:
             size, origin = self.size, self.origin
+        if self._wgc is not None:
+            old, self._wgc = self._wgc, None
+            try:
+                old.release()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._wgc = _WgcSource(size, origin=origin)
+                self.backend = "wgc"
+                print("[capture] 已切到显示器: wgc, %dx%d @ 桌面坐标 %s"
+                      % (size + (origin,)))
+            except Exception as exc:  # noqa: BLE001
+                print("[capture] 换屏后 WGC 重开失败, 退回 mss: %s" % exc)
+                self.backend = "mss"
+                if self._sct is None:
+                    self._sct = mss.mss()
+            return
         old, self._dxgi = self._dxgi, None
         try:
             old.release()
