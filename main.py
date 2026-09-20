@@ -292,7 +292,12 @@ def make_qsurface_format():
     from PyQt6.QtGui import QSurfaceFormat
     fmt = QSurfaceFormat()
     fmt.setVersion(3, 3)
-    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+    # **Core profile**: 着色器已全部改成 3.3 core 写法 (in/out + 自声明 out +
+    # gl_VertexID 全屏三角形, 见 render/shader.py 与 overlay._draw_quad)。
+    # 之前用 Compatibility, 在核显 (Intel/AMD) 上拿到的前向兼容上下文会把
+    # varying/gl_FragColor/即时模式剥掉, 编译失败 -> 玻璃层白/黑屏。core 后
+    # 任何合规驱动都一致。
+    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
     fmt.setSwapInterval(1)
     QSurfaceFormat.setDefaultFormat(fmt)
     return fmt

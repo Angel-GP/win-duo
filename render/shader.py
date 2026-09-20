@@ -15,15 +15,24 @@ MacDuo / FrostFold 的复刻):
         c = sum / taps * att + backdrop * miss
     uOutside=0 时 backdrop() 返回 0, 公式退化成原版 -- 所以这是严格超集, 不是改写。
 """
-VS = """#version 330 compatibility
-varying vec2 vUV;
+# 用 **3.3 core** 而不是 compatibility: 兼容 profile 里的 `varying` /
+# `gl_FragColor` / 即时模式在核显 (Intel/AMD) 拿到的**前向兼容上下文**里会被
+# 剥掉, 直接编译失败、玻璃层白/黑屏 (NVIDIA 驱动宽松, 一直掩盖了这个坑)。
+# core 里: `varying` -> `in`/`out`, `gl_FragColor` -> 自声明 out, 顶点用
+# gl_VertexID 生成全屏三角形 (不需要 VBO / 顶点属性)。数学与采样一字未改。
+VS = """#version 330 core
+out vec2 vUV;
 void main() {
-    vUV = gl_MultiTexCoord0.xy;
-    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+    // 用顶点号直接生成一个盖住全屏的三角形 (0,0)/(2,0)/(0,2):
+    // 经裁剪后正好覆盖 [0,1]x[0,1], vUV 落在 0..1, 与原来的四边形语义一致
+    // (vUV.y=0 在底部, 即铰链)。不需要 VBO / 顶点属性。
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    vUV = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 """
 
-FS_DUO = """#version 330 compatibility
+FS_DUO = """#version 330 core
 uniform sampler2D uTex;
 uniform sampler2D uBackdrop;
 uniform vec2  uRes;        // 截图尺寸 px
@@ -34,7 +43,8 @@ uniform float uDark;       // 单位模糊半径损失的光量
 uniform int   uMaxTaps;
 uniform int   uOutside;    // 0 = 出界纯黑(原版)  1 = 背景兜底(无黑场)
 uniform float uBgBlur;     // 背景相对前景的模糊比例
-varying vec2 vUV;
+in  vec2 vUV;
+out vec4 fragColor;
 
 const float GOLDEN = 2.39996322972865332;
 const float TWO_PI = 6.28318530717958648;
@@ -57,7 +67,7 @@ void main() {
     vec2 uvFlat = vec2(vUV.x, 1.0 - vUV.y);   // 平视采样 (截图行序 top-first)
 
     if (tilt < 1e-5) {
-        gl_FragColor = vec4(texture(uTex, uvFlat).rgb, 1.0);
+        fragColor = vec4(texture(uTex, uvFlat).rgb, 1.0);
         return;
     }
 
@@ -68,7 +78,7 @@ void main() {
 
     // 光线 eye -> glass 像素, 延长交到界面平面 z=0
     float depth = eye.z - glass.z;
-    if (depth <= 1e-3) { gl_FragColor = vec4(backdrop(uvFlat, 0.0), 1.0); return; }
+    if (depth <= 1e-3) { fragColor = vec4(backdrop(uvFlat, 0.0), 1.0); return; }
     float t   = eye.z / depth;
     vec2 hit  = eye.xy + (glass.xy - eye.xy) * t;     // 界面平面上的落点 (px, y 向上)
 
@@ -79,7 +89,7 @@ void main() {
     // 整个模糊核都在界面之外
     if (hit.x < -radius || hit.x > uRes.x + radius ||
         hit.y < -radius || hit.y > uRes.y + radius) {
-        gl_FragColor = vec4(backdrop(uvFlat, radius), 1.0); return;
+        fragColor = vec4(backdrop(uvFlat, radius), 1.0); return;
     }
 
     // 磨砂玻璃吸光: 与散射成正比地变暗
@@ -88,7 +98,7 @@ void main() {
     vec2 uvHit = vec2(hit.x / uRes.x, 1.0 - hit.y / uRes.y);
 
     if (radius < 0.5) {
-        gl_FragColor = vec4(textureLod(uTex, uvHit, 0.0).rgb * att, 1.0);
+        fragColor = vec4(textureLod(uTex, uvHit, 0.0).rgb * att, 1.0);
         return;
     }
 
@@ -124,6 +134,6 @@ void main() {
     float miss = clamp(1.0 - cov / n, 0.0, 1.0);
     if (miss > 0.0) c += backdrop(uvFlat, radius) * miss;
 
-    gl_FragColor = vec4(c, 1.0);
+    fragColor = vec4(c, 1.0);
 }
 """

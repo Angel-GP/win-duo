@@ -302,6 +302,11 @@ class GlassOverlay(QOpenGLWidget):
 
         self.cap_tex = self._new_tex()
         self.bd_tex = self._new_tex()
+
+        # **core profile 必须有一个已绑定的 VAO 才能发起 draw call**, 哪怕不用
+        # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
+        self.vao = GL.glGenVertexArrays(1)
+
         self._gl_ready = True
 
     @staticmethod
@@ -375,12 +380,12 @@ class GlassOverlay(QOpenGLWidget):
         self._draw_quad()
 
     def _draw_quad(self):
-        GL.glBegin(GL.GL_QUADS)
-        GL.glTexCoord2f(0.0, 0.0); GL.glVertex2f(-1.0, -1.0)
-        GL.glTexCoord2f(1.0, 0.0); GL.glVertex2f(1.0, -1.0)
-        GL.glTexCoord2f(1.0, 1.0); GL.glVertex2f(1.0, 1.0)
-        GL.glTexCoord2f(0.0, 1.0); GL.glVertex2f(-1.0, 1.0)
-        GL.glEnd()
+        # core profile: 不用即时模式 (glBegin/glVertex 已被移除)。绑定空 VAO,
+        # 画 3 个顶点的全屏三角形 —— 顶点位置和 UV 全由顶点着色器按 gl_VertexID
+        # 生成 (见 shader.VS)。
+        GL.glBindVertexArray(self.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glBindVertexArray(0)
 
     # ------------------------------------------------------------ 背景纹理
     def _backdrop_path(self):
