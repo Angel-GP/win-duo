@@ -42,6 +42,24 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
+# ═══════════════════════════════════════════════════════════════════════
+# DPI 感知 —— **必须在 import mss / 创建 QApplication 之前抢先设**。
+# ═══════════════════════════════════════════════════════════════════════
+# 否则 `import mss` 会先把进程设成旧的 system-DPI-aware, 之后 Qt 想升级到
+# 它默认要的 Per-Monitor-Aware-V2 会被系统拒绝, 控制台就刷一行
+#   qt.qpa.window: SetProcessDpiAwarenessContext() failed: 拒绝访问
+# 这条警告**无害** (最终仍然 DPI 感知), 但难看。抢先设成 Qt 要的那档 (V2),
+# Qt 检测到已经是目标档位就不再尝试, 警告消失。
+# 值 -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (Win10 1703+)。
+if sys.platform == "win32":
+    try:
+        _u32 = ctypes.WinDLL("user32")
+        _u32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        _u32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        _u32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:  # noqa: BLE001  老系统没这个 API, 忽略
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths as _paths   # noqa: E402  (必须在 sys.path 设置之后)
 

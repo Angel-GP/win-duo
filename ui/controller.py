@@ -672,10 +672,19 @@ class AppController(QObject):
 
     # ------------------------------------------------------------ 效果参数
     def apply_effect_settings(self, reload_backdrop=False):
-        """改完 config 里的渲染参数后让玻璃层重新读取它们。
+        """改完 config 里的渲染参数后让玻璃层/摄像头源重新读取它们。
 
-        GlassOverlay 在 __init__ 里把参数缓存成了实例属性, 光改 cfg 不会生效。
+        GlassOverlay 和摄像头源在 __init__ 里把参数缓存成了实例属性,
+        光改 cfg 不会生效, 要主动同步。
         """
+        # 摄像头灵敏度改了要推给正在跑的摄像头源 —— 它在循环里实时读 self.scale,
+        # 所以设了就即时生效, 不用重启设备。
+        cam = self.hub.get("camera")
+        if cam is not None:
+            try:
+                cam.scale = float(self.cfg.get("camera_scale", cam.scale))
+            except Exception:  # noqa: BLE001
+                pass
         if self.overlay is None:
             return
         self.overlay.apply_config()
