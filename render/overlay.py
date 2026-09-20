@@ -25,7 +25,7 @@ from angles.hub import LABELS
 
 import paths
 
-from .capture import frame_bgr, frame_bgra_to_rgba
+from .capture import frame_bgr
 from .shader import FS_DUO, VS
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -303,6 +303,7 @@ class GlassOverlay(QOpenGLWidget):
         else:
             print("[GL] 着色器编译链接 OK")
         self.prog.bind()
+        print("[GL] step: prog.bind 完成")
 
         # uniform 位置**在这里查一次就好**。`uniformLocation` 每次都要拿字符串
         # 去驱动里查表, 而 paintGL 每帧要设 9 个 uniform —— 每帧 9 次字符串查表
@@ -316,9 +317,19 @@ class GlassOverlay(QOpenGLWidget):
         missing = [k for k, v in self._uloc.items() if v < 0]
         if missing:
             print("[GL] 警告: 这些 uniform 没找到 (驱动可能优化掉了): %s" % missing)
+        print("[GL] step: uniform 缓存完成 %s" % self._uloc)
 
-        self.cap_tex = self._new_tex()
-        self.bd_tex = self._new_tex()
+        self.cap_tex = self._new_tex(swizzle_bgra=True)   # BGRA 帧, 采样时硬件换通道
+        print("[GL] step: cap_tex=%s (含 swizzle 设置) 完成" % self.cap_tex)
+        # bd_tex 同样走 swizzle: _upload_backdrop 手上的是 cv2 的 BGR 数据,
+        # 灌成 RGBA 字节序再让采样器按 (B,G,R,1) 换回来, 省一次 CPU 换通道。
+        self.bd_tex = self._new_tex(swizzle_bgra=True)
+        # 背景上传时 alpha 恒为 1 (见 _upload_backdrop), swizzle 通道 4 填 1
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.bd_tex)
+        GL.glTexParameteriv(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_RGBA,
+                            (GL.GL_BLUE, GL.GL_GREEN, GL.GL_RED, GL.GL_ONE))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        print("[GL] step: bd_tex=%s (含 swizzle 设置) 完成" % self.bd_tex)
 
         # **core profile 必须有一个已绑定的 VAO 才能发起 draw call**, 哪怕不用
         # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
@@ -326,12 +337,44 @@ class GlassOverlay(QOpenGLWidget):
         if not self.vao:
             print("[GL] 警告: glGenVertexArrays 失败 (core 下会画不出东西)")
 
+        print("[GL] step: initializeGL 全部完成, glError=0x%X"
+              % GL.glGetError())
+
         self._gl_ready = True
 
     @staticmethod
-    def _new_tex():
+    def _gl_err_where(tag):
+        """打印并清掉当前 GL 错误旗标。调试用, 定位完就删。"""
+        err = GL.glGetError()
+        if err != 0:
+            print("[GL] step: %s 处 glError=0x%X" % (tag, err))
+
+    @staticmethod
+    def _new_tex(swizzle_bgra=False):
+        """建一张纹理。
+
+        `swizzle_bgra=True` 时设 **GL_TEXTURE_SWIZZLE_RGBA = (B,G,R,A)**:
+        上传 BGRA 数据(内部格式仍是 GL_RGBA8,规范安全),采样时由硬件把
+        R/B 换回来。
+
+        为什么有这个开关:DXGI 桌面复制的原生格式就是 BGRA。以前为了用
+        GL_RGBA 外部格式,每帧在 CPU 侧把 16MB 的 BGRA 搬成 RGBA
+        (`frame_bgra_to_rgba`);swizzle 把这一步挪进纹理采样硬件 —— 上传
+        省一次全像素搬运,每帧少分配 16MB。GL_TEXTURE_SWIZZLE_RGBA 是
+        OpenGL 3.0 核心特性(本项目就是 3.3),无兼容性问题。
+        """
         tex = GL.glGenTextures(1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        if swizzle_bgra:
+            # **必须用 glTexParameteriv (数组版), 不能用 glTexParameteri。**
+            # swizzle 是 4 个整型的查询/设置, glTexParameteri 的 params 只收
+            # 一个 GLint —— PyOpenGL 把 tuple 塞给标量版会按错误的方式传给
+            # 驱动, 直接 native 崩溃 (0xC0000409, 实测踩过)。
+            # 顺带: GL_TRUE/GL_FALSE 之类是 uint 常量, 而 GL_TEXTURE_SWIZZLE_*
+            # 的分量值是普通 GLenum int, 直接传 python int 列表即可。
+            GL.glTexParameteriv(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_RGBA,
+                                (GL.GL_BLUE, GL.GL_GREEN, GL.GL_RED, GL.GL_ALPHA))
+            GlassOverlay._gl_err_where("纹理 %s 的 swizzle glTexParameteriv" % tex)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER,
                            GL.GL_LINEAR_MIPMAP_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
@@ -351,19 +394,25 @@ class GlassOverlay(QOpenGLWidget):
         frame = self.capturer.latest()
         if frame and frame[3] != self._uploaded_seq:
             raw, fw, fh, seq, fmt = frame
-            # **上传一律用 GL_RGBA (内部格式和外部格式都是)** —— `GL_BGRA` 作为
-            # 外部格式**不是 OpenGL 3.3 core 的核心保证** (来自 GL_EXT_bgra):
-            # NVIDIA 宽松接受, 但 Intel 核显的严格 core 实现常拒绝 ->
-            # glTexImage2D 报 GL_INVALID_ENUM、纹理是空的 -> **玻璃层全黑**。
-            # 所以 capture 侧现在统一把帧转成 RGBA (见 capture._store / frame_bgra),
-            # 这里就只剩一条 GL_RGBA 路径, 对任何驱动都规范安全。
-            if fmt != "RGBA":
-                raw = frame_bgra_to_rgba(raw, fw, fh)
+            # **cap_tex 上传走 BGRA + swizzle 采样换通道**。注意区分两个问题:
+            #   - `GL_BGRA` 作为 glTexImage2D 的**外部格式**不是 3.3 core 的
+            #     核心保证 (GL_EXT_bgra),Intel 核显会拒绝 -> 以前因此全黑;
+            #   - 外部格式仍可用 GL_RGBA 吗?不行 —— 数据是 BGRA,RGBA 会让
+            #     红/蓝互换。真正的解法是 **GL_TEXTURE_SWIZZLE_RGBA**:外部
+            #     格式老老实实给 GL_RGBA 按字节灌进去,纹理内部按 (B,G,R,A)
+            #     swizzle,采样时硬件换回 R/B —— 见 _new_tex 的说明。
+            # 于是每帧的 CPU 换通道 (frame_bgra_to_rgba, 16MB 搬运) 整个删掉,
+            # GL 调用本身对任何驱动都规范安全。
+            print("[GL] step: 首次上传 seq=%s %dx%d fmt=%s type=%s flags=%s"
+                  % (seq, fw, fh, fmt, type(raw).__name__,
+                     getattr(raw, "flags", None) and raw.flags["C_CONTIGUOUS"]))
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, fw, fh, 0,
                             GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
+            self._gl_err_where("首次 glTexImage2D (BGRA 直灌)")
             GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            print("[GL] step: 首次上传完成")
             self._uploaded_seq = seq
             self._uploaded_size = (fw, fh)
             if not self._backdrop_ready:
@@ -498,11 +547,17 @@ class GlassOverlay(QOpenGLWidget):
 
     def _upload_backdrop(self, bgr):
         h, w = bgr.shape[:2]
-        # 同样避开 GL_BGR 外部格式 (非 core 保证, 核显可能拒绝): 换成 RGBA 上传。
-        rgba = np.ascontiguousarray(bgr[:, :, [2, 1, 0]])
+        # bd_tex 已设 swizzle (B,G,R,1) —— cv2 的 BGR 数据直接按字节灌进去,
+        # 采样时硬件换通道, 不再在 CPU 上做 BGR->RGB 搬运。外部格式用 GL_RGBA:
+        # 每行末尾补一个 alpha 字节 (值任意, swizzle 会把它弃成常数 1)。
+        # 灌数用 GL_RED 指定逐字节平面?不 —— 这里直接把 HxWx3 reshape 成
+        # Hx(W*3)x1 一样要拷贝;干脆 ascontiguousarray 补齐成 4 通道, 一次性成本。
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[:, :, :3] = bgr
+        rgba[:, :, 3] = 255
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.bd_tex)
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0,
-                        GL.GL_RGB, GL.GL_UNSIGNED_BYTE, rgba)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, w, h, 0,
+                        GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, rgba)
         GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 

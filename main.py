@@ -18,12 +18,19 @@
 """
 import argparse
 import ctypes
+import faulthandler
 import json
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
+
+# **让 native 崩溃 (0xC0000409 / access violation) 也吐出 Python 栈。**
+# "Unhandled Python exception" 一行什么都说明不了 —— faulthandler 会在
+# 崩溃瞬间把所有线程的 Python 调用栈打到 stderr, 精确到是哪一行触发的。
+# stderr 已被 _TeeLogger 重定向到日志文件, 所以崩在日志里能查到。
+faulthandler.enable(file=__import__("sys").stderr, all_threads=True)
 
 # ═══════════════════════════════════════════════════════════════════════
 # 限制 BLAS 线程数 —— **必须在 numpy 被 import 之前设**。
