@@ -13,7 +13,6 @@ import ctypes
 import os
 import time
 
-import cv2
 import numpy as np
 from OpenGL import GL
 from PyQt6.QtCore import Qt, QTimer
@@ -29,6 +28,29 @@ from .capture import frame_bgr
 from .shader import FS_DUO, VS
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
+
+
+def _cv2():
+    """按需加载 cv2 并缓存到模块级单例。
+
+    **不要提回模块顶层 `import cv2`。** opencv 的 DLL 有 ~116MB, 而本模块在
+    controller 的导入链上 —— 提回顶层等于"进程一起来就扛着 116MB", 哪怕
+    用户从不用摄像头调试窗、不设背景兜底。cv2 在本文件只服务四个低频场景:
+    背景兜底图、背景图读取、摄像头匹配调试窗、`_resize_fill` (都在用户动作
+    或首次建背景时触发, 不在每帧热路径上)。
+
+    线程安全: 所有调用点都在主线程 (Qt 绘制/定时器回调), 不存在并发首导。
+    千万别学"绘制回调里 import"的反例 —— 这里第一次 import 发生在首次调用
+    `_cv2()` 时, 同样是主线程, 无 import lock 撞车风险。
+    """
+    global _cv2_mod
+    if _cv2_mod is None:
+        import cv2 as _m
+        _cv2_mod = _m
+    return _cv2_mod
+
+
+_cv2_mod = None
 
 #: 调试窗标题**必须是纯 ASCII**。OpenCV 的 HighGUI 在 Windows 上按本地代码页
 #: 解释窗口标题, 中文一定会变成乱码 (试过 "win-duo 特征匹配 (x 关闭)" -> 乱码)。
@@ -61,6 +83,7 @@ def _resize_fill(img, w, h):
         return img
     scale = max(w / iw, h / ih)
     nw, nh = int(round(iw * scale)), int(round(ih * scale))
+    cv2 = _cv2()
     resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
     x = (nw - w) // 2
     y = (nh - h) // 2
@@ -75,6 +98,7 @@ def load_image(path):
         return None
     if data.size == 0:
         return None
+    cv2 = _cv2()
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
@@ -478,6 +502,7 @@ class GlassOverlay(QOpenGLWidget):
         """
         fw, fh = frame[1], frame[2]
         bgr = frame_bgr(frame)
+        cv2 = _cv2()
         small = cv2.resize(bgr, (max(1, fw // 8), max(1, fh // 8)),
                            interpolation=cv2.INTER_AREA)
         small = cv2.GaussianBlur(small, (0, 0), 20)
@@ -618,6 +643,7 @@ class GlassOverlay(QOpenGLWidget):
         cam = self.hub.get("camera")
         if cam is not None:
             cam.set_debug(False)
+        cv2 = _cv2()
         for _ in range(8):
             try:
                 cv2.destroyWindow(DEBUG_WINDOW)
@@ -657,6 +683,7 @@ class GlassOverlay(QOpenGLWidget):
         if img is None or seq == self._dbg_seq:
             return
         self._dbg_seq = seq
+        cv2 = _cv2()
         try:
             cv2.imshow(DEBUG_WINDOW, img)
             if not self._dbg_shown:
