@@ -15,8 +15,8 @@ from pathlib import Path
 import time
 
 from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QStackedWidget,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QSizePolicy,
+                             QStackedWidget, QVBoxLayout, QWidget)
 
 from angles.hub import LABELS
 
@@ -154,6 +154,10 @@ class SettingsPanel(QWidget):
         root.addWidget(self._build_source_card())
         root.addWidget(self._build_advanced_card())
         root.addWidget(self._build_status())
+        # **末尾留伸缩**: 否则窗口变高时, 多出来的空间会全塞给"最后那个控件"
+        # —— 也就是底部状态行, 把它从一行高 (17px) 拉到 60+px, 白占一大块。
+        # 加了 stretch 之后多余空间落到底部空白, 状态行只占它需要的一行。
+        root.addStretch(1)
 
     # ---------------------------------------------------------- 悬浮玻璃
     def _build_glass_card(self):
@@ -337,6 +341,9 @@ class SettingsPanel(QWidget):
         # 单行 + 超出省略号 —— 关掉自动换行, 否则状态一长就折成两三行、占掉
         # 窗口底部一大块高度。文本在 _refresh_status 里按当前宽度 elide。
         self.lbl_status.setWordWrap(False)
+        # 竖向固定: 永远只占一行高, 不会被布局拉伸去吃多余空间
+        self.lbl_status.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                      QSizePolicy.Policy.Fixed)
         self.lbl_status.setObjectName("hint")
         return self.lbl_status
 
