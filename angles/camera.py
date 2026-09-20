@@ -164,8 +164,7 @@ def open_camera(index=0, backend="auto", warmup=5,
     raise RuntimeError(
         "摄像头 index=%d 没有可用组合。逐个后端的尝试结果: %s。\n"
         "  排查建议:\n"
-        "    1) 跑 tools/camera_probe.py —— 会列出每个 index x 后端的分辨率、\n"
-        "       画面变化量和 ORB 特征点数, 并给出推荐配置;\n"
+        "    1) 在设置窗口点「扫描」逐个探测 index x 后端 (会跳过冻结帧);\n"
         "    2) 注意 index 与设备的对应关系**随后端而变**, 且虚拟摄像头\n"
         "       (如手机投屏) 常常排在前面并给出冻结帧;\n"
         "    3) 设置 -> 隐私和安全性 -> 相机: 打开\"让桌面应用访问相机\";\n"
@@ -337,7 +336,7 @@ class OrbTracker:
     """上盖俯仰角跟踪器。
 
     with_camera=False 时不打开摄像头, 只留算法本体 —— 这样能用合成帧
-    (tools/tracker_test.py) 在没有摄像头的机器上验证匹配与测角。
+    在没有摄像头的机器上验证匹配与测角。
     """
 
     def __init__(self, camera_index=0, nfeatures=1200, ratio=0.75,

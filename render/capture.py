@@ -60,9 +60,8 @@ def _co_initialize():
         **native 崩溃** (0xC0000409), Python 侧连异常都抓不到, 只看到
         "Unhandled Python exception"。
 
-    实测症状: 玻璃层一显示、采集线程起来抓第一帧时进程就没了; 而
-    `tools/capture_backend_test.py` 里几乎一样的代码却好好的 —— 差别就是
-    那个测试是在**主线程**里调的。查了好几轮才定位到。
+    实测症状: 玻璃层一显示、采集线程起来抓第一帧时进程就没了; 而在**主线程**
+    里调几乎一样的代码却好好的 —— 差别就是线程。查了好几轮才定位到。
 
     参数用 `COINIT_APARTMENTTHREADED` (STA): DXGI 的桌面复制接口要求 STA。
     """

@@ -6,7 +6,10 @@
 __pycache__/
 *.pyc
 
-# 运行产物: 都能用 tools/ 里的脚本重新生成
+# 用户配置: 首次运行由 main.DEFAULT_CFG 在程序旁边现生成, 不入库
+config.json
+
+# 运行产物: 大多能重新生成
 smoke_widget.png
 smoke_grab.png
 smoke_frame.png
@@ -24,7 +27,7 @@ frame_camera_probe.png
 offscreen_tilt*.png
 
 # PyInstaller 打包产物: exe 约 94MB, 不该进仓库
-# (发布时另外传 release, 或让用户自己跑 tools/build_exe.py)
+# (发布时另外传 release, 或让用户自己跑 scripts/build_exe.py)
 build/
 dist/
 *.spec

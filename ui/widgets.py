@@ -356,7 +356,7 @@ def row(*widgets, spacing=10, stretch_last=False):
     return box, lay
 
 
-#: 程序图标文件 (由 tools/make_icon.py 生成, 内含 9 档尺寸)。
+#: 程序图标文件 (内含 9 档尺寸)。
 #: **只读资源** —— 打包后它在 PyInstaller 的解包目录里, 所以走 resource_file。
 _ICON_FILE = _resource_file("win-duo.ico")
 
@@ -367,7 +367,7 @@ _ICON_CACHE = []
 def make_icon(size=64):
     """程序图标。
 
-    **优先用 win-duo.ico** (tools/make_icon.py 生成, 含 16~256 共 9 档)。
+    **优先用 win-duo.ico** (含 16~256 共 9 档)。
     多分辨率的好处: Windows 在托盘、任务栏、资源管理器、Alt-Tab 各取所需,
     不用它自己硬缩 —— 硬缩出来的小图标又糊又脏。
     文件不在 (比如刚 clone 还没生成) 就**退回运行时绘制**, 保证界面不会因为
