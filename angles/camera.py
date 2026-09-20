@@ -406,7 +406,11 @@ class OrbTracker:
             self.cap, self.backend_name = open_camera(camera_index, backend,
                                                       threads=threads)
             try:
-                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                # dshow: 0.75=自动曝光。之前这里设 0.25(手动)却从没给过
+                # EXPOSURE 值, 驱动停在默认 1/64s, 室内画面亮度只有 ~5,
+                # 特征点根本提不出来 (实测开自动后 ~93)。亮度漂移由
+                # _prepare 里的 CLAHE 兜底, 不怕自动曝光。
+                self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
             except Exception:  # noqa: BLE001
                 pass
 
