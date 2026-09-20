@@ -68,12 +68,57 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
+#: 日志文件大小上限 (字节)。超过就轮转 —— 开机自启常驻时日志一直写, 不轮转会
+#: 无限增长 (实测见过 11MB+)。轮转时把当前日志改名成 `.1`、旧的 `.1` 丢弃, 所以
+#: 最多占 2 份。
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
 class _TeeLogger:
-    def __init__(self, primary, log_path):
+    """把 stdout/stderr 同时写到原流和日志文件。
+
+    stdout 和 stderr 两个实例**共享同一个文件句柄** (由 `_open_log` 打开), 否则
+    同一文件会被打开两次、写乱、轮转也各转各的。
+    """
+
+    #: 全进程共用的日志文件句柄 + 路径 (stdout/stderr 两个实例共用)
+    _file = None
+    _path = None
+    _max = _LOG_MAX_BYTES
+
+    def __init__(self, primary):
         self.primary = primary
-        self.log_file = None
+
+    @classmethod
+    def open_log(cls, log_path, max_bytes=_LOG_MAX_BYTES):
+        """打开(追加)日志文件; 已超上限则先轮转。失败就退化成只写原流。"""
+        cls._path = log_path
+        cls._max = int(max_bytes)
         try:
-            self.log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+            p = Path(log_path)
+            try:
+                if p.exists() and p.stat().st_size >= cls._max:
+                    rot = p.with_name(p.name + ".1")
+                    if rot.exists():
+                        rot.unlink()
+                    p.rename(rot)
+            except Exception:  # noqa: BLE001  轮转失败就继续追加
+                pass
+            cls._file = open(log_path, "a", encoding="utf-8", buffering=1)
+        except Exception:  # noqa: BLE001
+            cls._file = None
+
+    @classmethod
+    def _maybe_rotate(cls, s):
+        """写完一行后若超上限就轮转 (在行尾做, 不把一行劈两半)。"""
+        f = cls._file
+        if f is None or cls._max <= 0 or not s.endswith("\n"):
+            return
+        try:
+            if f.tell() >= cls._max:
+                f.close()
+                cls._file = None
+                cls.open_log(cls._path, cls._max)
         except Exception:  # noqa: BLE001
             pass
 
@@ -83,11 +128,13 @@ class _TeeLogger:
                 self.primary.write(s)
             except Exception:  # noqa: BLE001
                 pass
-        if self.log_file is not None:
+        f = type(self)._file
+        if f is not None:
             try:
-                self.log_file.write(s)
+                f.write(s)
             except Exception:  # noqa: BLE001
                 pass
+        type(self)._maybe_rotate(s)
 
     def flush(self):
         if self.primary is not None:
@@ -95,16 +142,18 @@ class _TeeLogger:
                 self.primary.flush()
             except Exception:  # noqa: BLE001
                 pass
-        if self.log_file is not None:
+        f = type(self)._file
+        if f is not None:
             try:
-                self.log_file.flush()
+                f.flush()
             except Exception:  # noqa: BLE001
                 pass
 
 
 _log_file_path = str(_paths.log_file("win_duo.log"))
-sys.stdout = _TeeLogger(sys.stdout, _log_file_path)
-sys.stderr = _TeeLogger(sys.stderr, _log_file_path)
+_TeeLogger.open_log(_log_file_path)
+sys.stdout = _TeeLogger(sys.stdout)
+sys.stderr = _TeeLogger(sys.stderr)
 
 #: config.json 等**用户数据**跟在 exe (或项目根) 旁边。
 #: 打包后 `__file__` 指向临时解包目录, 直接用它会把配置写到一个马上被删掉的

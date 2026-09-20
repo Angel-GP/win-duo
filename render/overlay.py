@@ -448,13 +448,17 @@ class GlassOverlay(QOpenGLWidget):
         选完再显示。
         """
         self.timer.stop()
+        # 记下藏起来之前是否本就该显示 —— 不要无条件 show(): 若此时总开关
+        # 关着、或被临时收起 (托盘菜单弹出), 强行 show 会有一帧闪现。
+        was_visible = self._visible and self.enabled and not self.suppressed
         self.hide()
         try:
             path, _ = QFileDialog.getOpenFileName(
                 None, "选择背景图", "",
                 "图片 (*.png *.jpg *.jpeg *.bmp);;所有文件 (*)")
         finally:
-            self.show()
+            if was_visible:
+                self.show()
             self.timer.start(self._tick_ms())
         if not path:
             return

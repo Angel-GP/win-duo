@@ -69,9 +69,16 @@ class SerialAngleSource(AngleSource):
 
     def stop(self):
         self._stop = True
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        th, self._thread = self._thread, None
+        if th is not None:
+            th.join(timeout=2.0)
+            # join 超时 (卡在 serial.Serial 打开/读里) 时旧线程仍活着 —— 别谎称
+            # "已停"。保留引用, 下一次 start() 会看到 _thread 已是 None 而起新
+            # 线程, 但至少不会把旧线程的引用丢掉导致无法观测。
+            if th.is_alive():
+                print("[serial] 采集线程未在 2s 内退出 (设备阻塞), 已放弃等待")
+                self._thread = th          # 留着引用, 防止 start() 叠加新线程
+                return
 
     # ---------- 对外读数 ----------
     def level(self):
@@ -140,7 +147,8 @@ class SerialAngleSource(AngleSource):
                                 self._fps = n / (now - t0)
                             n, t0 = 0, now
             except (serial.SerialException, OSError) as exc:
-                self._error = str(exc)
+                with self._lock:                 # 和别的读写一样加锁, 别裸写
+                    self._error = str(exc)
                 self._set_status("等待 " + self.port)
                 # 断线重连, 但不要在被要求停止时死等
                 for _ in range(20):
@@ -148,6 +156,7 @@ class SerialAngleSource(AngleSource):
                         break
                     time.sleep(0.1)
             except Exception as exc:  # noqa: BLE001
-                self._error = str(exc)
+                with self._lock:                 # 同上: 加锁写
+                    self._error = str(exc)
                 self._set_status("串口错误")
                 time.sleep(1.0)

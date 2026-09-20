@@ -132,12 +132,15 @@ class _DxgiSource:
     #: 连续错这么多次才认定 DXGI 真的坏了 (掉回 mss 的代价是每帧 30ms, 别轻易)
     MAX_ERRORS = 5
 
-    def __init__(self, size):
+    def __init__(self, size, origin=None):
         self.mod = None
         self.cam = None
         self.name = ""
         self.output_idx = 0
         self.errors = 0
+        #: 目标显示器的桌面左上角 (物理像素)。分辨率相同的两块屏只靠 size 分不开,
+        #: 这时再用坐标消歧 (见 _open_matching)。取不到就退化成"只按分辨率"。
+        self.origin = tuple(origin) if origin else None
         for name in ("bettercam", "dxcam"):
             try:
                 mod = __import__(name)
@@ -147,38 +150,85 @@ class _DxgiSource:
                 return
         raise RuntimeError("DXGI 不可用 (没装 bettercam/dxcam, 或没有分辨率匹配的显示器)")
 
+    @staticmethod
+    def _cam_origin(cam):
+        """某个 bettercam/dxcam 相机对应 output 的桌面左上角 (物理像素)。
+
+        bettercam 的 Output 里有 DXGI 的 DesktopCoordinates; dxcam 结构不同,
+        取不到就返回 None (调用方会退回"只按分辨率")。
+        """
+        try:
+            dc = cam._output.desc.DesktopCoordinates
+            return (int(dc.left), int(dc.top))
+        except Exception:  # noqa: BLE001
+            return None
+
     def _open_matching(self, mod, size):
-        """边探测边保留: 找到分辨率匹配的 output 就**直接留着用**。
+        """挑出**目标那块屏**的 output 并留着用。
+
+        选择规则:
+          1. 先按分辨率筛 —— 分辨率唯一时这一步就定了 (最常见);
+          2. 分辨率相同的多块屏 (例如两台 1920x1080) 用桌面左上角坐标区分:
+             在所有分辨率匹配里选 origin **最接近**目标的那块。
+             用"最近"而不是"精确相等": Qt 的 geometry 可能是逻辑坐标, 而 DXGI
+             报的是物理坐标, 缩放屏上两者不一定逐像素相等, 精确比对会错过 ——
+             取最近既能在同分辨率双屏里分对屏, 又能容忍这点坐标偏差。
+          3. 没给 size 时用第一块。
 
         不能"先遍历一遍探测、再 create 一次" —— bettercam 对同一个 output
-        返回的是**单例**, 探测时 release() 掉的正是后面要用的那个对象, 结果
-        拿到手的是个已销毁的 camera (`'NoneType' has no attribute
-        'AcquireNextFrame'`)。
-        多显示器时也不能假定 0 就是目标屏: 本机 output 0 是 2560x1600,
-        output 1 是 1920x1080, 选错整张图就错位。
+        返回的是**单例**, 探测时 release() 掉的正是后面要用的那个对象。这里
+        每个 output_idx 是不同实例, 所以边遍历边比较、只保留当前最优、把落选的
+        当场 release 掉, 不会误伤最终要用的那个。
         """
         try:
             count = len([ln for ln in mod.output_info().strip().splitlines()
                          if ln.strip()])
         except Exception:  # noqa: BLE001
             count = 1
+        want = tuple(size) if size else None
+
+        best = None                        # (cam, idx, dist)
         for idx in range(max(1, count)):
             try:
                 cam = mod.create(output_idx=idx, output_color=self.COLOR)
             except Exception:  # noqa: BLE001
                 continue
             wh = (getattr(cam, "width", 0), getattr(cam, "height", 0))
-            if not size or wh == tuple(size):
-                self.mod, self.cam, self.name, self.output_idx = mod, cam, mod.__name__, idx
-                return True
-            try:                                   # 不是目标屏, 放掉继续找
-                cam.release()
-            except Exception:  # noqa: BLE001
-                pass
-        return False
+            if want is not None and wh != want:
+                self._release_cam(cam)
+                continue
+            # 分辨率匹配。算它到目标坐标的距离 (取不到坐标或没给目标就当 0)。
+            dist = 0
+            if self.origin is not None:
+                org = self._cam_origin(cam)
+                if org is not None:
+                    dist = abs(org[0] - self.origin[0]) + abs(org[1] - self.origin[1])
+            if best is None or dist < best[2]:
+                if best is not None:
+                    self._release_cam(best[0])
+                best = (cam, idx, dist)
+            else:
+                self._release_cam(cam)
+            if dist == 0:                  # 已经完美命中, 不用再看后面的
+                break
+
+        if best is None:
+            return False
+        cam, idx, _ = best
+        self.mod, self.cam, self.name, self.output_idx = mod, cam, mod.__name__, idx
+        return True
+
+    @staticmethod
+    def _release_cam(cam):
+        try:
+            cam.release()
+        except Exception:  # noqa: BLE001
+            pass
 
     def grab(self):
-        """返回 (h, w, 4) 的 RGBA ndarray; 桌面没变时返回 None。
+        """返回 (h, w, 4) 的 **BGRA** ndarray; 桌面没变时返回 None。
+
+        (COLOR = "BGRA"; 全链路按 BGRA 处理 —— 别被旧注释"RGBA"误导。)
 
         DXGI 偶发 `DXGI_ERROR_INVALID_CALL` (输出切换、桌面锁定、上一帧没来得及
         释放等)。这种情况**不要立刻放弃 DXGI** —— 掉回 mss 就是每帧 30ms,
@@ -213,6 +263,9 @@ class CaptureWorker(threading.Thread):
         super().__init__(daemon=True, name="capture")
         self.region = region
         self.size = tuple(size) if size else (region.get("width"), region.get("height"))
+        #: 目标屏桌面左上角 (物理像素), 用来在**同分辨率双屏**里区分是哪一块 ——
+        #: 只按分辨率选会永远命中第一块 (通常是主屏), 于是"选了副屏还截主屏"。
+        self.origin = self._region_origin(region)
         self.want_backend = backend
         self.display_hz = float(display_hz or 60.0)
 
@@ -229,6 +282,8 @@ class CaptureWorker(threading.Thread):
         self.backend = "?"
         self._dxgi = None
         self._sct = None
+        #: set_region() 换屏后置 True; 采集线程在安全点重挑 DXGI output。
+        self._reopen_pending = False
         # 实测计数: 用来回答"设了 137Hz 到底跑到了多少"
         self.kicks = 0
         self.pumps = 0
@@ -256,10 +311,11 @@ class CaptureWorker(threading.Thread):
         ensure_dpi_aware()
         if self.want_backend in ("auto", "dxgi"):
             try:
-                self._dxgi = _DxgiSource(self.size)
+                self._dxgi = _DxgiSource(self.size, origin=self.origin)
                 self.backend = self._dxgi.name
-                print("[capture] 后端 %s (DXGI), output=%d, %dx%d"
-                      % (self._dxgi.name, self._dxgi.output_idx, *self.size))
+                print("[capture] 后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
+                      % (self._dxgi.name, self._dxgi.output_idx, *self.size,
+                         self.origin))
                 return
             except Exception as exc:  # noqa: BLE001
                 if self.want_backend == "dxgi":
@@ -322,11 +378,35 @@ class CaptureWorker(threading.Thread):
             self.kicks += 1
             self.request.set()
 
+    @staticmethod
+    def _region_origin(region):
+        """截屏区域左上角 (物理像素桌面坐标), 用于在同分辨率双屏里定位目标屏。"""
+        if not region:
+            return None
+        left, top = region.get("left"), region.get("top")
+        if left is None or top is None:
+            return None
+        return (int(left), int(top))
+
     def set_region(self, region):
+        """切换目标显示器 (换屏时 controller 会调)。
+
+        **不只是换 region。** DXGI 后端在 `_open` 时就**绑定了某一块 output**,
+        只改 self.region 对它没有任何作用 —— 它照旧抓原来那块屏。这正是
+        "在设置里选了副屏, 画面却还是主屏"的根因。所以换屏时必须让采集线程
+        **重新挑一次 output**。
+
+        重建绝不能在这里 (主线程) 直接做: 采集线程可能正卡在 native 层的
+        `grab()` 里, 从主线程 release() 掉它手上的相机会踩到已释放对象 ——
+        直接 native 崩溃 (见 stop() 的说明)。所以只在这里登记"待重开", 由采集
+        线程在两帧之间的安全点自己重建。mss 后端没有绑定问题, 换 region 即可。
+        """
         with self.lock:
             self.region = region
             self.size = (region.get("width"), region.get("height"))
+            self.origin = self._region_origin(region)
             self.frame = None
+            self._reopen_pending = True
         self.kick()
 
     # ------------------------------------------------------------ 主循环
@@ -391,7 +471,36 @@ class CaptureWorker(threading.Thread):
         if self._dxgi is not None:
             self._dxgi.release()
 
+    def _maybe_reopen(self):
+        """换屏后重挑 DXGI output —— **只在采集线程里调**, 这是安全点。
+
+        DXGI 后端在 open 时绑定了某块 output, 只改 region 不会换屏。这里把旧的
+        DXGI 相机放掉, 按新的 size/origin 重新挑一块。挑不到 (比如新屏分辨率没
+        匹配上) 就退回 mss —— mss 直接用 region 抓, 不受 output 绑定影响。
+        """
+        if not self._reopen_pending:
+            return
+        self._reopen_pending = False
+        if self._dxgi is None:
+            return                      # mss 后端: region 改了就行, 无需重开
+        with self.lock:
+            size, origin = self.size, self.origin
+        old, self._dxgi = self._dxgi, None
+        try:
+            old.release()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._dxgi = _DxgiSource(size, origin=origin)
+            self.backend = self._dxgi.name
+            print("[capture] 已切到显示器: %s output=%d, %dx%d @ 桌面坐标 %s"
+                  % (self._dxgi.name, self._dxgi.output_idx, *size, origin))
+        except Exception as exc:  # noqa: BLE001
+            print("[capture] 换屏后 DXGI 重开失败, 退回 mss: %s" % exc)
+            self._drop_dxgi()
+
     def _pump_once(self, seq):
+        self._maybe_reopen()
         if self._dxgi is not None:
             t0 = time.perf_counter()
             try:

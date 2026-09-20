@@ -61,11 +61,14 @@ def index_of(screen):
 def region_for(screen):
     """该屏幕的截屏区域 (物理像素)。
 
-    mss 用的是物理像素坐标, 所以要乘 devicePixelRatio;
-    而 QScreen.geometry() 给的是逻辑坐标。
+    mss 的 `grab(region)` 要求四个字段**同一坐标系** (都是物理像素), 而
+    `QScreen.geometry()` 给的是**逻辑坐标**。原来只把 width/height 乘了 dpr,
+    left/top 仍是逻辑值 —— 主屏在原点 (0,0) 时看不出来, 但**带缩放的副屏**
+    (left/top 非零) 上截屏区域会整体偏移。这里连 left/top 一起换算。
+    (DXGI 路径按 output 抓整屏、不看 region, 所以只有退回 mss 时才暴露。)
     """
     g = screen.geometry()
     dpr = screen.devicePixelRatio()
-    return {"left": g.x(), "top": g.y(),
+    return {"left": int(g.x() * dpr), "top": int(g.y() * dpr),
             "width": max(1, int(g.width() * dpr)),
             "height": max(1, int(g.height() * dpr))}

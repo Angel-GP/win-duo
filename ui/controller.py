@@ -125,10 +125,8 @@ class AppController(QObject):
             self.set_manual_level(1.0)
         elif name == "level_zero":
             self.set_manual_level(0.0)
-        elif name == "calibrate":
-            self.calibrate_camera()
-        elif name == "flip":
-            self.flip_camera_sign()
+        # 注: HOTKEY_DEFS 里没有 calibrate/flip (标定与翻转方向已改成设置窗口的
+        # 按钮), 所以这里不再有对应分支 —— 免得看着像"热键还在"。
         elif name == "debug":
             self.toggle_debug_window()
         else:

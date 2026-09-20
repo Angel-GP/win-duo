@@ -169,3 +169,9 @@ class SourceHub:
                 pass
         self._sources.clear()
         self._started.clear()
+        # manual 源 (KeyControl) 不在 _sources 里, 也要停 —— 否则它的键盘线程
+        # 只能靠 daemon 随进程回收, 退出路径不干净。
+        try:
+            self.control.stop()
+        except Exception:  # noqa: BLE001
+            pass

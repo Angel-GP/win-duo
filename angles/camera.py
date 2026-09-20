@@ -803,6 +803,8 @@ class CameraAngleSource(AngleSource):
 
         self.detail = {}
         self._thread = None
+        #: stop() 超时后仍活着的旧采集线程 (卡在打开设备里), 防止 start() 重复起
+        self._orphan = None
         self._stop = False
         self._lock = threading.Lock()
 
@@ -832,6 +834,13 @@ class CameraAngleSource(AngleSource):
         """
         if self._thread is not None:
             return
+        # 上一轮 stop() 超时后可能仍有 daemon 线程卡在打开设备里 —— 那种情况
+        # 绝不新建第二个线程 (两个线程会抢同一个摄像头)。等它自己结束。
+        if self._orphan is not None:
+            if self._orphan.is_alive():
+                print("[camera] 上一个采集线程仍在打开设备, 暂不重启")
+                return
+            self._orphan = None
         self._stop = False
         self._open_error = None
         with self._lock:
@@ -845,10 +854,16 @@ class CameraAngleSource(AngleSource):
         th, self._thread = self._thread, None
         if th is not None:
             # 别久等 —— 这同样是在主线程上调的。正常 ~33ms 就退出; 只有在
-            # "正在打开设备"阶段可能久一点, 那种情况就让 daemon 线程自己结束,
-            # 不拖着界面一起卡。
+            # "正在打开设备"阶段可能久一点 (open_camera 最坏 ~20s), 那种情况
+            # join 会超时, 旧线程仍在跑。
             th.join(timeout=0.6)
-        if th is None or not th.is_alive():
+        if th is not None and th.is_alive():
+            # join 超时: 旧线程还活着 (卡在 open_camera 里)。**寄存它**,
+            # 供 start() 检查 —— 否则紧接着 start() 会再起一个线程、两个线程
+            # 抢同一个摄像头。
+            self._orphan = th
+        else:
+            self._orphan = None
             tracker, self._tracker = self._tracker, None
             if tracker is not None:
                 tracker.release()

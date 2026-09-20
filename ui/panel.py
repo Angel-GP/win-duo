@@ -489,12 +489,16 @@ class SettingsPanel(QWidget):
         fm = self.lbl_status.fontMetrics()
         avail = max(80, self.lbl_status.width() or (self.width() - 36))
         self.lbl_status.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, avail))
+        # 这几行原本是 _refresh_glass() 的重复实现, 且 _loading 没用 try/finally
+        # —— 中间任一句抛异常, _loading 就永久卡在 True, 之后所有用户交互都被
+        # `if self._loading: return` 静默吞掉, 界面像死了。这里改成: 复用
+        # _refresh_glass(), 并且用 try/finally 保证 _loading 一定复位。
         self._loading = True
-        self.sw_glass.setChecked(self.controller.glass_on)
-        self.lbl_glass_state.setText("显示中" if self.controller.glass_on else "待机")
-        self.num_level.setValue(self.controller.manual_level() * 100, emit=False)
-        self._refresh_refresh_max()
-        self._loading = False
+        try:
+            self._refresh_glass()
+            self._refresh_refresh_max()
+        finally:
+            self._loading = False
 
     # ================================================================ 交互
     def _fit_height(self):
@@ -581,7 +585,10 @@ class SettingsPanel(QWidget):
         data = self.cmb_camera.currentData()
         if data is None:
             return
-        self.controller.set_camera(int(data), "auto")
+        # 保留用户/扫描确定的 backend, **别硬编码 auto** —— 否则用户特意选的
+        # dshow/msmf 会被这次换 index 抹回 auto。
+        backend = str(self.cfg.get("camera_backend", "auto"))
+        self.controller.set_camera(int(data), backend)
         self.controller.save()
 
     def _on_serial(self):
