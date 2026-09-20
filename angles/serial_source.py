@@ -19,16 +19,25 @@ import time
 from .base import AngleSource
 
 
+# ESP32 角度映射常量 —— 写死在源码, 不进 config.json。
+# 这些是固件约定 (读哪个轴) 和角度->level 的端点标定, 普通用户几乎不动。
+# config.json 只留 port / baud 两个用户换设备会改的。
+SERIAL_AXIS = "a"              # 读固件 JSON 里的哪个轴 (主轴)
+SERIAL_ANGLE_CLOSED = 10.0     # 合盖时的角度 -> level=1 (最虚)
+SERIAL_ANGLE_OPEN = -90.0      # 展开时的角度 -> level=0 (清晰)
+SERIAL_GLASS_START = 0.05      # 死区: ratio 低于它当 0
+
+
 class SerialAngleSource(AngleSource):
     name = "serial"
 
     def __init__(self, cfg):
         self.port = cfg.get("port", "COM3")
         self.baud = int(cfg.get("baud", 115200))
-        self.axis = cfg.get("axis", "a")
-        self.angle_closed = float(cfg.get("angle_closed", 10.0))
-        self.angle_open = float(cfg.get("angle_open", -90.0))
-        self.glass_start = float(cfg.get("glass_start", 0.05))
+        self.axis = SERIAL_AXIS
+        self.angle_closed = SERIAL_ANGLE_CLOSED
+        self.angle_open = SERIAL_ANGLE_OPEN
+        self.glass_start = SERIAL_GLASS_START
 
         self.detail = {}
         self._thread = None

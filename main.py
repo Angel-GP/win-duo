@@ -114,55 +114,41 @@ def config_path(explicit=None):
 #: (`FileNotFoundError` + 闪一下命令行窗口)。打包成 exe 时模板在解包目录、
 #: 活配置在 exe 旁边, 是两个文件, 所以**这个 bug 只在源码模式下暴露**。
 #: 内置一份, 两条路径就都稳了。
+#: 只放**用户会调 / 换机器会变 / 必须持久化**的键。算法与滤波微调那一批
+#: (camera_nfeatures / deadzone / fps / One-Euro / opencv_threads / 串口角度
+#: 标定 / smoothing / darkening / max_taps / backdrop_blur / lock_at_close /
+#: idle_* 阈值 等) 已改成源码常量, 不再进 config.json —— 分别定义在
+#: angles/camera.py (CAMERA_*)、angles/serial_source.py (SERIAL_*)、
+#: render/overlay.py (SMOOTHING / DARKENING / MAX_TAPS / IDLE_* 等)。
 DEFAULT_CFG = {
     "source": "camera",
     "hotkey_toggle": "ctrl+alt+d",
     "hotkey_off": "ctrl+alt+shift+esc",
-    "screen_name": "",
-    "screen_index": 0,
-    "camera_index": 0,
-    "camera_backend": "auto",
-    "camera_nfeatures": 1200,
-    "camera_scale": 1.1,
-    "camera_sign": -1,
-    "camera_deadzone": 0.03,
-    "camera_autocal": True,
-    "camera_fps": 30,
-    "camera_min_cutoff": 1.0,
-    "camera_beta": 0.05,
-    "camera_d_cutoff": 1.0,
-    "opencv_threads": 2,
-    "port": "COM3",
-    "baud": 115200,
-    "axis": "a",
-    "angle_closed": 10.0,
-    "angle_open": -90.0,
-    "glass_start": 0.05,
-    "refresh_hz": 165.0,
-    "smoothing": 0.22,
-    "idle_hide_below": 0.004,
-    "idle_show_above": 0.02,
-    "idle_dwell_sec": 0.35,
-    "max_tilt_deg": 88.0,
-    "eye_dist_h": 2.0,
-    "blur_spread": 0.42,
-    "darkening": 0.001,
-    "max_taps": 32,
-    "outside_mode": "black",
-    "backdrop_path": "desk_bg.png",
-    "backdrop_blur": 1.0,
-    "lock_at_close": False,
-    "autostart_glass": True,
-    "autostart_seeded": False,
-    "autocal_on_glass_open": True,
-    "low_memory_mode": False,
-    "render_fps": 30,
     "hotkey_level_up": "ctrl+alt+up",
     "hotkey_level_down": "ctrl+alt+down",
     "hotkey_level_full": "ctrl+alt+right",
     "hotkey_level_zero": "ctrl+alt+left",
     "hotkey_debug": "ctrl+alt+g",
+    "screen_name": "",
+    "screen_index": 0,
+    "camera_index": 0,
+    "camera_backend": "auto",
+    "camera_scale": 1.1,
+    "camera_sign": -1,
+    "port": "COM3",
+    "baud": 115200,
+    "refresh_hz": 165.0,
+    "render_fps": 30,
     "capture_backend": "auto",
+    "max_tilt_deg": 88.0,
+    "eye_dist_h": 2.0,
+    "blur_spread": 0.42,
+    "outside_mode": "black",
+    "backdrop_path": "desk_bg.png",
+    "autostart_glass": True,
+    "autostart_seeded": False,
+    "autocal_on_glass_open": True,
+    "low_memory_mode": False,
 }
 
 
@@ -307,13 +293,11 @@ def print_banner(cfg, region):
               % (cfg.get("camera_index"), cfg.get("camera_backend"),
                  cfg["camera_scale"], cfg["camera_sign"]))
     elif cfg["source"] == "serial":
-        print("  串口      : %s @ %d  轴=%s"
-              % (cfg["port"], cfg["baud"], cfg["axis"]))
+        print("  串口      : %s @ %d" % (cfg["port"], cfg["baud"]))
     print("  渲染      : 铰链=屏幕底边  最大转角 %.0f 度  眼距 %.1fx 屏高"
           % (cfg["max_tilt_deg"], cfg["eye_dist_h"]))
-    print("              blur_spread=%.2f  darkening=%.4f  taps<=%d  出界=%s"
-          % (cfg["blur_spread"], cfg["darkening"], cfg["max_taps"],
-             cfg["outside_mode"]))
+    print("              blur_spread=%.2f  出界=%s"
+          % (cfg["blur_spread"], cfg["outside_mode"]))
     print("  截屏      : %dx%d @ %.0fHz"
           % (region["width"], region["height"], cfg.get("refresh_hz", 3)))
     print("=" * 68)

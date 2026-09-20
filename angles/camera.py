@@ -91,6 +91,21 @@ _BACKEND_APIS = {
 #: 耗时只多 2%, 省下约 1.8 个核。
 DEFAULT_OPENCV_THREADS = 2
 
+# ═══════════════════════════════════════════════════════════════════
+# 摄像头算法/滤波常量
+# ═══════════════════════════════════════════════════════════════════
+# 这些是内部调校参数, 普通用户几乎不会动, 所以**写死在源码里**, 不再进
+# config.json (配置文件只留 index/scale/sign/backend 这几个用户会调的)。
+# 真要改就改这里。
+CAMERA_NFEATURES = 1200        # ORB 每帧提取的特征点数
+CAMERA_DEADZONE = 0.03         # 角度死区: 小于它当 0, 抑制静止抖动
+CAMERA_AUTOCAL = True          # 摄像头源启动后自动标定一次基准帧
+CAMERA_FPS = 30.0              # 摄像头目标帧率
+CAMERA_MIN_CUTOFF = 1.0        # One Euro 滤波: 最小截止频率
+CAMERA_BETA = 0.05             # One Euro 滤波: 速度系数 (调大更跟手但更抖)
+CAMERA_D_CUTOFF = 1.0          # One Euro 滤波: 导数截止频率
+CAMERA_OPENCV_THREADS = 2      # OpenCV 内部线程上限 (默认 32 会空转烧 CPU)
+
 
 def _limit_opencv_threads(n):
     if n and int(n) > 0:
@@ -635,21 +650,24 @@ class CameraAngleSource(AngleSource):
     name = "camera"
 
     def __init__(self, cfg):
+        # 用户会调的留在 config.json: index / scale / sign / backend。
         self.index = int(cfg.get("camera_index", 0))
-        self.nfeatures = int(cfg.get("camera_nfeatures", 1200))
         self.scale = float(cfg.get("camera_scale", 1.1))
         self.sign = int(cfg.get("camera_sign", -1))
-        self.deadzone = float(cfg.get("camera_deadzone", 0.03))
-        self.autocal = bool(cfg.get("camera_autocal", True))
-        self.target_fps = float(cfg.get("camera_fps", 30))
-        self.min_cutoff = float(cfg.get("camera_min_cutoff", 1.0))
-        self.beta = float(cfg.get("camera_beta", 0.05))
-        self.d_cutoff = float(cfg.get("camera_d_cutoff", 1.0))
         self.backend = str(cfg.get("camera_backend", "auto"))
         if self.backend not in BACKEND_CHOICES:
             print("[camera] 未知 camera_backend=%r, 回退到 auto" % (self.backend,))
             self.backend = "auto"
-        self.threads = int(cfg.get("opencv_threads", DEFAULT_OPENCV_THREADS))
+        # 下面这些是算法/滤波微调, 普通用户几乎不动 —— 写死为源码常量,
+        # 不再进 config.json (见本文件顶部的 CAMERA_* 常量)。
+        self.nfeatures = CAMERA_NFEATURES
+        self.deadzone = CAMERA_DEADZONE
+        self.autocal = CAMERA_AUTOCAL
+        self.target_fps = CAMERA_FPS
+        self.min_cutoff = CAMERA_MIN_CUTOFF
+        self.beta = CAMERA_BETA
+        self.d_cutoff = CAMERA_D_CUTOFF
+        self.threads = CAMERA_OPENCV_THREADS
         # 铰链轴: 上盖绕屏幕水平中线转 -> 图像 x 轴。竖装摄像头用 "y"。
         ax = str(cfg.get("camera_axis", "x")).lower()
         self.axis = (0.0, 1.0, 0.0) if ax == "y" else (1.0, 0.0, 0.0)

@@ -65,9 +65,10 @@ if (-not $SkipPipUpgrade) {
 }
 
 Write-Host "== [3/3] install dependencies ==" -ForegroundColor Cyan
+# Single source of truth: read the dependency list from requirements.txt
+# (do NOT hardcode package names here -- keep the two in sync automatically).
 & $py -m pip install --disable-pip-version-check --cache-dir "$root\.pipcache" `
-    -i $IndexUrl --prefer-binary `
-    PyQt6 PyQt6-Fluent-Widgets PyOpenGL numpy opencv-python mss Pillow pyserial
+    -i $IndexUrl --prefer-binary -r (Join-Path $root "requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 
 Write-Host ""

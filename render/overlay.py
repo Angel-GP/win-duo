@@ -34,6 +34,22 @@ WDA_EXCLUDEFROMCAPTURE = 0x11
 #: 解释窗口标题, 中文一定会变成乱码 (试过 "win-duo 特征匹配 (x 关闭)" -> 乱码)。
 DEBUG_WINDOW = "win-duo match debug"
 
+# ═══════════════════════════════════════════════════════════════════
+# 渲染微调 / 显隐阈值 常量
+# ═══════════════════════════════════════════════════════════════════
+# 这些参数普通用户几乎不动, 所以**写死在源码里**, 不再进 config.json。
+# config.json 只留 refresh_hz / render_fps / max_tilt_deg / eye_dist_h /
+# blur_spread / outside_mode / backdrop_path 这几个用户会调的。
+SMOOTHING = 0.22          # 浓度缓动系数, 越小越跟手
+DARKENING = 0.001         # 吸光: 间隙越大越暗
+MAX_TAPS = 32             # 模糊盘式采样数上限
+BACKDROP_BLUR = 1.0       # 背景兜底图相对前景的模糊比例
+LOCK_AT_CLOSE = False     # 合盖到底 (浓度接近满) 时锁屏
+#: 玻璃层显隐的三个阈值 (双阈值 + 最短驻留, 防止死区边缘反复闪)
+IDLE_HIDE_BELOW = 0.004   # 浓度低于它 -> 隐藏整个玻璃层 (露出真实桌面)
+IDLE_SHOW_ABOVE = 0.02    # 浓度高于它 -> 显示
+IDLE_DWELL_SEC = 0.35     # 两次显隐最短间隔
+
 
 def _resize_fill(img, w, h):
     """等比缩放 + 居中裁剪到 w x h, 铺满且不拉伸、不留黑边。
@@ -120,17 +136,19 @@ class GlassOverlay(QOpenGLWidget):
         调一次这里, 否则改动不会生效。
         """
         cfg = self.cfg
-        self.smoothing = float(cfg.get("smoothing", 0.22))
+        # 用户会调的留在 config.json
         self.refresh_hz = float(cfg.get("refresh_hz", 3))
         self.max_tilt = float(cfg.get("max_tilt_deg", 88.0)) * 3.14159265 / 180.0
         self.eye_h = float(cfg.get("eye_dist_h", 2.0))
         self.spread = float(cfg.get("blur_spread", 0.42))
-        self.dark = float(cfg.get("darkening", 0.001))
-        self.max_taps = int(cfg.get("max_taps", 32))
-        self.bg_blur = float(cfg.get("backdrop_blur", 1.0))
-        self.idle_hide = float(cfg.get("idle_hide_below", 0.004))
-        self.idle_show = float(cfg.get("idle_show_above", 0.02))
-        self.idle_dwell = float(cfg.get("idle_dwell_sec", 0.35))
+        # 下面这些是渲染微调/显隐阈值, 写死为源码常量 (见文件顶部)
+        self.smoothing = SMOOTHING
+        self.dark = DARKENING
+        self.max_taps = MAX_TAPS
+        self.bg_blur = BACKDROP_BLUR
+        self.idle_hide = IDLE_HIDE_BELOW
+        self.idle_show = IDLE_SHOW_ABOVE
+        self.idle_dwell = IDLE_DWELL_SEC
         fps = float(cfg.get("render_fps", 30))
         self.render_interval = (1.0 / fps) if fps > 0 else 0.0
         self.render_fps = fps
@@ -663,7 +681,7 @@ class GlassOverlay(QOpenGLWidget):
             self._last_drawn_seq = seq
             self.update()
 
-        if self.cfg.get("lock_at_close") and self.g > 0.985 and not self._locked:
+        if LOCK_AT_CLOSE and self.g > 0.985 and not self._locked:
             self._locked = True
             ctypes.windll.user32.LockWorkStation()
         if self.g < 0.9:

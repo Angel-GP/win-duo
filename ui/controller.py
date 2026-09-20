@@ -218,7 +218,8 @@ class AppController(QObject):
             return False
         if level is None:
             return False
-        return level >= self.cfg.get("idle_show_above", 0.02)
+        from render.overlay import IDLE_SHOW_ABOVE
+        return level >= IDLE_SHOW_ABOVE
 
     def _start_release_poll(self):
         if self._release_timer is None:
