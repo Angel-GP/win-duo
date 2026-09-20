@@ -613,7 +613,7 @@ class SettingsPanel(QWidget):
         self.controller.end_scan()
         self.btn_scan.setEnabled(True)
         if not found:
-            self.lbl_scan.setText("没扫到可用摄像头。跑 tools\\camera_probe.py 看原因。")
+            self.lbl_scan.setText("没扫到可用摄像头。检查相机权限, 或确认没被别的程序占用。")
         else:
             self.lbl_scan.setText("扫到 %d 个可用摄像头（虚拟摄像头的冻结帧已排除）"
                                   % len(found))

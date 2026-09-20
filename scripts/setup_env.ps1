@@ -10,7 +10,7 @@
 #         curl.exe    -> curl: (35) schannel: AcquireCredentialsHandle failed
 #         git.exe     -> schannel: AcquireCredentialsHandle failed  (needs -c http.sslBackend=openssl)
 #      Python's ssl uses its own OpenSSL, so pip is unaffected. Do NOT diagnose
-#      PyPI problems with curl.exe on this machine -- use tools/net_probe.py.
+#      PyPI problems with curl.exe on this machine -- test with Python's ssl.
 #
 #   2) The registry proxy is stored as a bare "127.0.0.1:10808" with no scheme.
 #      Python 3.9's urllib.request.getproxies_registry() expands that to
@@ -21,8 +21,8 @@
 #      makes getproxies_environment() win over the buggy registry values.
 #
 # Usage:
-#   pwsh -File tools/setup_env.ps1
-#   pwsh -File tools/setup_env.ps1 -IndexUrl https://pypi.org/simple
+#   pwsh -File scripts/setup_env.ps1
+#   pwsh -File scripts/setup_env.ps1 -IndexUrl https://pypi.org/simple
 
 param(
     [string]$IndexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple",

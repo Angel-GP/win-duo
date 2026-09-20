@@ -37,7 +37,7 @@ jobs:
       - name: Build exe
         shell: pwsh
         run: |
-          python tools\build_exe.py --clean
+          python scripts\build_exe.py --clean
 
       - name: Show result
         shell: pwsh

@@ -447,8 +447,7 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
             label = "摄像头" if cfg["source"] == "camera" else "串口"
             print("!" * 68)
             print("[!] %s打不开。角度源仍是「%s」, 未自动切换。" % (label, label))
-            print("[!] 先跑  .venv\\Scripts\\python.exe tools\\camera_probe.py  确认设备,")
-            print("[!] 或在托盘/设置窗口里换成别的角度源。")
+            print("[!] 在设置窗口点「扫描」探测可用摄像头, 或换成别的角度源。")
             print("!" * 68)
 
     from PyQt6.QtCore import QTimer as _QTimer
@@ -622,7 +621,7 @@ def _check_interpreter():
         print("    或直接双击   : %s" % (BASE_DIR / "run_camera.bat"))
     else:
         print("    还没建环境, 先跑:")
-        print("      powershell -ExecutionPolicy Bypass -File tools\\setup_env.ps1")
+        print("      powershell -ExecutionPolicy Bypass -File scripts\\setup_env.ps1")
     print("=" * 68)
     return False
 

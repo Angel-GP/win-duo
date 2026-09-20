@@ -1,9 +1,9 @@
 """把 win-duo 打包成单文件 exe。
 
 用法:
-    .venv\\Scripts\\python.exe tools\\build_exe.py            # 单文件, 带控制台日志
-    .venv\\Scripts\\python.exe tools\\build_exe.py --onedir    # 目录版 (启动更快)
-    .venv\\Scripts\\python.exe tools\\build_exe.py --clean     # 先清掉旧产物
+    .venv\\Scripts\\python.exe scripts\\build_exe.py            # 单文件, 带控制台日志
+    .venv\\Scripts\\python.exe scripts\\build_exe.py --onedir    # 目录版 (启动更快)
+    .venv\\Scripts\\python.exe scripts\\build_exe.py --clean     # 先清掉旧产物
 
 ═══════════════════════════════════════════════════════════════════════
 几个必须处理的点 (都踩过或差点踩到)
@@ -13,9 +13,9 @@
    必须显式 `--add-data`。不放进去的话打包后 `make_icon()` 会退回运行时绘制
    —— 不崩, 但任务栏/托盘图标会变差 (少 9 档尺寸)。
 
-2. **`config.json` 不能打进 exe。** 它是用户要改的, 必须留在外面。
-   程序里 `paths.data_dir()` 会在 exe 旁边找它; 第一次启动时从
-   `config.example.json` 复制一份 (见 `--add-data` 那行和 main.py 的逻辑)。
+2. **`config.json` 不打进 exe, 仓库里也不放它。** 它是用户数据, 首次启动时
+   由 `main.DEFAULT_CFG` 在 exe 旁边现生成 (见 main.load_config /
+   _seed_config_if_missing)。所以这里没有它的 `--add-data`。
 
 3. **`bettercam` / `dxcam` 是 `__import__` 动态导入的, PyInstaller 的静态分析
    看不到。** 必须 `--hidden-import`, 否则打包后 DXGI 抓屏失效, 静默退回 mss
@@ -88,8 +88,8 @@ def build(onedir=False, clean=False, console=False, name=NAME):
         # ---- 数据文件 ----
         # win-duo.ico: 运行时 make_icon() 会去解包目录找它 (9 档尺寸)
         "--add-data", "%s%s." % (ROOT / "win-duo.ico", os.pathsep),
-        # config.example.json: 首次启动时复制成 exe 旁边的 config.json
-        "--add-data", "%s%s." % (ROOT / "config.json", os.pathsep),
+        # 注意: 不再打包 config.json。它是用户数据, 首次启动时由 main.DEFAULT_CFG
+        # 在 exe 旁边现生成 (见 main.load_config / _seed_config_if_missing)。
     ]
 
     for m in HIDDEN:
@@ -145,7 +145,7 @@ def main():
 
     # 打包前先确认图标在
     if not (ROOT / "win-duo.ico").exists():
-        print("[!] 缺 win-duo.ico, 先跑 tools/make_icon.py")
+        print("[!] 缺 win-duo.ico (仓库里应带着它)")
         return 1
     return build(onedir=args.onedir, clean=args.clean,
                  console=args.console, name=args.name)

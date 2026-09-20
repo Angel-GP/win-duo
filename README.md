@@ -21,7 +21,7 @@
 
 ```powershell
 # 建 venv 装依赖（工作区内，不污染系统 Python）
-powershell -ExecutionPolicy Bypass -File tools\setup_env.ps1
+powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
 
 # 默认进托盘（玻璃层按配置自动开）
 .venv\Scripts\python.exe main.py
@@ -79,8 +79,8 @@ powershell -ExecutionPolicy Bypass -File tools\setup_env.ps1
 3. 上盖**完全展开**时标定基准帧（设置窗口里有按钮，启动后也会自动标定一次）。
 4. 慢慢开合上盖，画面就会跟着折叠；方向反了用「翻转方向」，幅度不合适调 `camera_scale`。
 
-打不开摄像头时程序**只提示、不自动切换角度源**。可先跑 `tools\camera_probe.py`
-排查（它会列出每个 index × 后端的分辨率、画面变化量和特征点数，并跳过虚拟摄像头的冻结帧）。
+打不开摄像头时程序**只提示、不自动切换角度源**（`auto` 后端会自动跳过虚拟摄像头的
+冻结帧）。可在设置窗口点「扫描」逐个探测可用的摄像头。
 
 ## 性能说明
 
@@ -118,20 +118,14 @@ powershell -ExecutionPolicy Bypass -File tools\setup_env.ps1
 本地打包：
 
 ```powershell
-.venv\Scripts\python.exe tools\build_exe.py            # 单文件（约 94 MB）
-.venv\Scripts\python.exe tools\build_exe.py --onedir   # 目录版，启动更快
+.venv\Scripts\python.exe scripts\build_exe.py            # 单文件（约 94 MB）
+.venv\Scripts\python.exe scripts\build_exe.py --onedir   # 目录版，启动更快
 ```
 
-## 验证
-
-各工具都输出数值结论 + PASS/FAIL 退出码，不需要肉眼看图：
+无窗口自检（角度源 + 截屏链路）：
 
 ```powershell
-.venv\Scripts\python.exe tools\capture_backend_test.py   # 抓屏后端
-.venv\Scripts\python.exe tools\offscreen_test.py         # 着色器
-.venv\Scripts\python.exe tools\tracker_test.py           # 测角算法（合成帧）
-.venv\Scripts\python.exe tools\ui_test.py                # GUI 链路
-.venv\Scripts\python.exe main.py --selftest              # 角度源 + 截屏
+.venv\Scripts\python.exe main.py --selftest
 ```
 
 ## 许可

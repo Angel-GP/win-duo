@@ -105,7 +105,7 @@ SOFTWARE.
 | 抗漂移 | 按角度采样 + **回访绝对校正** |
 | 内点判据 | **角度**残差 |
 
-精度：稳态误差 **0.02°**、往返归零 **0.02°**（`tools/tracker_test.py` 合成帧实测）。
+精度：稳态误差 **0.02°**、往返归零 **0.02°**（合成帧实测）。
 
 `angles/serial_source.py`（ESP32 串口角度源）同为本项目自写。
 
@@ -124,8 +124,7 @@ GPL-3.0 发布。
 
 1. 把 PyQt6 换成 [PySide6](https://www.qt.io/qt-for-python)（LGPL-3.0，可动态链接）；
 2. 移除 `PyQt6-Fluent-Widgets` 依赖 —— 代码已经支持，设 `WIN_DUO_NO_FLUENT=1`
-   即走普通 Qt + QSS 的界面路径，该路径有回归测试覆盖
-   （`tools/ui_test.py`）；
+   即走普通 Qt + QSS 的界面路径；
 3. 去掉 [C.1](#c1-windowsduo--mit-) 里上游 WindowsDuo 的 MIT 声明段，并重写
    `render/shader.py` / `render/overlay.py`（MIT 允许删除声明，但**只在不再包含
    其衍生代码时**才成立 —— 也就是说你得用别的方式实现那个逆投影效果）。
@@ -159,6 +158,3 @@ GL 初始化这些必然写法占了大部分，属于"看过它之后自己写�
 
 最后一列是实测的文本相似度，用 `difflib.SequenceMatcher` 算的。列出来是为了
 让"哪些是衍生、哪些是重写"有据可查，而不是靠声称。
-
-另外 `tools/offscreen_test.py` 里内嵌了 WindowsDuo 的**原版 GLSL 着色器**用于
-逐像素比对（第 [6] 项断言），同属 MIT 代码，版权归 WindowsDuo 作者所有。
