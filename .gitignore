@@ -23,6 +23,9 @@ desk_bg.png
 # 摄像头自检输出的画面
 frame_camera_probe.png
 
+# 冻结帧 dump (angles/camera.py 检测到冻结帧时转储, 运行时产物)
+camera_dump/
+
 # 着色器对照图 (offscreen_test.py 生成, 每次跑都重画)
 offscreen_tilt*.png
 
