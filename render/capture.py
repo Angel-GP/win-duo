@@ -482,6 +482,9 @@ class CaptureWorker(threading.Thread):
         self.done = threading.Event()
         self.lock = threading.Lock()
         self.frame = None          # (data, w, h, seq, "BGRA")
+        #: 双缓冲 (_store 用): 两块预分配 BGRA 帧缓冲, 按帧号奇偶轮流写入,
+        #: 消掉每帧 malloc/free 16MB 的堆碎片与分配开销 (见 _store 说明)。
+        self._bufs = [None, None]
         self.busy = False
         # **不能叫 `_stop`** —— threading.Thread 内部有个 `_stop()` 方法,
         # 用同名属性会把它遮蔽掉, `join()` 一调就
@@ -645,6 +648,8 @@ class CaptureWorker(threading.Thread):
             self.size = (region.get("width"), region.get("height"))
             self.origin = self._region_origin(region)
             self.frame = None
+            # 双缓冲不在这里重建: _buf_for 只在采集线程里跑, 尺寸不符时自己
+            # 会按新尺寸重建 —— 这里碰它反而要考虑与采集线程的并发。
             self._reopen_pending = True
         self.kick()
 
@@ -825,17 +830,50 @@ class CaptureWorker(threading.Thread):
         # 于是 `ascontiguousarray` 返回同一个对象 (`b is a == True`, data 指针
         # 完全相同, OWNDATA 仍然是 False) —— 那个"保护"从来就没生效过。
         # 我原来就是这么写的, 一直以为有拷贝, 直到它真的崩了才量出来。
-        # 必须用 `.copy()` (或用 `np.array(..., copy=True)`)。
-        # 16MB 拷一次约 1.5~3ms, 在 refresh_hz=30 下可接受 —— 这是**正确性**
-        # 的成本, 不能省。
-        if not isinstance(data, (bytes, bytearray)):
+        # 必须真的拷贝。16MB 拷一次约 1.5~3ms, 在 refresh_hz=30 下可接受 ——
+        # 这是**正确性**的成本, 不能省。
+        #
+        # ═════════════════════════════════════════════════════════════════
+        # **双缓冲** (预分配 `_bufs` 两块轮流写 + `np.copyto`)
+        # ═════════════════════════════════════════════════════════════════
+        # 每帧 `arr.copy()` 都要 malloc/free 16MB 级大块, Python 堆"涨了不缩",
+        # 常驻 RSS 里沉淀出几十 MB 碎片; 分配开销也让拷贝本身变慢。改成**两块
+        # 预分配缓冲按帧号奇偶轮流写入**, 块里只发生 `np.copyto` (同样拷全部
+        # 字节, 无分配)。
+        #
+        # 安全性 —— 渲染层不会读到"正在被覆写"的缓冲:
+        #   1. overlay.paintGL 只在帧号变化时把 latest() 拷进 GL 纹理, 且这是
+        #      **同步调用**, paintGL 返回前一定拷完;
+        #   2. 同一块预分配缓冲要隔 2 帧才被复用 (奇偶轮换), 而 capture_hz 最多
+        #      是重绘率的 2 倍 —— 采集线程写 buf[N%2] 时, 渲染层对它的上一次
+        #      使用早已结束;
+        #   3. 双缓冲足够覆盖后端自有缓冲的轮换深度 (bettercam 实测 3 块)。
+        # 语义与旧版逐字节一致: 挂出去的永远是"我们拥有的独立内存"。
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            # mss 给 bytes: 灌进预缓冲, 顺便把"frombuffer 只读视图"问题一起消掉
+            buf = self._buf_for(w, h)
+            buf[:] = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)
+        else:
             arr = np.asarray(data)
-            if not arr.flags["OWNDATA"]:
-                data = arr.copy()
+            buf = self._buf_for(w, h)
+            np.copyto(buf, arr.reshape(h, w, 4))
         with self.lock:
-            self.frame = (data, w, h, seq, fmt)
+            self.frame = (buf, w, h, seq, fmt)
         self.grabs += 1
         return seq
+
+    def _buf_for(self, w, h):
+        """取本帧该写的预分配缓冲 (按帧号奇偶轮换); 尺寸变了就整对重建。
+
+        换屏/DPI 虚拟化都会让 w/h 变 —— 按新尺寸重建, 旧尺寸的缓冲自然被
+        替换掉, 不会累积。只在采集线程调用, 无并发。
+        """
+        idx = (self.grabs + 1) % 2
+        buf = self._bufs[idx]
+        if buf is None or buf.shape != (h, w, 4):
+            buf = np.empty((h, w, 4), dtype=np.uint8)
+            self._bufs[idx] = buf
+        return buf
 
 
 def make_capture(region, cfg, display_hz=60.0):
