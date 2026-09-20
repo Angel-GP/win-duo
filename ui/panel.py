@@ -542,10 +542,6 @@ class SettingsPanel(QWidget):
             if not d.isMaximized():
                 QTimer.singleShot(0, d.adjustSize)
 
-    def _switch_adv_tab(self, key):
-        self.tab_adv.set_current(key)
-        self._on_adv_tab(key)
-
     def _quick_calibrate(self):
         self.controller.calibrate_camera()
 
