@@ -29,15 +29,22 @@ ACCENT = "#4f7cff"
 FLUENT = False
 if not _FORCE_FALLBACK:
     try:
-        from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget,
-                                    FluentIcon, LineEdit, PlainTextEdit,
-                                    PrimaryPushButton, PushButton,
-                                    SegmentedWidget, StrongBodyLabel,
-                                    SubtitleLabel, Theme, ToolButton,
-                                    TransparentPushButton, setTheme,
-                                    setThemeColor)
-        from qfluentwidgets import SwitchButton as _FluentSwitch
-        from qfluentwidgets import ComboBox as _FluentCombo
+        # qfluentwidgets 在 import 时**无条件** `print(ALERT)` 打一行
+        # "QFluentWidgets Pro is now released..." 的广告 (见其 common/config.py,
+        # 没有关闭开关)。首次 import 时把 stdout 临时挡掉, 吞掉这条广告 ——
+        # 只挡 stdout, stderr 不动, 真报错照样能看到。
+        import contextlib
+        import io as _io
+        with contextlib.redirect_stdout(_io.StringIO()):
+            from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget,
+                                        FluentIcon, LineEdit, PlainTextEdit,
+                                        PrimaryPushButton, PushButton,
+                                        SegmentedWidget, StrongBodyLabel,
+                                        SubtitleLabel, Theme, ToolButton,
+                                        TransparentPushButton, setTheme,
+                                        setThemeColor)
+            from qfluentwidgets import SwitchButton as _FluentSwitch
+            from qfluentwidgets import ComboBox as _FluentCombo
 
         class ComboBox(_FluentCombo):
             """Fluent 的 addItem 签名是 (text, icon, userData), Qt 是 (text, userData)。
