@@ -6,6 +6,11 @@
 __pycache__/
 *.pyc
 
+# 排除非 requirements.txt 依赖清单
+# 项目依赖的唯一可信源是 requirements.txt
+uv.lock
+pyproject.toml
+
 # 本地测试启动器 (不进仓库)
 test.bat
 
