@@ -74,6 +74,70 @@ IDLE_SHOW_ABOVE = 0.02    # 浓度高于它 -> 显示
 IDLE_DWELL_SEC = 0.35     # 两次显隐最短间隔
 
 
+def _display_width(s):
+    """字符串在终端里占的**列数** (中文/全角算 2 列)。
+
+    `_print_status` 用 `\\r` 覆盖同一行来刷新状态 —— 这只在"整行不折行"时
+    才成立。一旦超过控制台宽度就会折行, 而 `\\r` 只回到**折行后那一段**的行首,
+    于是状态行错乱、残留 (用户看到的"快捷键提示没有正常显示")。
+    所以必须按显示宽度判断是否超宽。
+    """
+    w = 0
+    for ch in s:
+        o = ord(ch)
+        # 东亚宽字符 / 全角标点: 占 2 列
+        if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
+                or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF
+                or 0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60
+                or 0xFFE0 <= o <= 0xFFE6 or 0x20000 <= o):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _console_columns(default=80):
+    """当前控制台窗口宽度 (列)。取不到就返回 default。
+
+    优先用 Win32 (Windows 上最准); 失败 (无控制台 / 重定向) 再退到
+    shutil.get_terminal_size。
+    """
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+
+        class _COORD(_ct.Structure):
+            _fields_ = [("X", _ct.c_short), ("Y", _ct.c_short)]
+
+        class _SMALL_RECT(_ct.Structure):
+            _fields_ = [("Left", _ct.c_short), ("Top", _ct.c_short),
+                        ("Right", _ct.c_short), ("Bottom", _ct.c_short)]
+
+        class _CSBI(_ct.Structure):
+            _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                        ("wAttributes", _wt.WORD), ("srWindow", _SMALL_RECT),
+                        ("dwMaximumWindowSize", _COORD)]
+
+        k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.restype = _ct.c_void_p
+        k32.GetConsoleScreenBufferInfo.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_CSBI)]
+        k32.GetConsoleScreenBufferInfo.restype = _wt.BOOL
+        h = k32.GetStdHandle(-11)
+        info = _CSBI()
+        if k32.GetConsoleScreenBufferInfo(_ct.c_void_p(h), _ct.byref(info)):
+            n = info.srWindow.Right - info.srWindow.Left + 1
+            if n > 8:
+                return int(n)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import shutil
+        return int(shutil.get_terminal_size().columns) or default
+    except Exception:  # noqa: BLE001
+        return default
+
+
 def _resize_fill(img, w, h):
     """等比缩放 + 居中裁剪到 w x h, 铺满且不拉伸、不留黑边。
 
@@ -884,25 +948,79 @@ class GlassOverlay(QOpenGLWidget):
         self._last_print = now
 
         bits = ["[%s]" % LABELS.get(name, name)]
+        #: 可精简的**数据项**, 按"越靠后越先丢"排列 (超宽时从尾部丢)。
+        #: 快捷键提示不在这个列表里 —— 它是用户要的操作指引, 优先级最高。
+        extra = []
         if detail:
             if "pitch" in detail:
                 bits.append("pitch=%+6.2f" % detail["pitch"])
-                bits.append("fold=%5.1f" % detail["fold"])
-                bits.append("match=%d" % detail["matches"])
-                bits.append("SCALE=%.1f" % detail["scale"])
-                bits.append("SIGN=%+d" % detail["sign"])
+                extra.append("fold=%5.1f" % detail["fold"])
+                extra.append("match=%d" % detail["matches"])
+                extra.append("SCALE=%.1f" % detail["scale"])
+                extra.append("SIGN=%+d" % detail["sign"])
             if "angle" in detail:
                 bits.append("a=%7.2f" % detail["angle"])
-                bits.append("%3.0fHz" % detail["fps"])
+                extra.append("%3.0fHz" % detail["fps"])
         bits.append("浓度=%5.1f%%" % (self.g * 100))
         bits.append("%s" % status)
         bits.append("重绘=%.0f/s" % self._paint_rate())
         # 把**真实**截屏速率也打出来: 光有一个"上限"数字会骗人 ——
         # 实际速率还受 tick 周期、以及"桌面没变就降频轮询"影响。
         try:
-            bits.append("截屏=%.0f/s" % self.capturer.rate_hz)
+            extra.append("截屏=%.0f/s" % self.capturer.rate_hz)
         except Exception:  # noqa: BLE001
             pass
         bits.append("出界=%s" % ("黑" if self.outside == 0 else "背景"))
-        bits.append("m=换源 c=标定 x=调试 v=出界 b=选背景 +/-=灵敏度")
-        print("\r" + "  ".join(bits) + "   ", end="", flush=True)
+        # ═══════════════════════════════════════════════════════════════
+        # 按控制台宽度拼行 —— 否则 `\r` 覆盖刷新会错乱
+        # ═══════════════════════════════════════════════════════════════
+        # 状态行用 `\r` 覆盖同一行来刷新。只要它超过控制台宽度就会折行, 而 `\r`
+        # 只回到折行后那一段的行首 -> 提示残留/错乱 (用户反馈的"快捷键提示没有
+        # 正常显示")。摄像头模式下这一行长达 167 列, 80 列控制台必然出事。
+        #
+        # **优先级**: 快捷键提示 > 主信息 ([源] 浓度 状态) > 数据项。超宽时从
+        # 数据项尾部开始丢, 提示永远保住 (放不下时用紧凑写法)。
+        hint = "m=换源 c=标定 x=调试 v=出界 b=选背景 +/-=灵敏度"
+        short_hint = "m c x v b +/-"
+        cols = _console_columns()
+        # 留 1 列余量: 不少终端在刚好写满最后一列时也会自动换行
+        limit = max(20, cols - 1)
+
+        def fits(cand):
+            return _display_width(cand) <= limit
+
+        # 1) 完整: 主信息 + 所有数据项 + 完整提示
+        line = None
+        cand = "  ".join(bits + extra + [hint])
+        if fits(cand):
+            line = cand
+        # 2) 从数据项尾部逐个丢, 直到放得下
+        if line is None:
+            for i in range(len(extra) - 1, -1, -1):
+                cand = "  ".join(bits + extra[:i] + [hint])
+                if fits(cand):
+                    line = cand
+                    break
+        # 3) 丢光数据项 + 紧凑提示
+        if line is None:
+            cand = "  ".join(bits + [short_hint])
+            if fits(cand):
+                line = cand
+        # 4) 连"主信息 + 紧凑提示"都放不下: 只保主信息 + 紧凑提示, 截断主信息
+        if line is None:
+            line = "  ".join(bits + [short_hint])
+        if not fits(line):
+            out, w = [], 0
+            # 给提示留出位置: 先截主信息, 再把提示接回去
+            tail = "  " + short_hint
+            room = limit - _display_width(tail) - 1
+            for ch in "  ".join(bits):
+                cw = _display_width(ch)
+                if w + cw > room:
+                    break
+                out.append(ch)
+                w += cw
+            line = "".join(out) + "…" + tail
+
+        # 行尾补空格: 覆盖上一次更长的那行残影
+        print("\r" + line + " " * 4, end="", flush=True)
