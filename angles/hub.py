@@ -3,7 +3,6 @@
 合并的关键就在这一层 -- 摄像头、ESP32、键盘三种测法在这里被抹平成同一个
 接口, 渲染层完全不知道自己接的是哪一个传感器。
 """
-from .camera import CameraAngleSource
 from .serial_source import SerialAngleSource
 
 ORDER = ["camera", "serial", "manual"]
@@ -40,6 +39,14 @@ class SourceHub:
     # ---------- 内部 ----------
     def _build(self, name):
         if name == "camera":
+            # **懒导入** (不要提回模块顶层)。angles.camera 顶层就 import cv2,
+            # 而 opencv 的 DLL 有 ~116MB —— 提到顶层的话, 只要 import hub
+            # (串口/键盘源也逃不掉) 就把它加载进内存。摄像头源是唯一真正的
+            # cv2 用户, 放到 _build 这个实际要用它的点上, 串口/键盘进程
+            # 一辈子不碰 cv2。首次导入是主线程同步做的 (几百 ms), 不在采集
+            # 线程热路径上, 也没有 import lock 撞车问题 (见 overlay 热路径
+            # 注释的反例 —— 那是"绘制回调里 import", 这里是"启动源时 import")。
+            from .camera import CameraAngleSource
             return CameraAngleSource(self.cfg)
         if name == "serial":
             return SerialAngleSource(self.cfg)

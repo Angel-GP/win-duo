@@ -18,12 +18,38 @@
 """
 import argparse
 import ctypes
+import faulthandler
 import json
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
+
+# **让 native 崩溃 (0xC0000409 / access violation) 也吐出 Python 栈。**
+# "Unhandled Python exception" 一行什么都说明不了 —— faulthandler 会在
+# 崩溃瞬间把所有线程的 Python 调用栈打到 stderr, 精确到是哪一行触发的。
+# stderr 通常已被 _TeeLogger 重定向到日志文件, 所以崩在日志里能查到。
+#
+# ⚠️ **打包 exe (console=False) 下 sys.stderr 是 None**, 直接 enable 会
+# `RuntimeError: sys.stderr is None` (实测打包后启动即崩)。此时退而求其次:
+# 崩溃栈写到 _TeeLogger 马上要打开的那个日志文件 —— 它由 main() 里
+# _TeeLogger.open_log 创建, 这里只能先算出路径; open_log 失败时连日志
+# 文件也没有, 那 faulthandler 只好不启用 (总不能因此起不来)。
+def _enable_faulthandler():
+    import sys as _sys
+    if _sys.stderr is not None:
+        faulthandler.enable(file=_sys.stderr, all_threads=True)
+        return
+    try:
+        _log = _paths.log_file("win_duo.log")
+        _log.parent.mkdir(parents=True, exist_ok=True)
+        faulthandler.enable(file=open(_log, "a", encoding="utf-8"), all_threads=True)
+    except Exception:  # noqa: BLE001  连日志都开不了就放弃, 不挡启动
+        pass
+
+
+_enable_faulthandler()
 
 # ═══════════════════════════════════════════════════════════════════════
 # 限制 BLAS 线程数 —— **必须在 numpy 被 import 之前设**。
@@ -333,6 +359,8 @@ def apply_args(cfg, args):
         cfg["camera_scale"] = args.scale
     if args.screen is not None:
         cfg["screen_index"] = args.screen
+    if args.capture_backend:
+        cfg["capture_backend"] = args.capture_backend
     if args.low_memory:
         cfg["low_memory_mode"] = True
     return cfg
@@ -691,6 +719,10 @@ def main():
     ap.add_argument("--camera-backend", dest="camera_backend",
                     choices=["auto", "dshow", "msmf", "any"],
                     help="摄像头取流后端 (默认 auto: 会跳过冻结帧)")
+    ap.add_argument("--capture-backend", dest="capture_backend",
+                    choices=["auto", "wgc", "dxgi", "mss"],
+                    help="桌面采集后端 (默认 auto: wgc -> dda -> mss)。"
+                         "多后端渲染验证用: --capture-backend mss --smoke 之类")
     ap.add_argument("--port", help="ESP32 串口, 如 COM3")
     ap.add_argument("--screen", type=int, help="用第几块显示器 (0 起)")
     ap.add_argument("--outside", choices=["black", "backdrop"],

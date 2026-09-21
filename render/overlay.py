@@ -13,7 +13,6 @@ import ctypes
 import os
 import time
 
-import cv2
 import numpy as np
 from OpenGL import GL
 from PyQt6.QtCore import Qt, QTimer
@@ -25,10 +24,33 @@ from angles.hub import LABELS
 
 import paths
 
-from .capture import frame_bgr, frame_bgra_to_rgba
+from .capture import frame_bgr
 from .shader import FS_DUO, VS
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
+
+
+def _cv2():
+    """按需加载 cv2 并缓存到模块级单例。
+
+    **不要提回模块顶层 `import cv2`。** opencv 的 DLL 有 ~116MB, 而本模块在
+    controller 的导入链上 —— 提回顶层等于"进程一起来就扛着 116MB", 哪怕
+    用户从不用摄像头调试窗、不设背景兜底。cv2 在本文件只服务四个低频场景:
+    背景兜底图、背景图读取、摄像头匹配调试窗、`_resize_fill` (都在用户动作
+    或首次建背景时触发, 不在每帧热路径上)。
+
+    线程安全: 所有调用点都在主线程 (Qt 绘制/定时器回调), 不存在并发首导。
+    千万别学"绘制回调里 import"的反例 —— 这里第一次 import 发生在首次调用
+    `_cv2()` 时, 同样是主线程, 无 import lock 撞车风险。
+    """
+    global _cv2_mod
+    if _cv2_mod is None:
+        import cv2 as _m
+        _cv2_mod = _m
+    return _cv2_mod
+
+
+_cv2_mod = None
 
 #: 调试窗标题**必须是纯 ASCII**。OpenCV 的 HighGUI 在 Windows 上按本地代码页
 #: 解释窗口标题, 中文一定会变成乱码 (试过 "win-duo 特征匹配 (x 关闭)" -> 乱码)。
@@ -61,6 +83,7 @@ def _resize_fill(img, w, h):
         return img
     scale = max(w / iw, h / ih)
     nw, nh = int(round(iw * scale)), int(round(ih * scale))
+    cv2 = _cv2()
     resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
     x = (nw - w) // 2
     y = (nh - h) // 2
@@ -75,6 +98,7 @@ def load_image(path):
         return None
     if data.size == 0:
         return None
+    cv2 = _cv2()
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
@@ -317,8 +341,15 @@ class GlassOverlay(QOpenGLWidget):
         if missing:
             print("[GL] 警告: 这些 uniform 没找到 (驱动可能优化掉了): %s" % missing)
 
-        self.cap_tex = self._new_tex()
-        self.bd_tex = self._new_tex()
+        self.cap_tex = self._new_tex(swizzle_bgra=True)   # BGRA 帧, 采样时硬件换通道
+        # bd_tex 同样走 swizzle: _upload_backdrop 手上的是 cv2 的 BGR 数据,
+        # 灌成 RGBA 字节序再让采样器按 (B,G,R,1) 换回来, 省一次 CPU 换通道。
+        self.bd_tex = self._new_tex(swizzle_bgra=True)
+        # 背景上传时 alpha 恒为 1 (见 _upload_backdrop), swizzle 通道 4 填 1
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.bd_tex)
+        GL.glTexParameteriv(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_RGBA,
+                            (GL.GL_BLUE, GL.GL_GREEN, GL.GL_RED, GL.GL_ONE))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
         # **core profile 必须有一个已绑定的 VAO 才能发起 draw call**, 哪怕不用
         # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
@@ -329,9 +360,38 @@ class GlassOverlay(QOpenGLWidget):
         self._gl_ready = True
 
     @staticmethod
-    def _new_tex():
+    def _gl_err_where(tag):
+        """打印并清掉当前 GL 错误旗标 (调试辅助, 平时无错时零输出)。"""
+        err = GL.glGetError()
+        if err != 0:
+            print("[GL] %s 处 glError=0x%X" % (tag, err))
+
+    @staticmethod
+    def _new_tex(swizzle_bgra=False):
+        """建一张纹理。
+
+        `swizzle_bgra=True` 时设 **GL_TEXTURE_SWIZZLE_RGBA = (B,G,R,A)**:
+        上传 BGRA 数据(内部格式仍是 GL_RGBA8,规范安全),采样时由硬件把
+        R/B 换回来。
+
+        为什么有这个开关:DXGI 桌面复制的原生格式就是 BGRA。以前为了用
+        GL_RGBA 外部格式,每帧在 CPU 侧把 16MB 的 BGRA 搬成 RGBA
+        (`frame_bgra_to_rgba`);swizzle 把这一步挪进纹理采样硬件 —— 上传
+        省一次全像素搬运,每帧少分配 16MB。GL_TEXTURE_SWIZZLE_RGBA 是
+        OpenGL 3.0 核心特性(本项目就是 3.3),无兼容性问题。
+        """
         tex = GL.glGenTextures(1)
         GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
+        if swizzle_bgra:
+            # **必须用 glTexParameteriv (数组版), 不能用 glTexParameteri。**
+            # swizzle 是 4 个整型的查询/设置, glTexParameteri 的 params 只收
+            # 一个 GLint —— PyOpenGL 把 tuple 塞给标量版会按错误的方式传给
+            # 驱动, 直接 native 崩溃 (0xC0000409, 实测踩过)。
+            # 顺带: GL_TRUE/GL_FALSE 之类是 uint 常量, 而 GL_TEXTURE_SWIZZLE_*
+            # 的分量值是普通 GLenum int, 直接传 python int 列表即可。
+            GL.glTexParameteriv(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_SWIZZLE_RGBA,
+                                (GL.GL_BLUE, GL.GL_GREEN, GL.GL_RED, GL.GL_ALPHA))
+            GlassOverlay._gl_err_where("纹理 %s 的 swizzle glTexParameteriv" % tex)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER,
                            GL.GL_LINEAR_MIPMAP_LINEAR)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
@@ -351,14 +411,21 @@ class GlassOverlay(QOpenGLWidget):
         frame = self.capturer.latest()
         if frame and frame[3] != self._uploaded_seq:
             raw, fw, fh, seq, fmt = frame
-            # **上传一律用 GL_RGBA (内部格式和外部格式都是)** —— `GL_BGRA` 作为
-            # 外部格式**不是 OpenGL 3.3 core 的核心保证** (来自 GL_EXT_bgra):
-            # NVIDIA 宽松接受, 但 Intel 核显的严格 core 实现常拒绝 ->
-            # glTexImage2D 报 GL_INVALID_ENUM、纹理是空的 -> **玻璃层全黑**。
-            # 所以 capture 侧现在统一把帧转成 RGBA (见 capture._store / frame_bgra),
-            # 这里就只剩一条 GL_RGBA 路径, 对任何驱动都规范安全。
-            if fmt != "RGBA":
-                raw = frame_bgra_to_rgba(raw, fw, fh)
+            # **cap_tex 上传走 BGRA + swizzle 采样换通道**。注意区分两个问题:
+            #   - `GL_BGRA` 作为 glTexImage2D 的**外部格式**不是 3.3 core 的
+            #     核心保证 (GL_EXT_bgra),Intel 核显会拒绝 -> 以前因此全黑;
+            #   - 外部格式仍可用 GL_RGBA 吗?不行 —— 数据是 BGRA,RGBA 会让
+            #     红/蓝互换。真正的解法是 **GL_TEXTURE_SWIZZLE_RGBA**:外部
+            #     格式老老实实给 GL_RGBA 按字节灌进去,纹理内部按 (B,G,R,A)
+            #     swizzle,采样时硬件换回 R/B —— 见 _new_tex 的说明。
+            # 于是每帧的 CPU 换通道 (frame_bgra_to_rgba, 16MB 搬运) 整个删掉,
+            # GL 调用本身对任何驱动都规范安全。
+            #
+            # **fmt 契约**: 上传无条件按 BGRA 字节序灌 (swizzle 负责换通道)。
+            # 现存三个后端 (wgc/dda/mss) 都以 "BGRA" 登记, 这里 assert 钉死
+            # —— 未来若有人加 RGBA 后端而忘了改这里, 会在开发期立刻炸出来,
+            # 而不是上线后整屏红蓝反转还查不到原因。
+            assert fmt == "BGRA", "paintGL 假定帧是 BGRA, 实际 fmt=%r" % (fmt,)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, fw, fh, 0,
                             GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
@@ -435,6 +502,7 @@ class GlassOverlay(QOpenGLWidget):
         """
         fw, fh = frame[1], frame[2]
         bgr = frame_bgr(frame)
+        cv2 = _cv2()
         small = cv2.resize(bgr, (max(1, fw // 8), max(1, fh // 8)),
                            interpolation=cv2.INTER_AREA)
         small = cv2.GaussianBlur(small, (0, 0), 20)
@@ -498,11 +566,17 @@ class GlassOverlay(QOpenGLWidget):
 
     def _upload_backdrop(self, bgr):
         h, w = bgr.shape[:2]
-        # 同样避开 GL_BGR 外部格式 (非 core 保证, 核显可能拒绝): 换成 RGBA 上传。
-        rgba = np.ascontiguousarray(bgr[:, :, [2, 1, 0]])
+        # bd_tex 已设 swizzle (B,G,R,1) —— cv2 的 BGR 数据直接按字节灌进去,
+        # 采样时硬件换通道, 不再在 CPU 上做 BGR->RGB 搬运。外部格式用 GL_RGBA:
+        # 每行末尾补一个 alpha 字节 (值任意, swizzle 会把它弃成常数 1)。
+        # 灌数用 GL_RED 指定逐字节平面?不 —— 这里直接把 HxWx3 reshape 成
+        # Hx(W*3)x1 一样要拷贝;干脆 ascontiguousarray 补齐成 4 通道, 一次性成本。
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[:, :, :3] = bgr
+        rgba[:, :, 3] = 255
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.bd_tex)
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB, w, h, 0,
-                        GL.GL_RGB, GL.GL_UNSIGNED_BYTE, rgba)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, w, h, 0,
+                        GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, rgba)
         GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
@@ -569,6 +643,7 @@ class GlassOverlay(QOpenGLWidget):
         cam = self.hub.get("camera")
         if cam is not None:
             cam.set_debug(False)
+        cv2 = _cv2()
         for _ in range(8):
             try:
                 cv2.destroyWindow(DEBUG_WINDOW)
@@ -608,6 +683,7 @@ class GlassOverlay(QOpenGLWidget):
         if img is None or seq == self._dbg_seq:
             return
         self._dbg_seq = seq
+        cv2 = _cv2()
         try:
             cv2.imshow(DEBUG_WINDOW, img)
             if not self._dbg_shown:
