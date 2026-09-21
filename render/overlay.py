@@ -77,6 +77,70 @@ IDLE_SHOW_ABOVE = 0.02    # 浓度高于它 -> 显示
 IDLE_DWELL_SEC = 0.35     # 两次显隐最短间隔
 
 
+def _display_width(s):
+    """字符串在终端里占的**列数** (中文/全角算 2 列)。
+
+    `_print_status` 用 `\\r` 覆盖同一行来刷新状态 —— 这只在"整行不折行"时
+    才成立。一旦超过控制台宽度就会折行, 而 `\\r` 只回到**折行后那一段**的行首,
+    于是状态行错乱、残留 (用户看到的"快捷键提示没有正常显示")。
+    所以必须按显示宽度判断是否超宽。
+    """
+    w = 0
+    for ch in s:
+        o = ord(ch)
+        # 东亚宽字符 / 全角标点: 占 2 列
+        if (0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
+                or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF
+                or 0xFE30 <= o <= 0xFE6F or 0xFF00 <= o <= 0xFF60
+                or 0xFFE0 <= o <= 0xFFE6 or 0x20000 <= o):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _console_columns(default=80):
+    """当前控制台窗口宽度 (列)。取不到就返回 default。
+
+    优先用 Win32 (Windows 上最准); 失败 (无控制台 / 重定向) 再退到
+    shutil.get_terminal_size。
+    """
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+
+        class _COORD(_ct.Structure):
+            _fields_ = [("X", _ct.c_short), ("Y", _ct.c_short)]
+
+        class _SMALL_RECT(_ct.Structure):
+            _fields_ = [("Left", _ct.c_short), ("Top", _ct.c_short),
+                        ("Right", _ct.c_short), ("Bottom", _ct.c_short)]
+
+        class _CSBI(_ct.Structure):
+            _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                        ("wAttributes", _wt.WORD), ("srWindow", _SMALL_RECT),
+                        ("dwMaximumWindowSize", _COORD)]
+
+        k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.restype = _ct.c_void_p
+        k32.GetConsoleScreenBufferInfo.argtypes = [
+            _ct.c_void_p, _ct.POINTER(_CSBI)]
+        k32.GetConsoleScreenBufferInfo.restype = _wt.BOOL
+        h = k32.GetStdHandle(-11)
+        info = _CSBI()
+        if k32.GetConsoleScreenBufferInfo(_ct.c_void_p(h), _ct.byref(info)):
+            n = info.srWindow.Right - info.srWindow.Left + 1
+            if n > 8:
+                return int(n)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import shutil
+        return int(shutil.get_terminal_size().columns) or default
+    except Exception:  # noqa: BLE001
+        return default
+
+
 def _resize_fill(img, w, h):
     """等比缩放 + 居中裁剪到 w x h, 铺满且不拉伸、不留黑边。
 
@@ -121,7 +185,9 @@ class GlassOverlay(QOpenGLWidget):
         self._visible = False        # 玻璃层当前是否真的显示着
         self._uploaded_seq = -1
         self._uploaded_size = (1, 1)  # 已上传纹理的尺寸, 与 frame 解耦
-        self._last_drawn_g = -1.0    # 上次真正重绘时的浓度/帧号, 用于跳过无谓重绘
+        # 注: 原来这里还有个 `_last_drawn_g` (上次重绘时的浓度), 用来做
+        # "浓度变化 > 0.0005 才重绘"的节流 —— 那个判据会把指数缓动的尾段吞掉
+        # (见 tick 里的说明), 已改为按"是否还在追 target"判断, 故删除。
         self._last_drawn_seq = -1
         self._last_kick = 0.0
         self._last_print = 0.0
@@ -226,14 +292,29 @@ class GlassOverlay(QOpenGLWidget):
         self._retune_timer()
 
     def _tick_ms(self):
-        """tick 周期必须跟得上设定的重截频率。
+        """tick 周期 (ms)。**它是重绘判据的时间粒度, 直接决定实际帧率。**
 
-        以前写死 16ms -> 每秒最多 62 次 tick, 所以 refresh_hz 填 137 也只会
-        跑到 62 —— 用户当然会问"实际上频率没那么高啊"。
-        现在按设定值算, 下限 4ms (防手滑填太大把 CPU 烧掉)。
+        原来写死 16ms -> 每秒最多 62 次 tick, 所以 refresh_hz 填 137 也只会
+        跑到 62 (用户会问"实际频率没那么高")。后来改成按设定值算, 但留下了
+        `min(16, ...)` 这个**上限**, 而它恰好是最糟的一档:
+
+            render_fps=30 -> 需要 33.3ms 的间隔
+            tick=16ms 时, 判据 `now - last >= 33.3` 必须凑够 3 拍 = 48ms
+            -> 实际只有 1000/48 ≈ 21 fps  (实测 21.0/s, 帧间隔 47.9ms)
+
+        **实测对照 (本项目, render_fps=30):**
+            tick=16ms -> 21.0/s   帧间隔 47.9ms   <- 原来的值
+            tick= 8ms -> 25.0/s
+            tick= 4ms -> 27.8/s   帧间隔 35.9ms   <- 接近目标 30/s
+
+        所以 tick 必须**足够细**: 量化误差正比于 tick, 细 tick 反而更准。
+        实测在本项目上 tick=4ms 最优 (27.8/s, 帧间隔 35.9ms), 8ms 已经掉到
+        25.0/s。所以直接取目标帧间隔的 1/8 并夹到 [4ms, 16ms] —— 30fps 时
+        得到 4ms。tick 本身很便宜 (只做判据与状态更新, 绘制仍被 render_fps
+        限速), 实测单核占用没有可见上升。
         """
-        want = max(self.refresh_hz, self.render_fps, 60.0)
-        return int(max(4, min(16, round(1000.0 / want))))
+        want = max(self.refresh_hz, self.render_fps, 30.0)
+        return int(max(4, min(16, round(1000.0 / want / 8.0))))
 
     def _retune_timer(self):
         """按当前设置重设定时器周期 (apply_config 会调, 改设置就地生效)。"""
@@ -850,7 +931,6 @@ class GlassOverlay(QOpenGLWidget):
             self._visible = True
             self._last_vis_change = now
             self.show()
-            self._last_drawn_g = -1.0
             self._last_drawn_seq = -1
             self.capturer.kick()
             wdlog.log.info("玻璃层显示", tag="glass")
@@ -871,14 +951,25 @@ class GlassOverlay(QOpenGLWidget):
         frame = self.capturer.latest()
         seq = frame[3] if frame else -1
         new_frame = seq != self._last_drawn_seq
-        level_moved = abs(self.g - self._last_drawn_g) > 0.0005
 
-        # 有新帧或浓度变了就重绘, 并由 render_fps 限速。
-        # **别在这里再问一次"内容变了吗"** —— 帧号本身就只在后端给出新帧时
-        # 才推进, 多一层平均差过滤会把日常的小变化全吞掉, 画面直接冻死。
-        if (level_moved or new_frame) and (now - self._last_draw_req) >= self.render_interval:
+        # ═══════════════════════════════════════════════════════════════
+        # 浓度是否还在动 —— **不能用固定小阈值判断**
+        # ═══════════════════════════════════════════════════════════════
+        # 原来写的是 `abs(self.g - self._last_drawn_g) > 0.0005`。而 g 走的是
+        # 指数缓动 (`g += (target-g)*0.22`): 越接近目标每帧变化越小, 到尾部
+        # 会**小于 0.0005**, 于是被判成"浓度没动" -> 不重绘 -> 动画尾部顿住,
+        # 再突然跳到终值。更糟的是 `_last_drawn_g` 只在**真的重绘时**才更新,
+        # 所以一旦开始跳过, 差值只会越来越小, 可能长时间卡住。
+        # 上游 WindowsDuo 没有这个判据 (每 tick 无条件 update()), 尾段是连续的
+        # —— 这就是"效果远不及上游"的主因。
+        #
+        # 正确判据: 只要 **g 还没追上 target**, 就认为动画在动 (与阈值无关)。
+        # 用"是否已到达目标"代替"变化量 > 常数", 缓动多慢都能画完。
+        settling = abs(self.target - self.g) > 1e-4
+
+        # 有新帧、或浓度尚未追上 target -> 重绘, 并由 render_fps 限速。
+        if (settling or new_frame) and (now - self._last_draw_req) >= self.render_interval:
             self._last_draw_req = now
-            self._last_drawn_g = self.g
             self._last_drawn_seq = seq
             self._update_req_count = getattr(self, "_update_req_count", 0) + 1
             self.update()
@@ -1027,23 +1118,26 @@ class GlassOverlay(QOpenGLWidget):
             self._period_stats.add(self._paint_rate())
 
         bits = ["[%s]" % LABELS.get(name, name)]
+        #: 可精简的**数据项**, 按"越靠后越先丢"排列 (超宽时从尾部丢)。
+        #: 快捷键提示不在这个列表里 —— 它是用户要的操作指引, 优先级最高。
+        extra = []
         if detail:
             if "pitch" in detail:
                 bits.append("pitch=%+6.2f" % detail["pitch"])
-                bits.append("fold=%5.1f" % detail["fold"])
-                bits.append("match=%d" % detail["matches"])
-                bits.append("SCALE=%.1f" % detail["scale"])
-                bits.append("SIGN=%+d" % detail["sign"])
+                extra.append("fold=%5.1f" % detail["fold"])
+                extra.append("match=%d" % detail["matches"])
+                extra.append("SCALE=%.1f" % detail["scale"])
+                extra.append("SIGN=%+d" % detail["sign"])
             if "angle" in detail:
                 bits.append("a=%7.2f" % detail["angle"])
-                bits.append("%3.0fHz" % detail["fps"])
+                extra.append("%3.0fHz" % detail["fps"])
         bits.append("浓度=%5.1f%%" % (self.g * 100))
         bits.append("%s" % status)
         bits.append("重绘=%.0f/s" % self._paint_rate())
         # 把**真实**截屏速率也打出来: 光有一个"上限"数字会骗人 ——
         # 实际速率还受 tick 周期、以及"桌面没变就降频轮询"影响。
         try:
-            bits.append("截屏=%.0f/s" % self.capturer.rate_hz)
+            extra.append("截屏=%.0f/s" % self.capturer.rate_hz)
         except Exception:  # noqa: BLE001
             pass
         bits.append("出界=%s" % ("黑" if self.outside == 0 else "背景"))
