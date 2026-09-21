@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import QApplication, QFileDialog
 from angles.hub import LABELS
 
 import paths
+import wdlog
 
 from .capture import frame_bgr
 from .shader import FS_DUO, VS
@@ -251,9 +252,9 @@ class GlassOverlay(QOpenGLWidget):
         self._backdrop_ready = False
         if getattr(self, "_gl_ready", False):
             self.update()
-        print("[glass] 已移到显示器 %s %dx%d"
-              % (screen.name(), screen.geometry().width(),
-                 screen.geometry().height()))
+        wdlog.log.info("已移到显示器 %s %dx%d"
+                       % (screen.name(), screen.geometry().width(),
+                          screen.geometry().height()), tag="glass")
 
     # ------------------------------------------------------------ 窗口生命周期
     def showEvent(self, _ev):
@@ -267,9 +268,9 @@ class GlassOverlay(QOpenGLWidget):
                 r = ctypes.windll.user32.SetWindowDisplayAffinity(
                     int(self.winId()), WDA_EXCLUDEFROMCAPTURE)
                 if not r:
-                    print("[警告] SetWindowDisplayAffinity 失败, 截图可能包含自身")
+                    wdlog.log.warn("SetWindowDisplayAffinity 失败, 截图可能包含自身", tag="glass")
             except Exception as exc:  # noqa: BLE001
-                print("[警告] 显示排除设置异常:", exc)
+                wdlog.log.error("显示排除设置异常: %s" % exc, tag="glass")
 
         # show() 可能被调用多次 (例如选背景图后重新显示), 定时器只能建一次,
         # 否则每显示一次就多一个 16ms 定时器, tick 会被重复触发
@@ -305,16 +306,17 @@ class GlassOverlay(QOpenGLWidget):
         # 打印驱动信息 —— 排查"某类显卡上玻璃层黑屏"时, 这一行能直接说明
         # 拿到的是什么上下文 (版本/厂商/prof ile), 不用再猜。
         try:
-            print("[GL] %s | %s | %s | GLSL %s" % (
+            wdlog.log.info("%s | %s | %s | GLSL %s" % (
                 GL.glGetString(GL.GL_VERSION).decode("latin-1"),
                 GL.glGetString(GL.GL_VENDOR).decode("latin-1"),
                 GL.glGetString(GL.GL_RENDERER).decode("latin-1"),
-                GL.glGetString(GL.GL_SHADING_LANGUAGE_VERSION).decode("latin-1")))
+                GL.glGetString(GL.GL_SHADING_LANGUAGE_VERSION).decode("latin-1")), tag="gl")
         except Exception:  # noqa: BLE001
             pass
-        print("[GL] initializeGL, context valid =", self.context().isValid(),
-              self.context().format().majorVersion(),
-              self.context().format().minorVersion())
+        wdlog.log.debug("initializeGL, context valid = %s %s.%s"
+                        % (self.context().isValid(),
+                           self.context().format().majorVersion(),
+                           self.context().format().minorVersion()), tag="gl")
 
         self.prog = QOpenGLShaderProgram(self)
         ok_v = self.prog.addShaderFromSourceCode(
@@ -323,10 +325,10 @@ class GlassOverlay(QOpenGLWidget):
             QOpenGLShader.ShaderTypeBit.Fragment, FS_DUO)
         ok_l = self.prog.link()
         if not (ok_v and ok_f and ok_l):
-            print("[GL] 着色器编译/链接失败: vs=%s fs=%s link=%s\n%s"
-                  % (ok_v, ok_f, ok_l, self.prog.log()))
+            wdlog.log.error("着色器编译/链接失败: vs=%s fs=%s link=%s\n%s"
+                            % (ok_v, ok_f, ok_l, self.prog.log()), tag="gl")
         else:
-            print("[GL] 着色器编译链接 OK")
+            wdlog.log.debug("着色器编译链接 OK", tag="gl")
         self.prog.bind()
 
         # uniform 位置**在这里查一次就好**。`uniformLocation` 每次都要拿字符串
@@ -340,7 +342,7 @@ class GlassOverlay(QOpenGLWidget):
         }
         missing = [k for k, v in self._uloc.items() if v < 0]
         if missing:
-            print("[GL] 警告: 这些 uniform 没找到 (驱动可能优化掉了): %s" % missing)
+            wdlog.log.warn("这些 uniform 没找到 (驱动可能优化掉了): %s" % missing, tag="gl")
 
         self.cap_tex = self._new_tex(swizzle_bgra=True)   # BGRA 帧, 采样时硬件换通道
         # bd_tex 同样走 swizzle: _upload_backdrop 手上的是 cv2 的 BGR 数据,
@@ -356,7 +358,7 @@ class GlassOverlay(QOpenGLWidget):
         # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
         self.vao = GL.glGenVertexArrays(1)
         if not self.vao:
-            print("[GL] 警告: glGenVertexArrays 失败 (core 下会画不出东西)")
+            wdlog.log.error("glGenVertexArrays 失败 (core 下会画不出东西)", tag="gl")
 
         self._gl_ready = True
 
@@ -365,7 +367,7 @@ class GlassOverlay(QOpenGLWidget):
         """打印并清掉当前 GL 错误旗标 (调试辅助, 平时无错时零输出)。"""
         err = GL.glGetError()
         if err != 0:
-            print("[GL] %s 处 glError=0x%X" % (tag, err))
+            wdlog.log.error("%s 处 glError=0x%X" % (tag, err), tag="gl")
 
     @staticmethod
     def _new_tex(swizzle_bgra=False):
@@ -430,8 +432,8 @@ class GlassOverlay(QOpenGLWidget):
             # 但不会把整个绘制循环带走。
             if fmt != "BGRA" and not getattr(self, "_fmt_warned", False):
                 self._fmt_warned = True
-                print("[GL] 警告: 帧的 fmt=%r 不是 BGRA, 颜色可能不对"
-                      "(见 paintGL 的 fmt 契约)" % (fmt,))
+                wdlog.log.warn("帧的 fmt=%r 不是 BGRA, 颜色可能不对"
+                               "(见 paintGL 的 fmt 契约)" % (fmt,), tag="gl")
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
             # **尺寸没变就用 glTexSubImage2D 更新, 不要每帧重新分配纹理存储 +
             # 重建整条 mip 链** (2560x1600 的 glTexImage2D + glGenerateMipmap
@@ -529,10 +531,10 @@ class GlassOverlay(QOpenGLWidget):
         path = self._backdrop_path()
         img = load_image(path) if os.path.exists(path) else None
         if img is not None:
-            print("[backdrop] 已加载 %s" % path)
+            wdlog.log.debug("已加载背景图 %s" % path, tag="backdrop")
         else:
             if os.path.exists(path):
-                print("[backdrop] 无法读取 %s, 回退到模糊桌面" % path)
+                wdlog.log.warn("无法读取背景图 %s, 回退到模糊桌面" % path, tag="backdrop")
             img = self._fallback_backdrop(frame)
         self._upload_backdrop(_resize_fill(img, fw, fh))
         self._backdrop_ready = True
@@ -540,7 +542,7 @@ class GlassOverlay(QOpenGLWidget):
     def reload_backdrop(self):
         frame = self.capturer.latest()
         if not frame:
-            print("[backdrop] 还没有截图, 稍后再试")
+            wdlog.log.debug("还没有截图, 稍后再试", tag="backdrop")
             return
         self._backdrop_ready = False
         self._build_backdrop(frame)
@@ -568,7 +570,7 @@ class GlassOverlay(QOpenGLWidget):
             return
         img = load_image(path)
         if img is None:
-            print("\n[backdrop] 读不出这张图: %s" % path)
+            wdlog.log.error("读不出这张图: %s" % path, tag="backdrop")
             return
         frame = self.capturer.latest()
         if not frame:
@@ -576,7 +578,7 @@ class GlassOverlay(QOpenGLWidget):
         self.cfg["backdrop_path"] = path
         self._upload_backdrop(_resize_fill(img, frame[1], frame[2]))
         self._backdrop_ready = True
-        print("\n[backdrop] 已切换 %s" % path)
+        wdlog.log.info("已切换背景图 %s" % path, tag="backdrop")
 
     def _upload_backdrop(self, bgr):
         """把背景图上传到 bd_tex。
@@ -631,8 +633,8 @@ class GlassOverlay(QOpenGLWidget):
                 self.hub.next_source()
             elif cmd == "toggle_outside":
                 self.outside = 0 if self.outside else 1
-                print("\n[渲染] 出界处理 -> %s"
-                      % ("纯黑(原版)" if self.outside == 0 else "背景兜底(无黑场)"))
+                wdlog.log.info("出界处理 -> %s"
+                               % ("纯黑(原版)" if self.outside == 0 else "背景兜底(无黑场)"), tag="glass")
             elif cmd == "toggle_debug":
                 self.toggle_debug()
             elif cmd == "pick_backdrop":
@@ -645,23 +647,23 @@ class GlassOverlay(QOpenGLWidget):
     def _apply_camera_cmd(self, cmd):
         cam = self.hub.get("camera")
         if cam is None:
-            print("\n[键] 摄像头角度源尚未启动")
+            wdlog.log.warn("摄像头角度源尚未启动", tag="camera")
             return
         if cmd == "calibrate":
             cam.request_calibration()
-            print("\n[键] 请求标定 (上盖完全展开时按才有意义)")
+            wdlog.log.debug("请求标定 (上盖完全展开时按才有意义)", tag="camera")
         elif cmd == "scale_up":
-            print("\n[键] camera_scale = %.2f" % cam.adjust_scale(+0.1))
+            wdlog.log.debug("camera_scale = %.2f" % cam.adjust_scale(+0.1), tag="camera")
         elif cmd == "scale_down":
-            print("\n[键] camera_scale = %.2f" % cam.adjust_scale(-0.1))
+            wdlog.log.debug("camera_scale = %.2f" % cam.adjust_scale(-0.1), tag="camera")
         elif cmd == "flip_sign":
-            print("\n[键] camera_sign = %+d" % cam.flip_sign())
+            wdlog.log.debug("camera_sign = %+d" % cam.flip_sign(), tag="camera")
 
     def toggle_debug(self):
         """开关摄像头特征匹配调试窗 (设置窗口里也有对应按钮)。"""
         cam = self.hub.get("camera")
         if cam is None:
-            print("\n[debug] 摄像头角度源尚未启动, 无法显示匹配窗口")
+            wdlog.log.warn("摄像头角度源尚未启动, 无法显示匹配窗口", tag="debug")
             return
         if self._dbg_window_open:
             self.close_debug()
@@ -670,7 +672,7 @@ class GlassOverlay(QOpenGLWidget):
             self._dbg_seq = -1
             self._dbg_shown = False
             cam.set_debug(True)
-            print("\n[debug] 匹配窗口 开 (置顶小窗; 再点一次按钮或按 x 关闭)")
+            wdlog.log.debug("匹配窗口 开 (置顶小窗; 再点一次按钮或按 x 关闭)", tag="debug")
 
     def close_debug(self):
         """关掉调试窗。
@@ -702,7 +704,7 @@ class GlassOverlay(QOpenGLWidget):
             cv2.waitKey(1)
         except Exception:  # noqa: BLE001
             pass
-        print("\n[debug] 匹配窗口 关")
+        wdlog.log.debug("匹配窗口 关", tag="debug")
 
     def _pump_debug_window(self):
         if not self._dbg_window_open:
@@ -740,7 +742,7 @@ class GlassOverlay(QOpenGLWidget):
                 self._dbg_shown = True
             cv2.waitKey(1)
         except Exception as exc:  # noqa: BLE001
-            print("[debug] 显示失败:", exc)
+            wdlog.log.error("调试窗显示失败: %s" % exc, tag="debug")
             self._dbg_window_open = False
             self._dbg_shown = False
 
@@ -791,7 +793,7 @@ class GlassOverlay(QOpenGLWidget):
                 self._visible = False
                 self._last_vis_change = now
                 self.hide()
-                print("\n[glass] 浓度≈0, 玻璃层已隐藏 -> 直接看真实桌面, 不再卡顿")
+                wdlog.log.debug("浓度≈0, 玻璃层已隐藏 -> 直接看真实桌面, 不再卡顿", tag="glass")
                 self._idle_capture()
                 self._pump_debug_window()
                 self._print_status(name, status, detail)
@@ -809,7 +811,7 @@ class GlassOverlay(QOpenGLWidget):
             self._last_drawn_g = -1.0
             self._last_drawn_seq = -1
             self.capturer.kick()
-            print("\n[glass] 玻璃层显示")
+            wdlog.log.info("玻璃层显示", tag="glass")
 
         # 截屏频率: 交给采集线程**自己连续跑**, 但只跑到 capture_hz ——
         # 抓得比重绘还勤的帧上屏前就被覆盖了, 白白多做 16MB 拷贝 (见 apply_config
@@ -890,4 +892,7 @@ class GlassOverlay(QOpenGLWidget):
             pass
         bits.append("出界=%s" % ("黑" if self.outside == 0 else "背景"))
         bits.append("m=换源 c=标定 x=调试 v=出界 b=选背景 +/-=灵敏度")
-        print("\r" + "  ".join(bits) + "   ", end="", flush=True)
+        # TRACE 才输出: 这是 0.1s 一刷的 \r 单行状态, 只在排查"实时数值"时看。
+        # 走 log.status_line: 保持 \r 原地刷新, 且它记住"行未闭合",
+        # 下一条日志输出前会先补换行 (否则日志会糊在状态行同一行上)。
+        wdlog.log.status_line("  ".join(bits))

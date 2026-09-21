@@ -23,6 +23,8 @@ from render.overlay import GlassOverlay
 from . import monitors
 from .hotkey import HotkeyManager
 
+import wdlog
+
 #: 全局热键表: (名字, config 键, 说明, 生效模式)
 #:   None     = 一直生效
 #:   "manual" = 只在「键盘」角度源下生效
@@ -100,8 +102,8 @@ class AppController(QObject):
                 continue
             ok = self.hotkeys.register(spec, name)
             self._hotkey_ok[name] = ok
-            print("[hotkey] %-22s %s%s"
-                  % (spec, label, "" if ok else "   ← 注册失败(可能被别的程序占用)"))
+            wdlog.log.info("%-22s %s%s" % (spec, label,
+                           "" if ok else "   ← 注册失败(可能被别的程序占用)"), tag="hotkey")
 
     def hotkey_lines(self):
         """当前**生效**的热键说明, 给设置窗口显示用。
@@ -136,7 +138,7 @@ class AppController(QObject):
         elif name == "debug":
             self.toggle_debug_window()
         else:
-            print("[hotkey] 未知动作 %r" % name)
+            wdlog.log.warn("未知动作 %r" % name, tag="hotkey")
 
     def release_hotkeys(self):
         try:
@@ -273,7 +275,7 @@ class AppController(QObject):
             if self._recreate_streak < self._RECREATE_CONFIRM:
                 return                       # 再观察一个周期, 防噪声尖峰
             self._recreate_streak = 0
-            print("[glass] 低内存模式: 该显示了, 建 GL 窗口")
+            wdlog.log.info("低内存模式: 该显示了, 建 GL 窗口", tag="glass")
             # **不重新标定** —— 这是"合盖过程中"的重建, 上盖没有展开, 标定会把
             # 合到一半的画面当基准, 导致 level 归零、玻璃层刚亮起又被关掉。
             self.start_glass(recalibrate=False)
@@ -309,13 +311,13 @@ class AppController(QObject):
         """
         if self.overlay is None:
             return
-        print("[glass] 低内存模式: 释放 GL 窗口 (~130MB)")
+        wdlog.log.info("低内存模式: 释放 GL 窗口 (~130MB)", tag="glass")
         try:
             self.overlay.shutdown_gl()
             self.overlay.setParent(None)
             self.overlay.deleteLater()
         except Exception as exc:  # noqa: BLE001
-            print("[glass] 释放 GL 窗口失败: %s" % exc)
+            wdlog.log.error("释放 GL 窗口失败: %s" % exc, tag="glass")
         self.overlay = None
         self._last_hidden_at = None
         #: 连续的"该显示了"次数 (防抖, 见 `_RECREATE_CONFIRM`)
@@ -372,8 +374,8 @@ class AppController(QObject):
             h = k32.OpenProcess(0x0400 | 0x0100, False,       # QUERY_INFO|SET_QUOTA
                                 k32.GetCurrentProcessId())
             if not h:
-                print("[glass] 裁剪: OpenProcess 失败 err=%d"
-                      % ctypes.get_last_error())
+                wdlog.log.error("裁剪: OpenProcess 失败 err=%d"
+                                % ctypes.get_last_error(), tag="glass")
                 return False
             try:
                 k32.SetProcessWorkingSetSize(h, ctypes.c_size_t(-1).value,
@@ -383,7 +385,7 @@ class AppController(QObject):
                 k32.CloseHandle(h)
             return True
         except Exception as exc:  # noqa: BLE001
-            print("[glass] 裁剪失败 %s" % exc)
+            wdlog.log.error("裁剪失败 %s" % exc, tag="glass")
             return False
 
     def _touch_idle_timer(self):
@@ -462,7 +464,7 @@ class AppController(QObject):
         # 的守卫, 那是给硬释放 (低内存模式) 用的; 软路径窗口故意保留。
         if self._force_trim_working_set():
             self._soft_trimmed = True
-            print("[glass] 隐藏待命: 已裁工作集 (窗口保留, 下次展开零重建)")
+            wdlog.log.debug("隐藏待命: 已裁工作集 (窗口保留, 下次展开零重建)", tag="glass")
 
     def start_glass(self, recalibrate=True):
         """开启玻璃层。
@@ -504,7 +506,7 @@ class AppController(QObject):
             # 写死 1.6s 会在设备还没出图时就去标定 —— 基准帧是黑的/未稳定的,
             # 之后测角全错。改成轮询到"真的就绪"再标定。
             self._auto_calibrate_when_ready()
-        print("[glass] 已开启")
+        wdlog.log.info("已开启", tag="glass")
 
     def _show_overlay_when_ready(self, tries=0):
         """截图就绪后再 show 玻璃层, 避免首帧空纹理闪黑 (见 start_glass 里的说明)。
@@ -536,21 +538,21 @@ class AppController(QObject):
             return
         # 出错/不可用就别等了
         if getattr(cam, "available", lambda: True)() is False:
-            print("[camera] 不可用, 跳过自动标定")
+            wdlog.log.warn("不可用, 跳过自动标定", tag="camera")
             return
         if not getattr(cam, "ready", lambda: False)():
             if tries < 120:                     # 120×250ms ≈ 30s 上限
                 QTimer.singleShot(
                     250, lambda: self._auto_calibrate_when_ready(tries + 1))
             else:
-                print("[camera] 等待就绪超时, 跳过自动标定 (可手动标定)")
+                wdlog.log.warn("等待就绪超时, 跳过自动标定 (可手动标定)", tag="camera")
             return
         # 摄像头源自己启动后也会自动标定一次 (~1 秒出图后)。如果它已经标好了,
         # 这里就别再标 —— 否则同一段启动里白标两次, 第二次纯粹多余。
         if getattr(cam, "calibrated", lambda: False)():
-            print("[camera] 摄像头源已自动标定, 无需重复")
+            wdlog.log.debug("摄像头源已自动标定, 无需重复", tag="camera")
             return
-        print("[camera] 设备已就绪, 自动标定基准帧")
+        wdlog.log.debug("设备已就绪, 自动标定基准帧", tag="camera")
         self.calibrate_camera()
 
     def _auto_calibrate_on_open(self):
@@ -597,7 +599,7 @@ class AppController(QObject):
         if with_glass:
             ov.enabled = True
             ov.show()
-        print("[glass] 已预热 (GL 上下文 / 着色器), 首次开启不会再卡")
+        wdlog.log.debug("已预热 (GL 上下文 / 着色器), 首次开启不会再卡", tag="glass")
         return True
 
     def _schedule_source_check(self, delay=2500):
@@ -633,7 +635,7 @@ class AppController(QObject):
         self.glassChanged.emit(False)
         # 低内存模式: 关闭后重新计时 (够久不可见就释放 GL 窗口)
         self._touch_idle_timer()
-        print("[glass] 已关闭 (已释放摄像头/串口)")
+        wdlog.log.info("已关闭 (已释放摄像头/串口)", tag="glass")
 
     def toggle_glass(self):
         if self.glass_on:
@@ -652,7 +654,7 @@ class AppController(QObject):
         为什么要连程序一起退: 只关玻璃层的话, 摄像头再动一下浓度又上去, 屏幕
         会被重新盖住 —— 那就还是"回不去"。退出才能保证屏幕一定恢复正常。
         """
-        print("\n[hotkey] 紧急关闭 -> 关玻璃层 + 退出")
+        wdlog.log.warn("紧急关闭 -> 关玻璃层 + 退出", tag="hotkey")
         try:
             self.stop_glass()
         except Exception:  # noqa: BLE001
@@ -677,7 +679,7 @@ class AppController(QObject):
         if self.hub.device_available(name) is not False:
             return None
         label = "摄像头" if name == "camera" else "串口"
-        print("[!] %s不可用 (角度源保持 %s, 未自动切换)" % (label, name))
+        wdlog.log.warn("%s不可用 (角度源保持 %s, 未自动切换)" % (label, name), tag="glass")
         return "%s打不开。角度源仍是「%s」, 请在设置里换设备或改成键盘模式。" % (
             label, label)
 
@@ -796,8 +798,8 @@ class AppController(QObject):
             return True
         if self.hub.active_name() != "camera":
             if self.hub.borrow_camera():
-                print("[debug] 为调试窗临时打开摄像头 (角度源仍是 %s)"
-                      % self.hub.active_name())
+                wdlog.log.debug("为调试窗临时打开摄像头 (角度源仍是 %s)"
+                                % self.hub.active_name(), tag="debug")
                 self.notified.emit("正在打开摄像头, 约 1 秒后出现匹配窗口")
         self.overlay.toggle_debug()
         return True
@@ -855,7 +857,7 @@ class AppController(QObject):
             with open(self.cfg_path, "w", encoding="utf-8") as fh:
                 json.dump(clean, fh, ensure_ascii=False, indent=2)
                 fh.write("\n")
-        print("[config] 已保存 %s" % self.cfg_path)
+        wdlog.log.info("已保存 %s" % self.cfg_path, tag="config")
         return clean
 
     # ------------------------------------------------------------ 退出
@@ -871,4 +873,4 @@ class AppController(QObject):
             try:
                 fn()
             except Exception as exc:  # noqa: BLE001
-                print("[shutdown] %s" % exc)
+                wdlog.log.error("shutdown 中出错: %s" % exc, tag="app")

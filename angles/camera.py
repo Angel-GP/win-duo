@@ -70,6 +70,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import wdlog
 from .base import AngleSource
 
 try:
@@ -265,7 +266,7 @@ def open_camera(index=0, backend="auto", warmup=5,
         good = _load_good_backends().get(str(index))
         order = sorted(full, key=lambda kv: 0 if kv[0] == good else 1)
         if good and order[0][0] == good:
-            print("[camera] index=%d 上次成功的后端是 %s, 优先试它" % (index, good))
+            wdlog.log.debug("index=%d 上次成功的后端是 %s, 优先试它" % (index, good), tag="camera")
     else:
         order = [(backend, _BACKEND_APIS[backend])]
 
@@ -299,8 +300,8 @@ def open_camera(index=0, backend="auto", warmup=5,
                 try:
                     cv2.imwrite(str(fp), frame)
                     tried[-1] += " (画面已存到 %s)" % fp
-                    print("[camera] index=%d 后端 %s 是冻结帧(虚拟摄像头), "
-                          "画面 dump 到 %s" % (index, name, fp))
+                    wdlog.log.warn("index=%d 后端 %s 是冻结帧(虚拟摄像头), "
+                                   "画面 dump 到 %s" % (index, name, fp), tag="camera")
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -557,6 +558,8 @@ class OrbTracker:
         """
         prepared = self._prepare(gray)
         kp, des = self.orb.detectAndCompute(prepared, None)
+        n = 0 if des is None else len(kp)
+        wdlog.log.debug("标定: 提取到 %d 个特征点 (需要 >= 20)" % n, tag="camera.cv")
         if des is None or len(kp) < 20:
             return False
         self._install_reference(prepared, kp, des, 0.0)
@@ -738,10 +741,15 @@ class OrbTracker:
         if step is None:
             # 匹配失败: 画面可能已经转太远, 把参考帧换到当前帧让下一帧能跟上。
             # **不结算角度** —— 没有可信增量, 硬加会引入漂移。
+            wdlog.log.debug("匹配不足 (%d good), 重建参考帧 @ %.1f°"
+                            % (inliers, np.degrees(self.angle)), tag="camera.cv")
             self._install_reference(prepared, kp, des, self.angle)
             return None
         if abs(step) > MAX_STEP_RAD:
             # 单帧跳太多 = 匹配错了。同样重建参考帧, 不采信这个增量。
+            wdlog.log.debug("单帧跳变 %.1f° (> %.0f°), 丢弃增量并重建参考帧"
+                            % (np.degrees(abs(step)), np.degrees(MAX_STEP_RAD)),
+                            tag="camera.cv")
             self._install_reference(prepared, kp, des, self.angle)
             return None
 
@@ -754,12 +762,18 @@ class OrbTracker:
             corrected = self._visit_correction(kp, des, guess)
 
         if corrected is not None:
+            if abs(corrected - guess) > 0.02:
+                wdlog.log.debug("回访校正: %.2f° -> %.2f° (拉回 %.2f°)"
+                                % (np.degrees(guess), np.degrees(corrected),
+                                   np.degrees(abs(corrected - guess))), tag="camera.cv")
             self.angle = float(corrected)
             self._install_reference(prepared, kp, des, self.angle)
         else:
             self.angle = float(guess)
             if abs(step) > REBASE_RAD:
                 # 转得够远了, 把参考帧推进一格 (角度已经结算进 _ref_base)
+                wdlog.log.debug("推进参考帧 @ %.1f°" % np.degrees(self.angle),
+                                tag="camera.cv")
                 self._install_reference(prepared, kp, des, self.angle)
 
         self._maybe_sample(kp, des, self.angle)
@@ -801,7 +815,7 @@ class CameraAngleSource(AngleSource):
         self.sign = int(cfg.get("camera_sign", -1))
         self.backend = str(cfg.get("camera_backend", "auto"))
         if self.backend not in BACKEND_CHOICES:
-            print("[camera] 未知 camera_backend=%r, 回退到 auto" % (self.backend,))
+            wdlog.log.warn("未知 camera_backend=%r, 回退到 auto" % (self.backend,), tag="camera")
             self.backend = "auto"
         # 下面这些是算法/滤波微调, 普通用户几乎不动 —— 写死为源码常量,
         # 不再进 config.json (见本文件顶部的 CAMERA_* 常量)。
@@ -855,7 +869,7 @@ class CameraAngleSource(AngleSource):
         # 绝不新建第二个线程 (两个线程会抢同一个摄像头)。等它自己结束。
         if self._orphan is not None:
             if self._orphan.is_alive():
-                print("[camera] 上一个采集线程仍在打开设备, 暂不重启")
+                wdlog.log.warn("上一个采集线程仍在打开设备, 暂不重启", tag="camera")
                 return
             self._orphan = None
         self._stop = False
@@ -953,16 +967,16 @@ class CameraAngleSource(AngleSource):
             self._open_error = str(exc)
             with self._lock:
                 self._status = "摄像头不可用"
-            print("[camera] " + str(exc))
+            wdlog.log.error("摄像头打开失败: %s" % exc, tag="camera")
             return
         if self._stop:
             self._tracker.release()
             self._tracker = None
             return
-        print("[camera] index=%d 用后端 %s 打开成功 (OpenCV 线程数限为 %d, 铰链轴=%s)"
-              % (self.index, self._tracker.backend_name,
-                 _limit_opencv_threads(self.threads),
-                 "x" if self.axis[0] else "y"))
+        wdlog.log.info("index=%d 用后端 %s 打开成功 (OpenCV 线程数限为 %d, 铰链轴=%s)"
+                       % (self.index, self._tracker.backend_name,
+                          _limit_opencv_threads(self.threads),
+                          "x" if self.axis[0] else "y"), tag="camera")
         with self._lock:
             self._status = "已打开, 等待标定"
 
@@ -989,8 +1003,8 @@ class CameraAngleSource(AngleSource):
                     ok = tracker.set_reference(gray)
                     with self._lock:
                         self._status = "已标定" if ok else "标定失败(特征点不足)"
-                    print("[camera] 标定" + ("成功" if ok
-                                             else "失败: 特征点不足, 请对着有纹理的场景"))
+                    wdlog.log.info("标定" + ("成功" if ok
+                                            else "失败: 特征点不足, 请对着有纹理的场景"), tag="camera")
 
                 # 启动后自动标定一次, 让程序开箱可用
                 if (self.autocal and not tracker.has_reference
@@ -999,8 +1013,8 @@ class CameraAngleSource(AngleSource):
                     with self._lock:
                         self._status = ("自动标定成功" if ok
                                         else "自动标定失败(请手动标定)")
-                    print("[camera] 自动标定" + ("成功" if ok
-                                                 else "失败, 请手动标定"))
+                    wdlog.log.info("自动标定" + ("成功" if ok
+                                                else "失败, 请手动标定"), tag="camera")
 
                 dt = (loop_start - t_prev) if t_prev is not None else None
                 t_prev = loop_start

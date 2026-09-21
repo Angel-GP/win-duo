@@ -26,6 +26,8 @@ import os
 import sys
 from pathlib import Path
 
+import wdlog
+
 
 def is_frozen():
     """是不是 PyInstaller 打出来的 exe。"""
@@ -86,7 +88,7 @@ def writable_data_dir():
         fallback = Path(os.environ.get("LOCALAPPDATA") or Path.home())
         fallback = fallback / "win-duo"
         fallback.mkdir(parents=True, exist_ok=True)
-        print("[paths] %s 不可写, 数据目录改用 %s" % (d, fallback))
+        wdlog.log.warn("%s 不可写, 数据目录改用 %s" % (d, fallback), tag="paths")
         return fallback
 
 

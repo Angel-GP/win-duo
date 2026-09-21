@@ -97,6 +97,7 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths as _paths   # noqa: E402  (必须在 sys.path 设置之后)
+import wdlog             # noqa: E402  分级日志 (尽早导入, 后面的启动日志都走它)
 
 # 输出被重定向(管道)时 Windows 按 cp936 编码, 中文会乱码; 强制 UTF-8。
 # 挂在真控制台上时 Python 本就写 UTF-8, 这一步无副作用。
@@ -148,6 +149,19 @@ class _TeeLogger:
                 pass
         raise OSError("no fileno")
 
+    def isatty(self):
+        """转发 primary 的 isatty —— _init_logging 靠它判断要不要 ANSI 颜色。
+
+        不转发的话 `getattr(sys.stdout, "isatty", ...)()` 永远是 False,
+        Windows Terminal / pwsh 下也拿不到彩色日志。
+        """
+        if self.primary is not None and hasattr(self.primary, "isatty"):
+            try:
+                return bool(self.primary.isatty())
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
     @classmethod
     def open_log(cls, log_path, max_bytes=_LOG_MAX_BYTES):
         """打开(追加)日志文件; 已超上限则先轮转。失败就退化成只写原流。"""
@@ -182,15 +196,19 @@ class _TeeLogger:
             pass
 
     def write(self, s):
+        # 控制台 (primary) 收**原始文本** (含 ANSI 颜色); 日志文件收**剥掉
+        # ANSI** 的纯文本 —— 两边受众不同。先剥再写文件, 轮转判据
+        # (endswith("\n")) 用原始 s, 不受影响。
         if self.primary is not None:
             try:
                 self.primary.write(s)
             except Exception:  # noqa: BLE001
                 pass
+        clean = wdlog.strip_ansi(s) if "\x1b" in s else s
         f = type(self)._file
         if f is not None:
             try:
-                f.write(s)
+                f.write(clean)
             except Exception:  # noqa: BLE001
                 pass
         type(self)._maybe_rotate(s)
@@ -213,6 +231,36 @@ _log_file_path = str(_paths.log_file("win_duo.log"))
 _TeeLogger.open_log(_log_file_path)
 sys.stdout = _TeeLogger(sys.stdout)
 sys.stderr = _TeeLogger(sys.stderr)
+
+
+def _init_logging(plain=False, level=None):
+    """配置分级日志: 颜色 + 等级。要在 _TeeLogger 接管 stdout 之后调用。
+
+    - plain=True (或 stdout 不是真终端/被重定向) 时不输出 ANSI 颜色;
+      Windows 的旧 conhost 默认不解析 VT 序列, 还要主动开一次
+      ENABLE_VIRTUAL_TERMINAL_PROCESSING, 失败 (Win8 及以下) 就自动降级 plain。
+    - level 形如 "info" / "debug" / "all" / "off", 不认识的保持默认 INFO。
+    """
+    use_color = not plain and sys.stdout is not None \
+        and getattr(sys.stdout, "isatty", lambda: False)()
+    if sys.platform == "win32" and not plain:
+        try:
+            import ctypes as _ct
+            k32 = _ct.windll.kernel32
+            h = k32.GetStdHandle(-11)              # STD_OUTPUT_HANDLE
+            mode = _ct.c_uint()
+            if k32.GetConsoleMode(h, _ct.byref(mode)):
+                # 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                if not k32.SetConsoleMode(h, mode.value | 0x0004):
+                    use_color = False              # 旧 conhost: 不支持 VT
+        except Exception:  # noqa: BLE001
+            use_color = False
+    wdlog.log.set_color(use_color)
+    if level:
+        if not wdlog.log.set_level(level):
+            wdlog.log.warn("未知日志等级 %r, 用默认 info "
+                  "(可选 fatal/error/warn/info/debug/trace/all/off)" % level, tag="log")
+    return use_color
 
 #: config.json 等**用户数据**跟在 exe (或项目根) 旁边。
 #: 打包后 `__file__` 指向临时解包目录, 直接用它会把配置写到一个马上被删掉的
@@ -320,17 +368,17 @@ def _seed_config_if_missing(cfg_path):
         try:
             cfg_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, cfg_path)
-            print("[config] 首次运行, 已从模板生成 %s" % cfg_path)
+            wdlog.log.info("首次运行, 已从模板生成 %s" % cfg_path, tag="config")
             return
         except Exception as exc:  # noqa: BLE001
-            print("[config] 从模板复制失败, 改用内置默认值: %s" % exc)
+            wdlog.log.error("从模板复制失败, 改用内置默认值: %s" % exc, tag="config")
     try:
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         # 不写 BOM, 和 controller.save() 保持一致 (读的一端用 utf-8-sig, 两种都能读)
         _write_json_atomic(cfg_path, DEFAULT_CFG)
-        print("[config] 配置不存在, 已用内置默认值生成 %s" % cfg_path)
+        wdlog.log.info("配置不存在, 已用内置默认值生成 %s" % cfg_path, tag="config")
     except Exception as exc:  # noqa: BLE001
-        print("[config] 生成默认配置失败: %s" % exc)
+        wdlog.log.error("生成默认配置失败: %s" % exc, tag="config")
 
 
 def _seed_autostart_once(controller):
@@ -354,9 +402,9 @@ def _seed_autostart_once(controller):
     if autostart.available() and not autostart.is_enabled():
         try:
             autostart.enable()
-            print("[autostart] 首次运行, 已默认开启开机自启")
+            wdlog.log.info("首次运行, 已默认开启开机自启", tag="autostart")
         except Exception as exc:  # noqa: BLE001
-            print("[autostart] 默认开启失败: %s" % exc)
+            wdlog.log.error("默认开启失败: %s" % exc, tag="autostart")
     cfg["autostart_seeded"] = True
     controller.save()
 
@@ -373,16 +421,16 @@ def load_config(path=None):
         # _seed 已经尽力了还是没文件 (比如目录不可写)。给一份内存里的默认值
         # 让程序**能起来**, 总好过闪一下就没了 —— 起来以后用户能在设置里改,
         # 也能看到日志里的原因。
-        print("[config] 读不到 %s, 本次用内置默认值运行" % cfg_path)
+        wdlog.log.warn("读不到 %s, 本次用内置默认值运行" % cfg_path, tag="config")
         return dict(DEFAULT_CFG)
     except (json.JSONDecodeError, OSError) as exc:
         # 文件被写坏了 (空文件 / 手工改错 / 写一半断电)。**不静默吞掉** ——
         # 把坏文件留个备份再重建, 用户还能找回自己改过的内容。
-        print("[config] %s 解析失败 (%s), 备份后重建" % (cfg_path, exc))
+        wdlog.log.warn("%s 解析失败 (%s), 备份后重建" % (cfg_path, exc), tag="config")
         try:
             bad = cfg_path.with_suffix(".json.bad")
             shutil.copyfile(cfg_path, bad)
-            print("[config] 损坏的原文件已备份为 %s" % bad)
+            wdlog.log.info("损坏的原文件已备份为 %s" % bad, tag="config")
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -436,23 +484,24 @@ def make_qsurface_format():
 
 
 def print_banner(cfg, region):
-    print("=" * 68)
-    print("win-duo -- 折叠屏悬浮玻璃 (摄像头测角 + Duo 逆投影着色器)")
-    print("-" * 68)
-    print("  角度源    : %s" % cfg["source"])
+    w = wdlog.log.info
+    w("=" * 68, tag="banner")
+    w("win-duo -- 折叠屏悬浮玻璃 (摄像头测角 + Duo 逆投影着色器)", tag="banner")
+    w("-" * 68, tag="banner")
+    w("  角度源    : %s" % cfg["source"], tag="banner")
     if cfg["source"] == "camera":
-        print("  摄像头    : index=%s  后端=%s  SCALE=%.1f  SIGN=%+d"
-              % (cfg.get("camera_index"), cfg.get("camera_backend"),
-                 cfg["camera_scale"], cfg["camera_sign"]))
+        w("  摄像头    : index=%s  后端=%s  SCALE=%.1f  SIGN=%+d"
+          % (cfg.get("camera_index"), cfg.get("camera_backend"),
+             cfg["camera_scale"], cfg["camera_sign"]), tag="banner")
     elif cfg["source"] == "serial":
-        print("  串口      : %s @ %d" % (cfg["port"], cfg["baud"]))
-    print("  渲染      : 铰链=屏幕底边  最大转角 %.0f 度  眼距 %.1fx 屏高"
-          % (cfg["max_tilt_deg"], cfg["eye_dist_h"]))
-    print("              blur_spread=%.2f  出界=%s"
-          % (cfg["blur_spread"], cfg["outside_mode"]))
-    print("  截屏      : %dx%d @ %.0fHz"
-          % (region["width"], region["height"], cfg.get("refresh_hz", 3)))
-    print("=" * 68)
+        w("  串口      : %s @ %d" % (cfg["port"], cfg["baud"]), tag="banner")
+    w("  渲染      : 铰链=屏幕底边  最大转角 %.0f 度  眼距 %.1fx 屏高"
+      % (cfg["max_tilt_deg"], cfg["eye_dist_h"]), tag="banner")
+    w("              blur_spread=%.2f  出界=%s"
+      % (cfg["blur_spread"], cfg["outside_mode"]), tag="banner")
+    w("  截屏      : %dx%d @ %.0fHz"
+      % (region["width"], region["height"], cfg.get("refresh_hz", 3)), tag="banner")
+    w("=" * 68, tag="banner")
 
 
 # ------------------------------------------------------------------ 单实例
@@ -500,7 +549,7 @@ def selftest(cfg):
     region = monitors.region_for(screen)
     print_banner(cfg, region)
 
-    print("[自检] 启动角度源与截屏...")
+    wdlog.log.info("启动角度源与截屏...", tag="selftest")
     control = KeyControl(cfg, auto=False)
     hub = SourceHub(cfg, control)
 
@@ -524,22 +573,23 @@ def selftest(cfg):
     frame = cap.latest()
 
     lvl, name, status, detail = last if last else (None, "?", "?", {})
-    print("-" * 68)
+    wdlog.log.info("-" * 68, tag="selftest")
     if frame:
-        print("[自检] 截屏   : OK %dx%d" % (frame[1], frame[2]))
+        wdlog.log.info("截屏   : OK %dx%d" % (frame[1], frame[2]), tag="selftest")
     else:
-        print("[自检] 截屏   : FAIL")
+        wdlog.log.error("截屏   : FAIL", tag="selftest")
         ok = False
     if lvl is not None:
-        print("[自检] 角度源 : OK  %s  level=%.3f  %s  %s"
-              % (name, lvl, status, detail))
+        wdlog.log.info("角度源 : OK  %s  level=%.3f  %s  %s"
+                       % (name, lvl, status, detail), tag="selftest")
     else:
-        print("[自检] 角度源 : FAIL  %s  %s  %s" % (name, status, detail))
-        print("       摄像头需要对着有纹理的静止场景, 且上盖完全展开以便标定;")
-        print("       也可以先跑 --source manual 确认渲染链路是好的。")
+        wdlog.log.error("角度源 : FAIL  %s  %s  %s" % (name, status, detail),
+                        tag="selftest")
+        wdlog.log.error("       摄像头需要对着有纹理的静止场景, 且上盖完全展开以便标定;", tag="selftest")
+        wdlog.log.error("       也可以先跑 --source manual 确认渲染链路是好的。", tag="selftest")
         ok = False
-    print("-" * 68)
-    print("[自检] %s" % ("PASS" if ok else "FAIL"))
+    wdlog.log.info("-" * 68, tag="selftest")
+    wdlog.log.info("自检 %s" % ("PASS" if ok else "FAIL"), tag="selftest")
 
     hub.stop_all()
     cap.stop()
@@ -581,10 +631,10 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
             return
         if hub.device_available(cfg["source"]) is False:
             label = "摄像头" if cfg["source"] == "camera" else "串口"
-            print("!" * 68)
-            print("[!] %s打不开。角度源仍是「%s」, 未自动切换。" % (label, label))
-            print("[!] 在设置窗口点「扫描」探测可用摄像头, 或换成别的角度源。")
-            print("!" * 68)
+            wdlog.log.warn("!" * 68, tag="glass")
+            wdlog.log.warn("%s打不开。角度源仍是「%s」, 未自动切换。" % (label, label), tag="glass")
+            wdlog.log.warn("在设置窗口点「扫描」探测可用摄像头, 或换成别的角度源。", tag="glass")
+            wdlog.log.warn("!" * 68, tag="glass")
 
     from PyQt6.QtCore import QTimer as _QTimer
     _QTimer.singleShot(3000, _check_source)
@@ -593,7 +643,7 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
         control.set_auto(False)
         control.set_level(float(level))
         widget.g = float(level)
-        print("[运行] 浓度已被 --level 钉在 %.2f" % float(level))
+        wdlog.log.info("浓度已被 --level 钉在 %.2f" % float(level), tag="glass")
 
     if smoke:
         from PyQt6.QtCore import QTimer
@@ -603,10 +653,10 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
                 img = widget.grabFramebuffer()
                 out = str(_paths.debug_file("smoke_widget.png"))
                 img.save(out)
-                print("\n[smoke] grabFramebuffer -> %s (%dx%d)"
-                      % (out, img.width(), img.height()))
+                wdlog.log.info("grabFramebuffer -> %s (%dx%d)"
+                               % (out, img.width(), img.height()), tag="smoke")
             except Exception as exc:  # noqa: BLE001
-                print("\n[smoke] grabFramebuffer 失败:", exc)
+                wdlog.log.error("grabFramebuffer 失败: %s" % exc, tag="smoke")
             app.quit()
 
         # 关掉后台重截: 截图里会包含 Overlay 自身, 反复重截会反馈污染成纯色
@@ -626,7 +676,7 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
         from PyQt6.QtCore import QTimer as _QT
         _QT.singleShot(int(seconds * 1000), app.quit)
 
-    print("[运行] Overlay 常驻显示。Esc 或 Ctrl+C 退出。")
+    wdlog.log.info("Overlay 常驻显示。Esc 或 Ctrl+C 退出。", tag="glass")
     t_cpu0, t_wall0 = time.process_time(), time.perf_counter()
     try:
         rc = app.exec()
@@ -634,8 +684,8 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
         cpu = time.process_time() - t_cpu0
         wall = time.perf_counter() - t_wall0
         if wall > 0.5:
-            print("\n[stats] 进程 CPU %.2fs / 墙钟 %.2fs = 单核 %.1f%%"
-                  % (cpu, wall, cpu / wall * 100.0))
+            wdlog.log.info("进程 CPU %.2fs / 墙钟 %.2fs = 单核 %.1f%%"
+                           % (cpu, wall, cpu / wall * 100.0), tag="stats")
         hub.stop_all()
         cap.stop()
     return rc
@@ -660,7 +710,7 @@ def run_tray(cfg, cfg_path, start_glass=False, seconds=0.0, panel_at_start=False
     apply_theme()
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
-        print("[!] 系统托盘不可用, 退回直接启动模式")
+        wdlog.log.warn("系统托盘不可用, 退回直接启动模式", tag="tray")
         return run_direct(cfg)
 
     controller = AppController(cfg, cfg_path)
@@ -685,7 +735,7 @@ def run_tray(cfg, cfg_path, start_glass=False, seconds=0.0, panel_at_start=False
         p.show()
         p.raise_()
         p.activateWindow()
-        print("[ui] 设置窗口已打开")
+        wdlog.log.debug("设置窗口已打开", tag="ui")
 
     tray = DuoTray(controller, show_settings)
     tray.show()
@@ -697,12 +747,13 @@ def run_tray(cfg, cfg_path, start_glass=False, seconds=0.0, panel_at_start=False
 
     screen = monitors.resolve(cfg) or app.primaryScreen()
     print_banner(cfg, monitors.region_for(screen))
-    print("  模式      : 托盘常驻 (启动不弹窗, 只在托盘留一个图标)")
-    print("  用法      : 双击/右键托盘图标 -> 设置 / 开关玻璃层")
-    print("              (设置窗口点最小化收进托盘, 点 X 直接退出程序)")
-    print("  脱困      : Ctrl+Alt+Shift+Esc 立刻关掉玻璃层并退出")
-    print("              (屏幕被玻璃层盖住、托盘也点不到时的最后手段)")
-    print("=" * 68)
+    w = wdlog.log.info
+    w("  模式      : 托盘常驻 (启动不弹窗, 只在托盘留一个图标)", tag="banner")
+    w("  用法      : 双击/右键托盘图标 -> 设置 / 开关玻璃层", tag="banner")
+    w("              (设置窗口点最小化收进托盘, 点 X 直接退出程序)", tag="banner")
+    w("  脱困      : Ctrl+Alt+Shift+Esc 立刻关掉玻璃层并退出", tag="banner")
+    w("              (屏幕被玻璃层盖住、托盘也点不到时的最后手段)", tag="banner")
+    w("=" * 68, tag="banner")
 
     if start_glass:
         controller.start_glass()
@@ -749,16 +800,17 @@ def _check_interpreter():
     except ImportError:
         pass
     venv_py = BASE_DIR / ".venv" / "Scripts" / "python.exe"
-    print("=" * 68)
-    print("[!] 当前这个 Python 里没有 PyQt6 —— 多半是没走项目自带的虚拟环境。")
-    print("    你现在用的是 : %s" % sys.executable)
+    t = wdlog.log.fatal
+    t("=" * 68, tag="app")
+    t("当前这个 Python 里没有 PyQt6 —— 多半是没走项目自带的虚拟环境。", tag="app")
+    t("    你现在用的是 : %s" % sys.executable, tag="app")
     if venv_py.exists():
-        print("    请改用       : %s" % venv_py)
-        print("    或直接运行   : .venv\\Scripts\\python.exe main.py")
+        t("    请改用       : %s" % venv_py, tag="app")
+        t("    或直接运行   : .venv\\Scripts\\python.exe main.py", tag="app")
     else:
-        print("    还没建环境, 先跑:")
-        print("      powershell -ExecutionPolicy Bypass -File scripts\\setup_env.ps1")
-    print("=" * 68)
+        t("    还没建环境, 先跑:", tag="app")
+        t("      powershell -ExecutionPolicy Bypass -File scripts\\setup_env.ps1", tag="app")
+    t("=" * 68, tag="app")
     return False
 
 
@@ -785,6 +837,12 @@ def main():
                     help="桌面重截频率")
     ap.add_argument("--scale", type=float, help="camera_scale 灵敏度")
     ap.add_argument("--config", help="指定 config.json")
+    ap.add_argument("--log-level", dest="log_level",
+                    choices=["fatal", "error", "warn", "info", "debug",
+                             "trace", "all", "off"],
+                    help="日志等级 (默认 info; debug/trace 会明显更啰嗦)")
+    ap.add_argument("--plain", action="store_true",
+                    help="日志不带 ANSI 颜色 (重定向到文件/不好解析 VT 的终端用)")
     ap.add_argument("--tray", action="store_true",
                     help="托盘模式 (默认行为, 显式写出用)")
     ap.add_argument("--no-tray", dest="no_tray", action="store_true",
@@ -803,6 +861,9 @@ def main():
                     help="直接指定玻璃浓度 0..1 (手动模式, 不用按键)")
     args = ap.parse_args()
 
+    # 日志配置要赶在任何业务日志之前 (初始化本身可能打日志)
+    _init_logging(plain=args.plain, level=args.log_level)
+
     cfg_file = config_path(args.config)
     cfg = apply_args(load_config(cfg_file), args)
 
@@ -810,11 +871,11 @@ def main():
     # (旧代码/旧帧), 表现就是"画面静止, 怎么改都没用"。这个坑很难自查。
     # `--selftest` 不涉及窗口, 放行。
     if not args.selftest and already_running():
-        print("!" * 68)
-        print("[!] 已经有一个 win-duo 在运行了。")
-        print("[!] 两个实例会叠两层玻璃层、还抢全局热键 —— 请先在托盘右键退出")
-        print("[!] 那一个 (或任务管理器里结束 pythonw.exe), 再启动这个。")
-        print("!" * 68)
+        wdlog.log.warn("!" * 68, tag="app")
+        wdlog.log.warn("已经有一个 win-duo 在运行了。", tag="app")
+        wdlog.log.warn("两个实例会叠两层玻璃层、还抢全局热键 —— 请先在托盘右键退出", tag="app")
+        wdlog.log.warn("那一个 (或任务管理器里结束 pythonw.exe), 再启动这个。", tag="app")
+        wdlog.log.warn("!" * 68, tag="app")
         return 2
 
     if args.selftest:

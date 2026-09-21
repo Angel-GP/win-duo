@@ -16,6 +16,7 @@ import re
 import threading
 import time
 
+import wdlog
 from .base import AngleSource
 
 
@@ -63,7 +64,7 @@ class SerialAngleSource(AngleSource):
         # 少了这段, `_thread` 会永远非 None, **串口源将永久无法重启**。
         if self._orphan is not None:
             if self._orphan.is_alive():
-                print("[serial] 上一个采集线程仍卡在设备里, 暂不重启")
+                wdlog.log.warn("上一个采集线程仍卡在设备里, 暂不重启", tag="serial")
                 return
             self._orphan = None
         try:
@@ -71,7 +72,7 @@ class SerialAngleSource(AngleSource):
         except ImportError as exc:
             self._error = str(exc)
             self._status = "缺少 pyserial"
-            print("[serial] 未安装 pyserial, 无法使用串口角度源")
+            wdlog.log.error("未安装 pyserial, 无法使用串口角度源", tag="serial")
             return
         self._stop = False
         self._thread = threading.Thread(target=self._run, name="serial-angle",
@@ -87,7 +88,7 @@ class SerialAngleSource(AngleSource):
             # `_orphan`, 由 start() 复核 is_alive() 决定清掉还是等待。原来直接
             # 把这线程放回 `_thread`, 于是 `_thread` 永远非 None -> 再也起不来。
             if th.is_alive():
-                print("[serial] 采集线程未在 2s 内退出 (设备阻塞), 已寄存待其结束")
+                wdlog.log.warn("采集线程未在 2s 内退出 (设备阻塞), 已寄存待其结束", tag="serial")
                 self._orphan = th
 
     # ---------- 对外读数 ----------
@@ -118,6 +119,7 @@ class SerialAngleSource(AngleSource):
             try:
                 with serial.Serial(self.port, self.baud, timeout=1) as ser:
                     self._set_status("已连接 " + self.port)
+                    wdlog.log.info("串口已连接 %s @ %d" % (self.port, self.baud), tag="serial")
                     # 重连后重置 FPS 计数 —— 否则第一段的 (n, t0) 还带着重连前
                     # 的起点, 把停机时间算进分母, 报一次偏低的 FPS。
                     n, t0 = 0, time.time()
@@ -163,11 +165,13 @@ class SerialAngleSource(AngleSource):
                         if now - t0 >= 1.0:
                             with self._lock:
                                 self._fps = n / (now - t0)
+                            wdlog.log.trace("串口 %.0f Hz" % self._fps, tag="serial")
                             n, t0 = 0, now
             except (serial.SerialException, OSError) as exc:
                 with self._lock:                 # 和别的读写一样加锁, 别裸写
                     self._error = str(exc)
                 self._set_status("等待 " + self.port)
+                wdlog.log.warn("串口错误, 2s 后重连: %s" % exc, tag="serial")
                 # 断线重连, 但不要在被要求停止时死等
                 for _ in range(20):
                     if self._stop:
@@ -177,4 +181,5 @@ class SerialAngleSource(AngleSource):
                 with self._lock:                 # 同上: 加锁写
                     self._error = str(exc)
                 self._set_status("串口错误")
+                wdlog.log.error("串口未预期错误: %s" % exc, tag="serial")
                 time.sleep(1.0)

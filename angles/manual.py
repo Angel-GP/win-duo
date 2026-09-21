@@ -21,6 +21,7 @@
 """
 import threading
 
+import wdlog
 from .base import AngleSource
 
 
@@ -57,7 +58,7 @@ class KeyControl(AngleSource):
             changed = on != self._enabled
             self._enabled = on
         if changed:
-            print("[keys] 功能键%s" % ("已启用 (键盘模式)" if on else "已停用"))
+            wdlog.log.debug("功能键%s" % ("已启用 (键盘模式)" if on else "已停用"), tag="keys")
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -65,9 +66,8 @@ class KeyControl(AngleSource):
             return
         self._started = True
         if not _has_console():
-            print("[keys] 没有控制台 (托盘/pythonw 启动), 控制台按键已停用 —— "
-                  "键盘模式请用全局热键 (设置窗口里有列表), "
-                  "或用 .venv\\Scripts\\python.exe main.py 启动以获得控制台")
+            wdlog.log.debug("没有控制台 (托盘/pythonw 启动), 控制台按键已停用 —— "
+                            "键盘模式请用全局热键 (设置窗口里有列表)", tag="keys")
             return
         threading.Thread(target=self._run, name="keyboard", daemon=True).start()
 
@@ -107,7 +107,7 @@ class KeyControl(AngleSource):
         try:
             import msvcrt
         except ImportError:
-            print("[keys] 非 Windows 平台, 键盘控制不可用")
+            wdlog.log.warn("非 Windows 平台, 键盘控制不可用", tag="keys")
             return
 
         while not self.quit_flag:
@@ -153,7 +153,7 @@ class KeyControl(AngleSource):
                 with self._lock:
                     self._auto = not self._auto
                     self._last_key = "跟随传感器" if self._auto else "手动覆盖"
-                    print("\n[键] %s" % self._last_key)
+                    wdlog.log.debug("键盘: %s" % self._last_key, tag="keys")
             elif low == "m":
                 self._push("cycle_source")
             elif low == "c":

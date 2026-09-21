@@ -3,6 +3,7 @@
 合并的关键就在这一层 -- 摄像头、ESP32、键盘三种测法在这里被抹平成同一个
 接口, 渲染层完全不知道自己接的是哪一个传感器。
 """
+import wdlog
 from .serial_source import SerialAngleSource
 
 ORDER = ["camera", "serial", "manual"]
@@ -26,7 +27,7 @@ class SourceHub:
 
         name = cfg.get("source", "camera")
         if name not in ORDER:
-            print("[hub] 未知角度源 %r, 回退到 camera" % (name,))
+            wdlog.log.warn("未知角度源 %r, 回退到 camera" % (name,), tag="hub")
             name = "camera"
         self.active = name
         # manual 源就是键盘线程, 不需要也不应该走"跟随传感器"分支
@@ -85,7 +86,7 @@ class SourceHub:
         self._ensure(name)
         self.control.set_auto(name != "manual")
         self.control.set_enabled(name == "manual")
-        print("\n[hub] 角度源 -> %s (%s)" % (name, self.active_label()))
+        wdlog.log.info("角度源 -> %s (%s)" % (name, self.active_label()), tag="hub")
 
     # ---------- 临时借用摄像头 ----------
     # 键盘模式下摄像头是关着的。但"匹配调试窗"要看摄像头画面, 所以开窗时
@@ -105,7 +106,7 @@ class SourceHub:
         """摄像头不是当前角度源就关掉。"""
         if self.active != "camera" and "camera" in self._started:
             self.stop_source("camera")
-            print("[camera] 已归还 (当前角度源是 %s)" % self.active)
+            wdlog.log.debug("已归还摄像头 (当前角度源是 %s)" % self.active, tag="camera")
 
     def next_source(self):
         idx = ORDER.index(self.active) if self.active in ORDER else 0

@@ -18,6 +18,7 @@ from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QSizePolicy,
                              QStackedWidget, QVBoxLayout, QWidget)
 
+import wdlog
 from angles.hub import LABELS
 
 from . import autostart, monitors
@@ -78,7 +79,7 @@ class CameraScanThread(QThread):
         try:
             from angles.camera import open_camera
         except Exception as exc:  # noqa: BLE001
-            print("[scan] 无法导入取流模块: %s" % exc)
+            wdlog.log.error("无法导入取流模块: %s" % exc, tag="scan")
             self.scanned.emit(found)
             return
         for idx in range(3):
@@ -318,7 +319,7 @@ class SettingsPanel(QWidget):
         self.btn_debug = TransparentPushButton("打开匹配调试窗")
         self.btn_debug.clicked.connect(self._quick_debug)
         self.btn_log = PrimaryPushButton("查看运行日志...")
-        self.btn_log.clicked.connect(self._open_log_dialog)
+        self.btn_log.clicked.connect(self._open_log_dialog_clicked)
         l3.addWidget(self._labeled("特征匹配", self.btn_debug))
         l3.addWidget(self._labeled("运行日志", self.btn_log))
 
@@ -521,8 +522,11 @@ class SettingsPanel(QWidget):
 
     def _open_advanced(self):
         """弹出高级设置窗 (modeless, 跟随主窗但不阻塞)。"""
+        wdlog.log.debug("用户操作: 打开高级设置", tag="ui")
         d = self._adv_dialog
         first = not d.isVisible()
+        wdlog.log.debug("打开高级设置弹窗 (first=%s, page=%s)"
+                        % (first, self.tab_adv.current()), tag="ui")
         d.show()
         if first:
             # **只在首次显示时贴合内容**。之后用户可能拉大/最大化了, 再调
@@ -534,6 +538,7 @@ class SettingsPanel(QWidget):
     def _on_glass_switch(self, checked):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 玻璃层开关 -> %s" % ("开" if checked else "关"), tag="ui")
         if checked:
             self.controller.start_glass()
         else:
@@ -551,9 +556,11 @@ class SettingsPanel(QWidget):
                 QTimer.singleShot(0, d.adjustSize)
 
     def _quick_calibrate(self):
+        wdlog.log.debug("用户操作: 标定基准帧", tag="ui")
         self.controller.calibrate_camera()
 
     def _quick_flip(self):
+        wdlog.log.debug("用户操作: 翻转方向", tag="ui")
         self.controller.flip_camera_sign()
         # try/finally: 中间抛异常时 _loading 不能卡在 True —— 那会让之后所有
         # 用户交互被 `if self._loading: return` 静默吞掉 (整窗"假死")。
@@ -564,11 +571,13 @@ class SettingsPanel(QWidget):
             self._loading = False
 
     def _quick_debug(self):
+        wdlog.log.debug("用户操作: 开关匹配调试窗", tag="ui")
         self.controller.toggle_debug_window()
 
     def _on_screen(self, pos):
         if self._loading or pos < 0:
             return
+        wdlog.log.debug("用户操作: 选择显示器 pos=%d" % pos, tag="ui")
         alls = monitors.screens()
         if 0 <= pos < len(alls):
             self.controller.set_screen(alls[pos])
@@ -577,11 +586,13 @@ class SettingsPanel(QWidget):
     def _on_level(self, pct):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 浓度 -> %d%%" % pct, tag="ui")
         self.controller.set_manual_level(pct / 100.0)
 
     def _on_source(self, key):
         if self._loading or not key:
             return
+        wdlog.log.debug("用户操作: 角度源 -> %s" % key, tag="ui")
         self.controller.set_source(key)
         self.controller.save()
         self._refresh_hotkeys()
@@ -593,6 +604,7 @@ class SettingsPanel(QWidget):
         data = self.cmb_camera.currentData()
         if data is None:
             return
+        wdlog.log.debug("用户操作: 选择摄像头 index=%s" % data, tag="ui")
         # 保留用户/扫描确定的 backend, **别硬编码 auto** —— 否则用户特意选的
         # dshow/msmf 会被这次换 index 抹回 auto。
         backend = str(self.cfg.get("camera_backend", "auto"))
@@ -602,12 +614,14 @@ class SettingsPanel(QWidget):
     def _on_serial(self):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 串口 -> %s" % self.edt_port.text().strip(), tag="ui")
         self.controller.set_serial(self.edt_port.text().strip())
         self.controller.save()
 
     def _on_effect(self, *_a):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 效果参数修改", tag="ui")
         for key, box in self._inputs.items():
             self.cfg[key] = float(box.value())
         self.cfg["outside_mode"] = self.cmb_outside.currentData()
@@ -617,10 +631,11 @@ class SettingsPanel(QWidget):
     def _on_autostart(self, checked):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 开机自启 -> %s" % checked, tag="ui")
         try:
             autostart.set_enabled(checked)
         except Exception as exc:  # noqa: BLE001
-            print("[autostart] %s" % exc)
+            wdlog.log.error("设置开机自启失败: %s" % exc, tag="autostart")
         self._loading = True
         try:
             self.sw_autostart.setChecked(autostart.is_enabled())
@@ -630,12 +645,14 @@ class SettingsPanel(QWidget):
     def _on_autocal(self, checked):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 自动标定 -> %s" % checked, tag="ui")
         self.cfg["autocal_on_glass_open"] = bool(checked)
         self.controller.save()
 
     def _on_autoglass(self, checked):
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 自动开玻璃 -> %s" % checked, tag="ui")
         self.cfg["autostart_glass"] = bool(checked)
         self.controller.save()
 
@@ -647,9 +664,14 @@ class SettingsPanel(QWidget):
         """
         if self._loading:
             return
+        wdlog.log.debug("用户操作: 低内存模式 -> %s" % checked, tag="ui")
         self.cfg["low_memory_mode"] = bool(checked)
         self.controller.save()
         self.controller.apply_low_memory_mode()
+
+    def _open_log_dialog_clicked(self):
+        wdlog.log.debug("用户操作: 打开运行日志窗口", tag="ui")
+        self._open_log_dialog()
 
     def _open_log_dialog(self):
         dlg = LogDialog(self)
@@ -661,11 +683,13 @@ class SettingsPanel(QWidget):
             "图片 (*.png *.jpg *.jpeg *.bmp);;所有文件 (*)")
         if not path:
             return
+        wdlog.log.debug("用户操作: 选择背景图 -> %s" % path, tag="ui")
         self.edt_backdrop.setText(path)
         self.controller.set_backdrop(path)
         self.controller.save()
 
     def _clear_backdrop(self):
+        wdlog.log.debug("用户操作: 背景图恢复默认 desk_bg.png", tag="ui")
         self.cfg["backdrop_path"] = "desk_bg.png"
         self.edt_backdrop.setText("desk_bg.png")
         self.controller.set_backdrop("desk_bg.png")
@@ -676,6 +700,7 @@ class SettingsPanel(QWidget):
         if self._scan is not None and self._scan.isRunning():
             return
         self.btn_scan.setEnabled(False)
+        wdlog.log.debug("用户操作: 开始扫描摄像头", tag="scan")
         self.lbl_scan.setText("扫描中… 会逐个打开摄像头, 约需几秒")
         self.controller.begin_scan()
         self._scan = CameraScanThread(self)
@@ -683,6 +708,7 @@ class SettingsPanel(QWidget):
         self._scan.start()
 
     def _on_scanned(self, found):
+        wdlog.log.debug("扫描完成: %d 个可用摄像头 %s" % (len(found), found), tag="scan")
         self._scan_result = found
         self.controller.end_scan()
         self.btn_scan.setEnabled(True)
@@ -777,7 +803,7 @@ class SettingsPanel(QWidget):
                 th.setParent(None)          # 断开 Qt 父子关系, 否则面板一销毁就 abort
                 self._scan = None
                 _ORPHANED.append(th)
-                print("[ui] 扫描线程仍在打开设备, 已寄存 (daemon, 随进程退出回收)")
+                wdlog.log.warn("扫描线程仍在打开设备, 已寄存 (daemon, 随进程退出回收)", tag="ui")
 
     @staticmethod
     def wait_orphans(extra_ms=2500):
