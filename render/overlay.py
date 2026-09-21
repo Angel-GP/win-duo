@@ -967,8 +967,19 @@ class GlassOverlay(QOpenGLWidget):
         # 用"是否已到达目标"代替"变化量 > 常数", 缓动多慢都能画完。
         settling = abs(self.target - self.g) > 1e-4
 
-        # 有新帧、或浓度尚未追上 target -> 重绘, 并由 render_fps 限速。
-        if (settling or new_frame) and (now - self._last_draw_req) >= self.render_interval:
+        # ═══════════════════════════════════════════════════════════════
+        # **玻璃层可见期间无条件按 render_fps 重绘** (2026-09 重绘率排查结论)
+        # ═══════════════════════════════════════════════════════════════
+        # 旧判据是 `settling or new_frame`: 桌面静止时 WGC/合成器只产 ~13 帧/s
+        # (实测 pump 58/s 里只有 13 帧是真新帧), new_frame 极少命中; 浓度稳定后
+        # settling 也恒 False —— 结果重绘率被动跟随桌面活动, 掉到 13/s 甚至
+        # 个位数。用户看到的就是"重绘率越用越低、玻璃层里的桌面变卡"。
+        # 但玻璃层画的就是**桌面快照**, 重绘率低 = 用户看到的整个桌面都卡,
+        # 省下的绘制毫无意义。上游 WindowsDuo 每 tick 无条件 update() 正是这个
+        # 原因。限速仍由 render_interval 把守 (render_fps 设多少就画多少),
+        # 浓度静止时多画的是"同一浓度下的新桌面帧", 不是浪费。
+        if self.render_interval <= 0 or \
+                (now - self._last_draw_req) >= self.render_interval:
             self._last_draw_req = now
             self._last_drawn_seq = seq
             self._update_req_count = getattr(self, "_update_req_count", 0) + 1
