@@ -16,6 +16,7 @@ import time
 import numpy as np
 from OpenGL import GL
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QOpenGLContext
 from PyQt6.QtOpenGL import QOpenGLShader, QOpenGLShaderProgram
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import QApplication, QFileDialog
@@ -422,13 +423,26 @@ class GlassOverlay(QOpenGLWidget):
             # GL 调用本身对任何驱动都规范安全。
             #
             # **fmt 契约**: 上传无条件按 BGRA 字节序灌 (swizzle 负责换通道)。
-            # 现存三个后端 (wgc/dda/mss) 都以 "BGRA" 登记, 这里 assert 钉死
-            # —— 未来若有人加 RGBA 后端而忘了改这里, 会在开发期立刻炸出来,
-            # 而不是上线后整屏红蓝反转还查不到原因。
-            assert fmt == "BGRA", "paintGL 假定帧是 BGRA, 实际 fmt=%r" % (fmt,)
+            # 现存三个后端 (wgc/dda/mss) 都以 "BGRA" 登记。原来这里用 assert
+            # 钉死契约, 但 assert 在 `python -O` 下会被剥离, 而它一触发就是
+            # **在绘制热路径里抛异常** —— Qt 槽里的未捕获异常会直接 abort 进程
+            # (见 AGENTS)。改成"不匹配就只警告一次并照常上传": 契约仍然可见,
+            # 但不会把整个绘制循环带走。
+            if fmt != "BGRA" and not getattr(self, "_fmt_warned", False):
+                self._fmt_warned = True
+                print("[GL] 警告: 帧的 fmt=%r 不是 BGRA, 颜色可能不对"
+                      "(见 paintGL 的 fmt 契约)" % (fmt,))
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
-            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, fw, fh, 0,
-                            GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
+            # **尺寸没变就用 glTexSubImage2D 更新, 不要每帧重新分配纹理存储 +
+            # 重建整条 mip 链** (2560x1600 的 glTexImage2D + glGenerateMipmap
+            # 是每帧一笔不小的 GPU 成本)。只有首次/换屏(尺寸变)时才走分配。
+            if (fw, fh) == getattr(self, "_tex_alloc_size", None):
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, fw, fh,
+                                   GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
+            else:
+                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, fw, fh, 0,
+                                GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, raw)
+                self._tex_alloc_size = (fw, fh)
             GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             self._uploaded_seq = seq
@@ -565,6 +579,36 @@ class GlassOverlay(QOpenGLWidget):
         print("\n[backdrop] 已切换 %s" % path)
 
     def _upload_backdrop(self, bgr):
+        """把背景图上传到 bd_tex。
+
+        **可能被非 GL 回调调用** (`reload_backdrop`/`pick_backdrop` 是从 tick 的
+        命令循环进来的, 不是 paintGL) —— `QOpenGLWidget` 只保证在
+        initializeGL/paintGL/resizeGL 期间上下文为 current, 定时器回调里没有。
+        若此时直接发 GL 调用, 会打到"没有 current context"上 -> 静默 GL 错误、
+        bd_tex 写坏。所以这里显式 makeCurrent/doneCurrent (从 paintGL 进来时
+        上下文本就是 current, makeCurrent 是幂等的, 无副作用)。
+        """
+        made = False
+        try:
+            ctx = self.context()
+            # 只有"已经建好且当前没有 current context"时才接管。
+            # 从 paintGL 进来时 currentContext() 就是自己, 不会切 (幂等)。
+            if (ctx is not None and ctx.isValid()
+                    and QOpenGLContext.currentContext() is not ctx):
+                self.makeCurrent()
+                made = True
+        except Exception:  # noqa: BLE001  取不到状态就按"不需要"处理
+            made = False
+        try:
+            self._upload_backdrop_gl(bgr)
+        finally:
+            if made:
+                try:
+                    self.doneCurrent()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _upload_backdrop_gl(self, bgr):
         h, w = bgr.shape[:2]
         # bd_tex 已设 swizzle (B,G,R,1) —— cv2 的 BGR 数据直接按字节灌进去,
         # 采样时硬件换通道, 不再在 CPU 上做 BGR->RGB 搬运。外部格式用 GL_RGBA:
@@ -666,6 +710,11 @@ class GlassOverlay(QOpenGLWidget):
         cam = self.hub.get("camera")
         if cam is None:
             return
+        # **cv2 必须在函数开头取一次。** 下面第 686 行原来写的是 `cv2 = _cv2()`,
+        # 那会让 Python 把 `cv2` 当成**整个函数的局部变量** —— 于是上面这个
+        # `getWindowProperty` 一访问就 UnboundLocalError, 被下面的裸 except 当成
+        # "窗口已被用户关掉", 立刻 close_debug()。表现: 调试窗**活不过一帧**。
+        cv2 = _cv2()
 
         # 用户自己点了窗口的 X -> 同步状态, 别再往一个已经没了的窗口 imshow
         if self._dbg_shown:
@@ -683,7 +732,6 @@ class GlassOverlay(QOpenGLWidget):
         if img is None or seq == self._dbg_seq:
             return
         self._dbg_seq = seq
-        cv2 = _cv2()
         try:
             cv2.imshow(DEBUG_WINDOW, img)
             if not self._dbg_shown:

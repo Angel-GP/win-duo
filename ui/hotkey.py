@@ -85,6 +85,15 @@ class HotkeyManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._user32 = ctypes.windll.user32
+        # **显式声明 argtypes/restype。** 不声明时 ctypes 按默认 int 传参,
+        # 64 位下句柄/指针可能被截断 —— 项目里对 SetProcessWorkingSetSize
+        # 正是因此踩过坑 (见 controller 的注释), 这里保持同样严谨。当前参数
+        # 恰好是小整数与 NULL 所以能跑, 但那是巧合, 不该依赖。
+        self._user32.RegisterHotKey.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+        self._user32.RegisterHotKey.restype = ctypes.c_bool
+        self._user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._user32.UnregisterHotKey.restype = ctypes.c_bool
         self._names = {}          # hotkey id -> name
         self._specs = {}          # name -> spec
         self._next_id = 0xD00D
@@ -99,13 +108,15 @@ class HotkeyManager(QObject):
             print("[hotkey] %r 解析失败" % spec)
             return False
         hid = self._next_id
-        self._next_id += 1
         # hwnd=NULL: WM_HOTKEY 投递到线程消息队列, 由 native event filter 接
         ok = self._user32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk)
-        if ok:
-            self._names[hid] = name
-            self._specs[name] = spec
-        return bool(ok)
+        if not ok:
+            # 失败就不占 id —— 原来无条件自增, 反复失败会把 id 空间一直推高
+            return False
+        self._next_id += 1
+        self._names[hid] = name
+        self._specs[name] = spec
+        return True
 
     def has(self, name):
         return name in self._specs

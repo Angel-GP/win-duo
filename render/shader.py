@@ -107,7 +107,10 @@ void main() {
     float effR = radius / exp2(lod);
 
     // Vogel 盘: sqrt 均匀面密度 + 黄金角 + 每像素随机旋转 -> 磨砂颗粒
-    int taps = int(clamp(effR * 2.0, 6.0, float(uMaxTaps)));
+    // taps 上界是 uMaxTaps (配置), 下界 6。**顺序很重要**: 原来的
+    // `clamp(x, 6.0, float(uMaxTaps))` 在 uMaxTaps < 6 时 min > max, GLSL 规范里
+    // 结果**未定义** —— 先 min(uMaxTaps) 再 max(6) 就永远合法。
+    int taps = int(max(min(effR * 2.0, float(uMaxTaps)), 6.0));
     float rot = hash21(gl_FragCoord.xy) * TWO_PI;
 
     // 边缘覆盖率: 采样核出界部分按比例衰减, 不出现硬边

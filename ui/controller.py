@@ -9,6 +9,7 @@
 """
 import ctypes
 import json
+import os
 import time
 from pathlib import Path
 
@@ -830,10 +831,30 @@ class AppController(QObject):
     # ------------------------------------------------------------ 持久化
     def save(self):
         clean = {k: v for k, v in self.cfg.items() if not k.startswith("_")}
-        # encoding="utf-8" 不写 BOM; 加载端也用 utf-8-sig, 记事本改过也能读
-        with open(self.cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(clean, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
+        # **原子写**: 先写同目录临时文件, 再 os.replace 到目标。直接
+        # `open(path,"w")` 覆写的话, 写到一半崩溃/断电会留下**截断的 JSON** ——
+        # config 就废了 (main.load_config 里那套"备份 + 重建"的恢复逻辑正是为
+        # 这种真实故障准备的)。os.replace 在 NTFS 上是原子的: 要么旧内容, 要么
+        # 新内容, 不会出现半截文件。
+        # encoding="utf-8" 不写 BOM; 加载端也用 utf-8-sig, 记事本改过也能读。
+        tmp = self.cfg_path.with_name(self.cfg_path.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(clean, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())      # 落盘后再换名, 别只到 OS 缓存
+            os.replace(tmp, self.cfg_path)
+        except Exception:  # noqa: BLE001
+            # 退路: 原子写失败 (权限/文件系统不支持) 就退回直接写, 别丢用户改动
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            with open(self.cfg_path, "w", encoding="utf-8") as fh:
+                json.dump(clean, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
         print("[config] 已保存 %s" % self.cfg_path)
         return clean
 

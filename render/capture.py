@@ -131,23 +131,6 @@ def frame_bgr(frame):
     return np.ascontiguousarray(arr[:, :, :3])
 
 
-def frame_bgra_to_rgba(data, w, h):
-    """把一帧的 BGRA 缓冲换成 RGBA (给 GL 上传用, 走规范安全的 GL_RGBA 外部格式)。
-
-    为什么要换: `GL_BGRA` 作为 `glTexImage2D` 的**外部格式**不属 OpenGL 3.3 core
-    的核心保证 (是 GL_EXT_bgra)。NVIDIA 宽松接受, 但 **Intel 核显常拒绝** ->
-    纹理上传失败、玻璃层全黑。所以统一在 CPU 侧换一次通道, 上传只用 GL_RGBA。
-
-    返回**连续且可写**的 RGBA 数组 (GL 需要连续内存; 换通道本身就产生了新数组)。
-    """
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 4)
-    else:
-        arr = np.asarray(data).reshape(h, w, 4)
-    # BGRA -> RGBA: R/B 互换。np.ascontiguousarray 保证连续 (切片会跨步)。
-    return np.ascontiguousarray(arr[:, :, [2, 1, 0, 3]])
-
-
 # ═══════════════════════════════════════════════════════════════════
 # 后端记忆: 与 angles/camera.py 的"记住上次成功的后端"同思路。
 # DDA 在部分驱动 (Intel Arc) 上会无视 SetWindowDisplayAffinity -> 反馈回路,
@@ -222,6 +205,13 @@ def _monitor_index_for(origin, size):
 
 
 _STATE_PATH = None
+#: "上次成功的采集后端"的**内存缓存**。
+#: `remember_capture_backend()` 在每次成功抓帧时都被调用 (WGC/DXGI 两条路径),
+#: 玻璃层显示时最高 ~140 帧/秒 —— 若每次都去 `read_text` + `json.loads` 判"值
+#: 变没变", 就是采集线程里每秒 140 次同步磁盘读, 纯白烧 I/O。这里缓存住,
+#: 只有**值真的变化**时才写盘。`_STATE_LOADED` 区分"没读过"和"读过但没有值"。
+_STATE_CACHE = None
+_STATE_LOADED = False
 
 
 def _backend_state_path():
@@ -235,16 +225,28 @@ def _backend_state_path():
 
 
 def load_good_capture_backend():
+    """读"上次成功的后端"。**带内存缓存** —— 第一次读盘, 之后走缓存。"""
+    global _STATE_CACHE, _STATE_LOADED
+    if _STATE_LOADED:
+        return _STATE_CACHE
     p = _backend_state_path()
-    if p is None or not p.exists():
-        return None
-    try:
-        return str(json.loads(p.read_text(encoding="utf-8")).get("backend") or "") or None
-    except Exception:  # noqa: BLE001  坏了就当没有
-        return None
+    val = None
+    if p is not None and p.exists():
+        try:
+            val = str(json.loads(p.read_text(encoding="utf-8")).get("backend")
+                      or "") or None
+        except Exception:  # noqa: BLE001  坏了就当没有
+            val = None
+    _STATE_CACHE = val
+    _STATE_LOADED = True
+    return val
 
 
 def remember_capture_backend(name):
+    """记住成功的后端。**只在值变化时写盘** (热路径零 I/O)。"""
+    global _STATE_CACHE, _STATE_LOADED
+    if _STATE_LOADED and _STATE_CACHE == name:
+        return                          # 热路径: 命中缓存, 直接返回 (不碰磁盘)
     p = _backend_state_path()
     if p is None:
         return
@@ -253,6 +255,8 @@ def remember_capture_backend(name):
             return
         p.write_text(json.dumps({"backend": name}, ensure_ascii=False) + "\n",
                      encoding="utf-8")
+        _STATE_CACHE = name
+        _STATE_LOADED = True
     except Exception:  # noqa: BLE001  静默, 别让记忆失败影响采集
         pass
 
@@ -528,11 +532,18 @@ class CaptureWorker(threading.Thread):
         good = load_good_capture_backend() if self.want_backend == "auto" else None
         if good:
             print("[capture] 上次成功的采集后端是 %s, 优先试它" % good)
-        order = ["wgc", "dxgi"] if good != "wgc" else ["dxgi", "wgc"]
-        if good == "wgc":
-            order = ["wgc", "dxgi"]
+        # **记住的后端排最前。** 原来写成
+        #     order = ["wgc","dxgi"] if good != "wgc" else ["dxgi","wgc"]
+        #     if good == "wgc": order = ["wgc","dxgi"]
+        # 第一行的 else 分支立刻被下一行覆盖 —— 净效果是 good=="dxgi" 时仍是
+        # ["wgc","dxgi"], **"优先上次成功后端"对 dxgi 从来没生效过**。这里显式
+        # 列三种情况。
+        if good == "dxgi":
+            order = ["dxgi", "wgc"]
         elif good == "mss":
-            order = []
+            order = []                       # 用户上次确认只有 mss 能用
+        else:
+            order = ["wgc", "dxgi"]          # 默认: WGC 优先 (affinity 更可靠)
         for name in order:
             if self.want_backend not in ("auto", name):
                 continue
@@ -812,8 +823,13 @@ class CaptureWorker(threading.Thread):
     def _grab_mss(self, seq):
         if self._sct is None:
             self._sct = mss.mss()
+        # **在锁内取 region 快照。** set_region 会在 self.lock 下改 self.region
+        # (主线程切屏), 这里若直接把自己的引用传进去, 可能拿到"半更新"的字典
+        # (改到一半被读)。取一份拷贝再用, 抓这一帧就用它自己的 region。
+        with self.lock:
+            region = dict(self.region) if self.region else self.region
         t0 = time.perf_counter()
-        shot = self._sct.grab(self.region)
+        shot = self._sct.grab(region)
         raw = shot.raw
         if self._dxgi is None:
             self.last_ms = (time.perf_counter() - t0) * 1000.0

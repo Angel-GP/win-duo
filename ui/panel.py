@@ -470,6 +470,11 @@ class SettingsPanel(QWidget):
         self.num_level.setValue(self.controller.manual_level() * 100, emit=False)
 
     def _refresh_status(self):
+        # **窗口不可见时不干活。** 面板最小化只是 hide() (对象还活着), 定时器
+        # 却仍每 500ms 跑一遍: 查角度源、字体度量、刷开关状态 —— 没人看的窗口上
+        # 白做功。隐藏时直接返回, 再显示时 refresh_all/下一次 tick 会补上。
+        if not self.isVisible():
+            return
         try:
             level, name, status, detail = self.controller.hub.resolve()
         except Exception:  # noqa: BLE001
@@ -550,9 +555,13 @@ class SettingsPanel(QWidget):
 
     def _quick_flip(self):
         self.controller.flip_camera_sign()
+        # try/finally: 中间抛异常时 _loading 不能卡在 True —— 那会让之后所有
+        # 用户交互被 `if self._loading: return` 静默吞掉 (整窗"假死")。
         self._loading = True
-        self._refresh_effect()
-        self._loading = False
+        try:
+            self._refresh_effect()
+        finally:
+            self._loading = False
 
     def _quick_debug(self):
         self.controller.toggle_debug_window()
@@ -613,8 +622,10 @@ class SettingsPanel(QWidget):
         except Exception as exc:  # noqa: BLE001
             print("[autostart] %s" % exc)
         self._loading = True
-        self.sw_autostart.setChecked(autostart.is_enabled())
-        self._loading = False
+        try:
+            self.sw_autostart.setChecked(autostart.is_enabled())
+        finally:
+            self._loading = False
 
     def _on_autocal(self, checked):
         if self._loading:
@@ -681,8 +692,10 @@ class SettingsPanel(QWidget):
             self.lbl_scan.setText("扫到 %d 个可用摄像头（虚拟摄像头的冻结帧已排除）"
                                   % len(found))
         self._loading = True
-        self._fill_camera_combo()
-        self._loading = False
+        try:
+            self._fill_camera_combo()
+        finally:
+            self._loading = False
 
     # ================================================================ 生命周期
     def showEvent(self, ev):

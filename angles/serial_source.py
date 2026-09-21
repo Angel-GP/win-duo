@@ -41,6 +41,9 @@ class SerialAngleSource(AngleSource):
 
         self.detail = {}
         self._thread = None
+        #: stop() 超时后仍活着的旧采集线程 (卡在 serial 打开/读里)。start() 见到
+        #: 它已死就清掉再起新的 —— 否则 `_thread` 永远非 None, 再也起不来。
+        self._orphan = None
         self._stop = False
         self._lock = threading.Lock()
 
@@ -55,6 +58,14 @@ class SerialAngleSource(AngleSource):
     def start(self):
         if self._thread is not None:
             return
+        # 上一轮 stop() 超时、把卡住的线程寄存到了 _orphan。它若已经死了就清掉
+        # (可以重新开始); 还活着就等它 —— 绝不叠加第二个线程。
+        # 少了这段, `_thread` 会永远非 None, **串口源将永久无法重启**。
+        if self._orphan is not None:
+            if self._orphan.is_alive():
+                print("[serial] 上一个采集线程仍卡在设备里, 暂不重启")
+                return
+            self._orphan = None
         try:
             import serial  # noqa: F401
         except ImportError as exc:
@@ -72,13 +83,12 @@ class SerialAngleSource(AngleSource):
         th, self._thread = self._thread, None
         if th is not None:
             th.join(timeout=2.0)
-            # join 超时 (卡在 serial.Serial 打开/读里) 时旧线程仍活着 —— 别谎称
-            # "已停"。保留引用, 下一次 start() 会看到 _thread 已是 None 而起新
-            # 线程, 但至少不会把旧线程的引用丢掉导致无法观测。
+            # join 超时 (卡在 serial.Serial 打开/读里) 时旧线程仍活着 —— 寄存到
+            # `_orphan`, 由 start() 复核 is_alive() 决定清掉还是等待。原来直接
+            # 把这线程放回 `_thread`, 于是 `_thread` 永远非 None -> 再也起不来。
             if th.is_alive():
-                print("[serial] 采集线程未在 2s 内退出 (设备阻塞), 已放弃等待")
-                self._thread = th          # 留着引用, 防止 start() 叠加新线程
-                return
+                print("[serial] 采集线程未在 2s 内退出 (设备阻塞), 已寄存待其结束")
+                self._orphan = th
 
     # ---------- 对外读数 ----------
     def level(self):
@@ -108,6 +118,9 @@ class SerialAngleSource(AngleSource):
             try:
                 with serial.Serial(self.port, self.baud, timeout=1) as ser:
                     self._set_status("已连接 " + self.port)
+                    # 重连后重置 FPS 计数 —— 否则第一段的 (n, t0) 还带着重连前
+                    # 的起点, 把停机时间算进分母, 报一次偏低的 FPS。
+                    n, t0 = 0, time.time()
                     buf = b""
                     while not self._stop:
                         buf += ser.readline()
@@ -119,13 +132,18 @@ class SerialAngleSource(AngleSource):
                         m = pattern.search(line)
                         if not m:
                             continue
+                        # **整行的解析 + 取值都包在这个 try 里。** 原来只包了
+                        # json.loads, 而 `d[self.axis]` 在 try 外 —— 一行缺 "a"
+                        # 键 (半行 / 固件抖动) 会抛 KeyError, 冒泡到最外层 except
+                        # 被当成"串口错误" -> **重连整个端口**。100Hz 噪声链路上
+                        # 这就是重连风暴。现在坏行只 `continue`(跳过这一行)。
                         try:
                             d = json.loads(m.group(0))
-                        except ValueError:
+                            angle = float(d[self.axis])
+                            other = float(d.get("b", 0.0))
+                        except (ValueError, KeyError, TypeError):
                             continue
 
-                        angle = float(d[self.axis])
-                        other = float(d.get("b", 0.0))
                         lo, hi = self.angle_open, self.angle_closed
                         ratio = (angle - lo) / (hi - lo) if hi != lo else 0.0
                         lvl = 0.0 if ratio < self.glass_start else min(1.0, ratio)

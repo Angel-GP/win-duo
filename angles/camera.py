@@ -630,12 +630,26 @@ class OrbTracker:
 
         内点判据用**角度**而不是像素距离: 把 a_i 用候选 R 转过去, 和 b_i 的
         夹角小于阈值就算内点。角度判据对画面位置不敏感, 比像素判据稳。
+
+        **性能**: 每次迭代都要对全部 N 个匹配做 `a @ R.T` + arccos, 而这是
+        摄像头模式每帧的主导 CPU 开销 (nfeatures=1200 时 N 可到几百)。两条
+        不改变结果的省法:
+          1. **提前退出**: 一旦某个候选的共识已经覆盖了几乎所有匹配, 再抽新的
+             4 点集不可能明显更好 —— 直接停。真实场景里前几次迭代通常就命中。
+          2. **只对"有机会赢"的候选做全量打分**: 先算内点数的上界没意义 (仍需
+             全量), 所以这里靠 (1) 就够了; 不再额外降 iters (那会改变结果)。
+        确定性不变: 同一输入仍然给出同一个 R (rng 种子固定、退出条件只依赖
+        已算出的共识数)。
         """
         n = len(a)
         if n < 4:
             return None, np.zeros(n, dtype=bool)
         rng = np.random.default_rng(seed if seed is not None else 12345)
         cos_thresh = np.cos(np.radians(thresh_deg))
+
+        #: 共识覆盖到这么高比例就没必要再抽了 —— 剩下的差异只在内点边缘,
+        #: 而后面 `_measure` 还会用内点做一次最小二乘精解, 不受这点影响。
+        good_enough = max(4, int(n * 0.9))
 
         best_R, best_mask, best_n = None, None, 0
         for _ in range(iters):
@@ -649,6 +663,8 @@ class OrbTracker:
             cnt = int(mask.sum())
             if cnt > best_n:
                 best_R, best_mask, best_n = R, mask, cnt
+                if best_n >= good_enough:
+                    break               # 已足够好, 省下剩余迭代
         if best_R is None:
             return None, np.zeros(n, dtype=bool)
         return best_R, best_mask

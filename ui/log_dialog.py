@@ -3,7 +3,7 @@ import subprocess
 import sys
 import time
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QVBoxLayout
 
@@ -36,6 +36,10 @@ class LogDialog(QDialog):
         self.setWindowTitle("win-duo 运行日志")
         self.setWindowIcon(make_icon())
         self.resize(680, 480)
+        # **关掉就销毁。** 否则 parent 是 panel 时, accept()/点 X 只是 hide(),
+        # 对象活到程序结束 —— 而它带着一个 1000ms 定时器, 每次开日志窗就多一个
+        # 永久定时器, 各自每秒把整份日志读一遍 (开 N 次 = N 个)。
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
@@ -52,7 +56,8 @@ class LogDialog(QDialog):
         btn_row.setSpacing(10)
 
         self.btn_refresh = TransparentPushButton("刷新")
-        self.btn_refresh.clicked.connect(self.refresh_log)
+        # clicked 会带一个 checked 布尔; 显式 force=True, 别让它当参数用
+        self.btn_refresh.clicked.connect(lambda: self.refresh_log(force=True))
         btn_row.addWidget(self.btn_refresh)
 
         # 弹一个**原生命令行窗口**实时滚动日志 —— 打包成无控制台 exe 后, 这是
@@ -82,7 +87,34 @@ class LogDialog(QDialog):
         self.timer.timeout.connect(self.refresh_log)
         self.timer.start(1000)
 
-    def refresh_log(self):
+    def closeEvent(self, ev):
+        """关窗即停轮询 (配合 WA_DeleteOnClose, 对象随后被销毁)。
+
+        双重保险: WA_DeleteOnClose 已保证销毁, 但定时器是在**销毁前**那一刻仍
+        可能触发一次; 显式停掉更干净, 也让"关掉就不再读日志"这件事不依赖
+        Qt 的销毁时机。
+        """
+        try:
+            self.timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(ev)
+
+    def refresh_log(self, force=False):
+        # **先看文件有没有变, 没变就直接返回。** 原来无条件 read_text + 跟整个
+        # 文档做 O(n) 字符串比较 —— 日志几 MB 时每秒一遍全文读 + 比较, 全在
+        # UI 线程上。用 (size, mtime) 快速判据挡掉绝大多数白做的事。
+        # force=True (用户点"刷新") 时跳过判据, 无条件重读。
+        if not force:
+            try:
+                st = LOG_FILE.stat()
+                stamp = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                stamp = None
+            if stamp is not None and stamp == getattr(self, "_log_stamp", None):
+                return
+            self._log_stamp = stamp
+
         content = get_all_logs()
         if content == self.text_edit.toPlainText():
             return                      # 没变化就别动, 免得白重设、白跳

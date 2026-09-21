@@ -38,14 +38,26 @@ from pathlib import Path
 # 文件也没有, 那 faulthandler 只好不启用 (总不能因此起不来)。
 def _enable_faulthandler():
     import sys as _sys
-    if _sys.stderr is not None:
-        faulthandler.enable(file=_sys.stderr, all_threads=True)
-        return
+    # **优先直接开到日志文件** (真 file 对象, 一定有 fileno)。这样无论 sys.stderr
+    # 是 None (打包 windowed exe) 还是已被 _TeeLogger 接管 (没有 fileno, 见该类
+    # 的 fileno 说明), 都能启用 —— 这正是本函数要保证的事。
     try:
-        _log = _paths.log_file("win_duo.log")
+        # 局部 import paths: 本函数在第 52 行就被调用, 而模块级
+        # `import paths as _paths` 在更后面 —— 用模块级会 NameError, 被裸 except
+        # 吞掉, 于是 faulthandler 恰好在它唯一被需要的场景 (打包 exe) 从不启用。
+        import paths as _p
+        _log = _p.log_file("win_duo.log")
         _log.parent.mkdir(parents=True, exist_ok=True)
-        faulthandler.enable(file=open(_log, "a", encoding="utf-8"), all_threads=True)
-    except Exception:  # noqa: BLE001  连日志都开不了就放弃, 不挡启动
+        faulthandler.enable(file=open(_log, "a", encoding="utf-8"),
+                            all_threads=True)
+        return
+    except Exception:  # noqa: BLE001  日志开不了就退到 stderr
+        pass
+    # 退路: stderr 可用就用它 (必须真有 fileno, 否则 faulthandler 会抛)
+    try:
+        if _sys.stderr is not None and hasattr(_sys.stderr, "fileno"):
+            faulthandler.enable(file=_sys.stderr, all_threads=True)
+    except Exception:  # noqa: BLE001  都不行就不启用, 不挡启动
         pass
 
 
@@ -114,6 +126,27 @@ class _TeeLogger:
 
     def __init__(self, primary):
         self.primary = primary
+
+    def fileno(self):
+        """让 faulthandler / 其它需要真文件描述符的调用也能用。
+
+        `faulthandler.enable(file=...)` 要求 file 有 `fileno()`。`sys.stderr` 被
+        本类接管后就没有了 —— 一旦有人在接管之后调 `faulthandler.enable(
+        file=sys.stderr)` 就会 `AttributeError`。这里转发到共享的日志文件句柄
+        (它就是本该收到崩溃栈的地方)。
+        """
+        f = type(self)._file
+        if f is not None and hasattr(f, "fileno"):
+            try:
+                return f.fileno()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.primary is not None and hasattr(self.primary, "fileno"):
+            try:
+                return self.primary.fileno()
+            except Exception:  # noqa: BLE001
+                pass
+        raise OSError("no fileno")
 
     @classmethod
     def open_log(cls, log_path, max_bytes=_LOG_MAX_BYTES):

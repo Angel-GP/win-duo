@@ -14,6 +14,11 @@ pyproject.toml
 # 本地测试启动器 (不进仓库)
 test.bat
 
+# 代码审计/临时报告: 个人分析产物, 不属于项目源码
+bug.md
+AUDIT_win-duo.md
+AUDIT*.md
+
 # 用户配置 + 调试产物: 全部收在 diagnostics/ 下, 运行时生成, 不入库
 #   diagnostics/config/config.json          用户配置
 #   diagnostics/debug/log/win_duo.log       运行日志
