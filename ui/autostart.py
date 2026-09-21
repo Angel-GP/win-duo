@@ -52,17 +52,6 @@ def is_enabled():
         return False
 
 
-def current_value():
-    if winreg is None:
-        return None
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                            winreg.KEY_READ) as key:
-            return winreg.QueryValueEx(key, APP_NAME)[0]
-    except OSError:
-        return None
-
-
 def enable():
     if winreg is None:
         raise RuntimeError("当前平台不支持开机自启")

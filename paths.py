@@ -90,9 +90,8 @@ def writable_data_dir():
         return fallback
 
 
-def data_file(name):
-    """数据目录里的一个文件路径。"""
-    return writable_data_dir() / name
+# 注: 原来这里有个 `data_file(name)`。配置/日志收进 diagnostics/ 之后已改走
+# config_file()/log_file()/debug_file(), 它就没有调用者了, 故删除。
 
 
 # ═══════════════════════════════════════════════════════════════════════

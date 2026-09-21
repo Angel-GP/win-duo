@@ -276,6 +276,31 @@ DEFAULT_CFG = {
 }
 
 
+def _write_json_atomic(cfg_path, data):
+    """原子地写一份 JSON。
+
+    和 `ui/controller.py::save()` 同样的问题: 直接 `open(path,"w")` 覆写, 写到
+    一半崩溃/断电会留下**截断的 JSON** (load_config 里那套"备份 + 重建"的恢复
+    逻辑就是为这种真实故障准备的)。先写同目录临时文件再 os.replace —— NTFS 上
+    原子换名, 要么旧内容要么新内容, 不会半截。
+    """
+    tmp = cfg_path.with_name(cfg_path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, cfg_path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
 def _seed_config_if_missing(cfg_path):
     """配置文件不存在时**生成一份**, 保证程序一定能启动。
 
@@ -302,9 +327,7 @@ def _seed_config_if_missing(cfg_path):
     try:
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         # 不写 BOM, 和 controller.save() 保持一致 (读的一端用 utf-8-sig, 两种都能读)
-        with open(cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(DEFAULT_CFG, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
+        _write_json_atomic(cfg_path, DEFAULT_CFG)
         print("[config] 配置不存在, 已用内置默认值生成 %s" % cfg_path)
     except Exception as exc:  # noqa: BLE001
         print("[config] 生成默认配置失败: %s" % exc)
@@ -363,9 +386,7 @@ def load_config(path=None):
         except Exception:  # noqa: BLE001
             pass
         try:
-            with open(cfg_path, "w", encoding="utf-8") as fh:
-                json.dump(DEFAULT_CFG, fh, ensure_ascii=False, indent=2)
-                fh.write("\n")
+            _write_json_atomic(cfg_path, DEFAULT_CFG)
         except Exception:  # noqa: BLE001
             pass
         return dict(DEFAULT_CFG)
