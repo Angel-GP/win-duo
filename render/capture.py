@@ -578,7 +578,7 @@ class CaptureWorker(threading.Thread):
                     wdlog.log.warn("DXGI 不可用, 退回 mss: %s" % exc, tag="capture")
         self.backend = "mss"
         self._sct = mss.mss()
-        wdlog.log.warn("后端 mss (GDI BitBlt), %dx%d" % (self.size,), tag="capture")
+        wdlog.log.warn("后端 mss (GDI BitBlt), %dx%d" % self.size, tag="capture")
 
     def _drop_dxgi(self):
         if self._dxgi is not None:

@@ -203,17 +203,6 @@ class GlassOverlay(QOpenGLWidget):
         # 场景 Python 侧本来就什么都来不及输出, 是固有限制。
         atexit.register(self._atexit_stats)
 
-    def _atexit_stats(self):
-        try:
-            # 退出瞬间玻璃层还开着的话, 先把进行中的周期收掉, 别丢最后一个
-            if self._period_stats is not None:
-                self.hideEvent(None)
-            rep = self.perf_stats.report()
-            if rep is not None:
-                wdlog.log.info(rep.replace("\n", "\n  "), tag="perf")
-        except Exception:  # noqa: BLE001  退出路径上统计绝不能挡进程收尾
-            pass
-
         # 渲染参数全部收进 apply_config(), 这样设置窗口改完能就地生效
         self.idle_hide = 0.004
         self.idle_show = 0.02
@@ -242,6 +231,17 @@ class GlassOverlay(QOpenGLWidget):
             from ui.widgets import make_icon
             self.setWindowIcon(make_icon())
         except Exception:  # noqa: BLE001
+            pass
+
+    def _atexit_stats(self):
+        try:
+            # 退出瞬间玻璃层还开着的话, 先把进行中的周期收掉, 别丢最后一个
+            if self._period_stats is not None:
+                self.hideEvent(None)
+            rep = self.perf_stats.report()
+            if rep is not None:
+                wdlog.log.info(rep.replace("\n", "\n  "), tag="perf")
+        except Exception:  # noqa: BLE001  退出路径上统计绝不能挡进程收尾
             pass
 
     def apply_config(self):
@@ -1141,8 +1141,51 @@ class GlassOverlay(QOpenGLWidget):
         except Exception:  # noqa: BLE001
             pass
         bits.append("出界=%s" % ("黑" if self.outside == 0 else "背景"))
-        bits.append("m=换源 c=标定 x=调试 v=出界 b=选背景 +/-=灵敏度")
+        # ═══════════════════════════════════════════════════════════════
+        # 超宽裁剪: 数据项从尾部逐个丢, 快捷键提示永远保住 (放不下时用紧凑写法)
+        # ═══════════════════════════════════════════════════════════════
+        hint = "m=换源 c=标定 x=调试 v=出界 b=选背景 +/-=灵敏度"
+        short_hint = "m c x v b +/-"
+        cols = _console_columns()
+        # 留 1 列余量: 不少终端在刚好写满最后一列时也会自动换行
+        limit = max(20, cols - 1)
+
+        def fits(cand):
+            return _display_width(cand) <= limit
+
+        # 1) 完整: 主信息 + 所有数据项 + 完整提示
+        line = None
+        cand = "  ".join(bits + extra + [hint])
+        if fits(cand):
+            line = cand
+        # 2) 从数据项尾部逐个丢, 直到放得下
+        if line is None:
+            for i in range(len(extra) - 1, -1, -1):
+                cand = "  ".join(bits + extra[:i] + [hint])
+                if fits(cand):
+                    line = cand
+                    break
+        # 3) 丢光数据项 + 紧凑提示
+        if line is None:
+            cand = "  ".join(bits + [short_hint])
+            if fits(cand):
+                line = cand
+        # 4) 连"主信息 + 紧凑提示"都放不下: 截断主信息, 提示接回行尾
+        if line is None:
+            line = "  ".join(bits + [short_hint])
+        if not fits(line):
+            out, w = [], 0
+            tail = "  " + short_hint
+            room = limit - _display_width(tail) - 1
+            for ch in "  ".join(bits):
+                cw = _display_width(ch)
+                if w + cw > room:
+                    break
+                out.append(ch)
+                w += cw
+            line = "".join(out) + "…" + tail
         # TRACE 才输出: 这是 0.1s 一刷的 \r 单行状态, 只在排查"实时数值"时看。
-        # 走 log.status_line: 保持 \r 原地刷新, 且它记住"行未闭合",
-        # 下一条日志输出前会先补换行 (否则日志会糊在状态行同一行上)。
-        wdlog.log.status_line("  ".join(bits))
+        # 走 log.status_line: 保持 \r 原地刷新, 且它记住"行未闭合"、按显示
+        # 宽度擦残尾 (行尾补空格防残影的事 status_line 用 EL 已处理)。
+        # 下一条日志输出前它会先补换行, 否则日志会糊在状态行同一行上。
+        wdlog.log.status_line(line)
