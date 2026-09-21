@@ -182,7 +182,9 @@ class GlassOverlay(QOpenGLWidget):
         self._visible = False        # 玻璃层当前是否真的显示着
         self._uploaded_seq = -1
         self._uploaded_size = (1, 1)  # 已上传纹理的尺寸, 与 frame 解耦
-        self._last_drawn_g = -1.0    # 上次真正重绘时的浓度/帧号, 用于跳过无谓重绘
+        # 注: 原来这里还有个 `_last_drawn_g` (上次重绘时的浓度), 用来做
+        # "浓度变化 > 0.0005 才重绘"的节流 —— 那个判据会把指数缓动的尾段吞掉
+        # (见 tick 里的说明), 已改为按"是否还在追 target"判断, 故删除。
         self._last_drawn_seq = -1
         self._last_kick = 0.0
         self._last_print = 0.0
@@ -885,7 +887,6 @@ class GlassOverlay(QOpenGLWidget):
             self._visible = True
             self._last_vis_change = now
             self.show()
-            self._last_drawn_g = -1.0
             self._last_drawn_seq = -1
             self.capturer.kick()
             print("\n[glass] 玻璃层显示")
@@ -906,14 +907,25 @@ class GlassOverlay(QOpenGLWidget):
         frame = self.capturer.latest()
         seq = frame[3] if frame else -1
         new_frame = seq != self._last_drawn_seq
-        level_moved = abs(self.g - self._last_drawn_g) > 0.0005
 
-        # 有新帧或浓度变了就重绘, 并由 render_fps 限速。
-        # **别在这里再问一次"内容变了吗"** —— 帧号本身就只在后端给出新帧时
-        # 才推进, 多一层平均差过滤会把日常的小变化全吞掉, 画面直接冻死。
-        if (level_moved or new_frame) and (now - self._last_draw_req) >= self.render_interval:
+        # ═══════════════════════════════════════════════════════════════
+        # 浓度是否还在动 —— **不能用固定小阈值判断**
+        # ═══════════════════════════════════════════════════════════════
+        # 原来写的是 `abs(self.g - self._last_drawn_g) > 0.0005`。而 g 走的是
+        # 指数缓动 (`g += (target-g)*0.22`): 越接近目标每帧变化越小, 到尾部
+        # 会**小于 0.0005**, 于是被判成"浓度没动" -> 不重绘 -> 动画尾部顿住,
+        # 再突然跳到终值。更糟的是 `_last_drawn_g` 只在**真的重绘时**才更新,
+        # 所以一旦开始跳过, 差值只会越来越小, 可能长时间卡住。
+        # 上游 WindowsDuo 没有这个判据 (每 tick 无条件 update()), 尾段是连续的
+        # —— 这就是"效果远不及上游"的主因。
+        #
+        # 正确判据: 只要 **g 还没追上 target**, 就认为动画在动 (与阈值无关)。
+        # 用"是否已到达目标"代替"变化量 > 常数", 缓动多慢都能画完。
+        settling = abs(self.target - self.g) > 1e-4
+
+        # 有新帧、或浓度尚未追上 target -> 重绘, 并由 render_fps 限速。
+        if (settling or new_frame) and (now - self._last_draw_req) >= self.render_interval:
             self._last_draw_req = now
-            self._last_drawn_g = self.g
             self._last_drawn_seq = seq
             self.update()
 
