@@ -9,6 +9,7 @@
   2) 必须 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) 把自己排除出捕获,
      否则 mss 会截到自己的上一帧, 反馈几帧后收敛成一片纯色。
 """
+import atexit
 import ctypes
 import os
 import time
@@ -27,6 +28,7 @@ import paths
 import wdlog
 
 from .capture import frame_bgr
+from .perfstats import SessionStats, ShowPeriodStats
 from .shader import FS_DUO, VS
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -124,6 +126,27 @@ class GlassOverlay(QOpenGLWidget):
         self._last_kick = 0.0
         self._last_print = 0.0
         self._locked = False
+        # 重绘率统计: 当前显示周期的采样器 + 整个会话的周期摘要 (atexit 汇总)
+        self.perf_stats = SessionStats()
+        self._period_stats = None
+        # 会话结束 (进程正常退出 / Python 层异常冒出) 时输出汇总。挂在
+        # overlay 的构造里, direct/托盘两种启动模式都自动覆盖, 不用往
+        # main.py 的两个 finally 里各塞一份。atexit 保证在解释器退出、
+        # stdout tee 还活着的时候打出最后一条 INFO。
+        # 注意: native 崩溃 (access violation) 时 atexit 不会跑 —— 那种
+        # 场景 Python 侧本来就什么都来不及输出, 是固有限制。
+        atexit.register(self._atexit_stats)
+
+    def _atexit_stats(self):
+        try:
+            # 退出瞬间玻璃层还开着的话, 先把进行中的周期收掉, 别丢最后一个
+            if self._period_stats is not None:
+                self.hideEvent(None)
+            rep = self.perf_stats.report()
+            if rep is not None:
+                wdlog.log.info(rep.replace("\n", "\n  "), tag="perf")
+        except Exception:  # noqa: BLE001  退出路径上统计绝不能挡进程收尾
+            pass
 
         # 渲染参数全部收进 apply_config(), 这样设置窗口改完能就地生效
         self.idle_hide = 0.004
@@ -261,6 +284,10 @@ class GlassOverlay(QOpenGLWidget):
         # 让 _visible 跟着真实可见性走: main 里已经 show() 过一次, 若初值仍为
         # False, 首次 tick 就不会把浓度 0 的玻璃层收起来, 卡顿依旧。
         self._visible = True
+        # 新显示周期开始。用 showEvent 而不是 tick 里的 _visible 翻转来收口:
+        # controller 有 3 处直接 hide() 不经过 tick (换屏/预热/退出), 只看
+        # _visible 会把那些周期的尾巴漏掉。
+        self._period_stats = ShowPeriodStats()
 
         # 坑 2: 把自己从屏幕捕获中排除, 否则截图会抓到上一次的渲染结果
         if not getattr(self, "_no_exclude", False):
@@ -278,6 +305,21 @@ class GlassOverlay(QOpenGLWidget):
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.tick)
         self.timer.start(self._tick_ms())
+
+    def hideEvent(self, _ev):
+        """每次玻璃层隐藏时输出本周期重绘率统计 (INFO)。
+
+        hideEvent 拦得住所有隐藏路径: tick 的空闲隐藏、controller 直接调
+        hide() (换屏/预热/退出)、以及退出时窗口销毁。预热那种 show->hide
+        间隔 <0.1s 的周期采不到样本, summary_line 返回 None, 不打日志。
+        """
+        self._visible = False
+        ps, self._period_stats = self._period_stats, None
+        if ps is not None:
+            line = ps.summary_line()
+            if line is not None:
+                wdlog.log.info(line, tag="perf")
+            self.perf_stats.add_period(ps)
 
     def closeEvent(self, ev):
         try:
@@ -838,7 +880,10 @@ class GlassOverlay(QOpenGLWidget):
             self._last_draw_req = now
             self._last_drawn_g = self.g
             self._last_drawn_seq = seq
+            self._update_req_count = getattr(self, "_update_req_count", 0) + 1
             self.update()
+
+        self._perf_check()
 
         if LOCK_AT_CLOSE and self.g > 0.985 and not self._locked:
             self._locked = True
@@ -848,6 +893,112 @@ class GlassOverlay(QOpenGLWidget):
 
         self._pump_debug_window()
         self._print_status(name, status, detail)
+
+    # ------------------------------------------------------------ 性能监控
+    # 重绘率监控的取样窗口: 窗口太短会被单个卡顿帧骗到, 太长则问题出现后
+    # 要等很久才报警。2s 折中 —— 与 _paint_rate 的 0.5s 最小窗口错开, 保证
+    # 每个监控窗口至少拿到 4 次真实的速率采样。
+    _PERF_WINDOW = 2.0
+    #: 重绘率的硬下限: 低于它直接报警 (用户可感知的卡顿)。
+    _PERF_MIN_RATE = 15.0
+    #: "明显下降"的判定: 比稳定基线掉这么多倍就算。基线是历史上较好的
+    #: 重绘率 (指数滑动平均, 只往上缓慢跟随), 0.6 倍意味着掉了 40% ——
+    #: 定太高 (如 0.8) 会被正常抖动反复触发。
+    _PERF_DROP_RATIO = 0.6
+    #: 报警后的冷却时间: 问题持续存在时不要每 2s 刷一条 WARN 刷屏。
+    #: 30s 足够用户读完日志并采取行动, 也不会漏掉"又恶化了一档"。
+    _PERF_COOLDOWN = 30.0
+
+    def _perf_check(self):
+        """重绘率性能监控: 每 _PERF_WINDOW 秒评估一次, 明显下降或低于
+        _PERF_MIN_RATE 时打 WARN, 尽量带齐诊断信息。
+
+        重绘率偏低的可能原因, 按链路从上游到下游:
+          1. 采集端没出新帧 (桌面静止 / 后端挂了) —— 看 seq 是否推进;
+          2. 采集太慢 (后端单帧耗时高, 如 mss 回退) —— 看 capturer.last_ms;
+          3. tick 定时器被饿死 (主线程被别的活拖住) —— 看 tick 间隔;
+          4. render_fps 限速本身 —— rate 接近 render_fps 就不是故障;
+          5. paintGL 排队但没执行 —— 用"请求重绘次数 vs 实际绘制次数"区分。
+        WARN 日志把这五个维度全部带上, 一条日志就能定位是哪一环。
+        """
+        now = time.time()
+        window = now - getattr(self, "_perf_t", None) if getattr(self, "_perf_t", None) else 0.0
+        if window < self._PERF_WINDOW:
+            return
+        self._perf_t = now
+
+        # 本窗口内的计数快照 (与上次相比的增量)
+        paints = self._paint_count - getattr(self, "_perf_p0", self._paint_count)
+        ticks = self._tick_count - getattr(self, "_perf_k0", self._tick_count)
+        updates = getattr(self, "_update_req_count", 0) - getattr(self, "_perf_u0", 0)
+        self._perf_p0 = self._paint_count
+        self._perf_k0 = self._tick_count
+        self._perf_u0 = getattr(self, "_update_req_count", 0)
+
+        # 只监控玻璃层真正显示的时段: 隐藏时空转, 重绘率天然是 0, 不是故障。
+        if not self._visible:
+            self._perf_good = None          # 换个显示周期, 基线重新建立
+            return
+
+        rate = paints / window
+        cap = self.render_fps if self.render_fps > 0 else 0.0
+        # 基线: 显示周期内见过的最好速率的平滑值。None = 还没建立。
+        base = self._perf_good
+        if base is None or rate > base:
+            self._perf_good = base = rate if base is None else min(base * 1.05, rate)
+
+        too_low = rate < self._PERF_MIN_RATE
+        dropped = (base is not None and base >= self._PERF_MIN_RATE
+                   and rate < base * self._PERF_DROP_RATIO)
+        if not (too_low or dropped):
+            return
+        # 贴着上限跑 = 限速生效, 不是故障; 只在"应该更快却没跑到"时报警。
+        if cap > 0 and rate >= cap * 0.85:
+            return
+        if now - getattr(self, "_perf_warn_t", 0.0) < self._PERF_COOLDOWN:
+            return
+        self._perf_warn_t = now
+
+        # ---- 诊断信息: 一条 WARN 说清整条链路 ----
+        frame = self.capturer.latest()
+        seq = frame[3] if frame else -1
+        seq_stalled = (seq != -1 and seq == self._last_drawn_seq)
+        try:
+            cap_ms = self.capturer.last_ms
+            cap_rate = self.capturer.rate_hz
+            backend = self.capturer.backend
+        except Exception:  # noqa: BLE001
+            cap_ms, cap_rate, backend = -1.0, -1.0, "?"
+        tick_gap = window / max(1, ticks)          # 平均 tick 周期
+        # 请求了 update() 但 paintGL 没跑: >2 说明主线程/GL 排队堵了;
+        # ≈0 而 rate 低, 说明根本没请求几次 (上游没新帧或 tick 饿死)。
+        update_backlog = updates - paints
+
+        why = []
+        if seq_stalled:
+            why.append("采集无新帧(seq停在同一值, 桌面静止或采集挂了)")
+        elif cap_rate >= 0 and cap_rate < 5:
+            why.append("截屏速率极低")
+        if cap_ms > 8.0:
+            why.append("后端单帧耗时%.1fms过高" % cap_ms)
+        if update_backlog > 2:
+            why.append("update排队未执行(主线程或GL阻塞)")
+        elif updates <= 1:
+            why.append("tick几乎没请求重绘(tick被饿死或上游无变化)")
+        if not why:
+            why.append("原因不明, 对照各分项排查")
+
+        wdlog.log.warn(
+            "重绘率偏低: %.1f/s (%s, 基线%.1f/s) | 上限%.0f/s 截屏%.1f/s 后端%s "
+            "单帧%.1fms seq=%d%s tick周期%.1fms 请求重绘%d 实际绘制%d(积压%d) "
+            "浓度%.0f%% dpr=%.1f 分辨率%dx%d"
+            % (rate, "低于15下限" if too_low else "比基线明显下降",
+               base if base is not None else 0.0,
+               cap, cap_rate, backend, cap_ms, seq,
+               " seq停滞!" if seq_stalled else "",
+               tick_gap * 1000.0, updates, paints, update_backlog,
+               self.g * 100.0, self.devicePixelRatioF(),
+               self.width(), self.height()), tag="perf")
 
     def _paint_rate(self):
         """每秒真正重绘了几次 —— 用来判断是不是在无谓地满帧空转。"""
@@ -869,6 +1020,11 @@ class GlassOverlay(QOpenGLWidget):
         if now - self._last_print < 0.1:
             return
         self._last_print = now
+        # 周期重绘率采样: 0.1s 一次快照, 正好与节流同频; O(1) 内存, 长期
+        # 挂机也不涨 (见 perfstats.py 顶部说明)。只在可见时采 —— 空转期为 0
+        # 会把"最差/p1"污染成 0。
+        if self._visible and self._period_stats is not None:
+            self._period_stats.add(self._paint_rate())
 
         bits = ["[%s]" % LABELS.get(name, name)]
         if detail:
