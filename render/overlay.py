@@ -97,6 +97,20 @@ def _display_width(s):
     return w
 
 
+def _stdout_is_tty():
+    """stdout 是不是**真终端**? (重定向到日志文件时返回 False)
+
+    状态行靠 `\\r` 原地覆盖。这只在真终端里成立 —— **写进文件时 `\\r` 只是个
+    字符, 不会覆盖任何东西**, 于是每次刷新都在日志里追加一整行, 变成大段
+    重复 (实测 130 次 \\r -> 日志 130 行一样的"未标定")。
+    所以要分开处理: 终端用 `\\r` 实时刷新, 文件只在**状态变化**时打一行。
+    """
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _console_columns(default=80):
     """当前控制台窗口宽度 (列)。取不到就返回 default。
 
@@ -490,6 +504,9 @@ class GlassOverlay(QOpenGLWidget):
 
     def paintGL(self):
         self._paint_count = getattr(self, "_paint_count", 0) + 1
+        # 第一帧的时刻: `_paint_rate()` 首秒要用它算平均 (否则显示 0/s, 见那里)
+        if not hasattr(self, "_count_t"):
+            self._count_t = time.time()
         if not getattr(self, "_gl_ready", False):
             return
         dpr = self.devicePixelRatioF()
@@ -940,12 +957,24 @@ class GlassOverlay(QOpenGLWidget):
         self._print_status(name, status, detail)
 
     def _paint_rate(self):
-        """每秒真正重绘了几次 —— 用来判断是不是在无谓地满帧空转。"""
+        """每秒真正重绘了几次 —— 用来判断是不是在无谓地满帧空转。
+
+        ⚠️ **首秒要给出真实值, 不能返回 0。** 原来首次调用只记录基线就返回
+        0.0, 且窗口 < 0.5s 时一律返回缓存的 `_rate_v` (初始也是 0)。于是
+        刚启动那几秒状态行一直显示"重绘=0/s", 看着像**根本没在画** —— 实际
+        已经在 62/s 满速跑了 (实测 paintGL 计数)。这里改成: 首次也用"从窗口
+        建立到现在的平均"给出估计, 不留 0。
+        """
         now = time.time()
         cnt = getattr(self, "_paint_count", 0)
         last_t = getattr(self, "_rate_t", None)
         if last_t is None:
+            # 还没有基线: 用"进程内首帧到现在的平均"近似。_count_t 在
+            # paintGL 第一次运行时打点 (见 paintGL)。
+            t0 = getattr(self, "_count_t", None)
             self._rate_t, self._rate_n = now, cnt
+            if t0 is not None and now > t0:
+                return cnt / (now - t0)
             return 0.0
         dt = now - last_t
         if dt < 0.5:
@@ -1035,5 +1064,20 @@ class GlassOverlay(QOpenGLWidget):
                 w += cw
             line = "".join(out) + "…" + tail
 
-        # 行尾补空格: 覆盖上一次更长的那行残影
-        print("\r" + line + " " * 4, end="", flush=True)
+        # ═══════════════════════════════════════════════════════════════
+        # 输出方式分两种 —— 关键: `\r` 在**文件里不会覆盖**, 只会在日志中堆成
+        # 一整行一整行的重复 (实测 130 次 \r -> 日志 130 行)。
+        # ═══════════════════════════════════════════════════════════════
+        # 终端 (tty): 用 `\r` 原地刷新状态行, 看着就是一行实时数据。
+        # 非终端 (重定向到日志文件): **不能**用 `\r`。改成只在
+        #   "(阶段/状态) 变化" 时用 `\n` 打一行, 其余时间静默 ——
+        # 这样日志里只留下**有意义的事件** (启动/等待标定/已标定/追踪中/出错),
+        # 而不是每秒几十条一模一样的重复行。
+        state_key = (name, status, self.outside)
+        if _stdout_is_tty():
+            print("\r" + line + " " * 4, end="", flush=True)
+            self._last_state_key = state_key
+            return
+        if state_key != getattr(self, "_last_state_key", None):
+            self._last_state_key = state_key
+            print(line, flush=True)
