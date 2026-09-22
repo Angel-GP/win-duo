@@ -68,7 +68,10 @@ class AppController(QObject):
         self.cfg_path = Path(cfg_path)
         self.control = KeyControl(cfg, auto=(cfg.get("source") != "manual"))
         self.control.start()
-        self.hub = SourceHub(cfg, self.control, autostart=False)
+        # save_cb: camera 模块记住"这个 index 成功的后端"后要立刻落盘
+        # (下次启动就用), 不能等用户改设置才存。
+        self.hub = SourceHub(cfg, self.control, autostart=False,
+                             save_cb=self.save)
         self.capture = make_capture(
             monitors.region_for(self.screen()), cfg,
             display_hz=self.screen().refreshRate())

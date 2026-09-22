@@ -62,7 +62,6 @@
 一套。角度 -> level 的映射 (angle_to_level) 是**产品参数** (SCALE/SIGN 的手感),
 不是算法核心。
 """
-import json
 import threading
 import time
 from pathlib import Path
@@ -189,42 +188,53 @@ def _drain_frames(cap, n):
 # 最前面并给出冻结帧**。于是在这类机器上, 每次打开摄像头都要先"打开虚拟摄像头
 # -> 丢 30 帧 -> 检测到冻结 -> dump 一张 -> release", 再轮到真摄像头。
 #
-# 修法: 把**每个 index 上次真正成功的后端**记到一个小状态文件, 下次 auto 时把它
-# 排到最前, 直接命中真摄像头; 它若失败(拔了/换了设备)再退回完整列表。
-# 状态文件跟 config 放一起 (<数据目录>/diagnostics/config/camera_backend.json)。
-def _state_path():
-    if paths is None:
-        return None
-    try:
-        return paths.config_file("camera_backend.json")
-    except Exception:  # noqa: BLE001
-        return None
+# 修法: 把**每个 index 上次真正成功的后端**记下来, 下次 auto 时把它排到最前,
+# 直接命中真摄像头; 它若失败(拔了/换了设备)再退回完整列表。
+#
+# 存在哪: **config.json 的 `camera_backend_map` 键** (形如 {"0": "msmf"})。
+# 起初为了"不污染用户配置"单独放了个 camera_backend.json, 但那个文件只有几个
+# 字节, 却要多维护一套路径/读写/损坏兜底 —— 而且用户在 config 里根本看不到它。
+# 合并进 config 后: 少一个文件, 用户也能直接看到/清掉它。
+#
+# `_CFG_REF` 由上层 (`angles/hub.py` 建摄像头源时) 灌进来。没有它时(比如
+# 独立的命令行自检)退化成"不记忆", 功能不受影响, 只是每次重新探测。
+_CFG_REF = None
+#: 写盘回调 (保存 config)。上层灌进来; 为 None 时只改内存不落盘。
+_SAVE_CB = None
+
+
+def bind_config(cfg, save_cb=None):
+    """把 config 字典接进来 —— 之后 `camera_backend_map` 读写都走它。
+
+    `save_cb` 是"把 config 落盘"的回调 (controller.save); 不传就只改内存。
+    """
+    global _CFG_REF, _SAVE_CB
+    _CFG_REF = cfg
+    _SAVE_CB = save_cb
 
 
 def _load_good_backends():
-    p = _state_path()
-    if p is None or not p.exists():
+    """读 {index(str): 后端名}。没有/类型不对时返回空 dict。"""
+    if _CFG_REF is None:
         return {}
-    try:
-        d = json.loads(p.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:  # noqa: BLE001  坏了就当没有
-        return {}
+    d = _CFG_REF.get("camera_backend_map")
+    return dict(d) if isinstance(d, dict) else {}
 
 
 def _remember_backend(index, backend):
     """记住某 index 成功的后端 (供下次 auto 优先)。失败静默。"""
-    p = _state_path()
-    if p is None:
+    if _CFG_REF is None:
         return
     try:
         d = _load_good_backends()
         if d.get(str(index)) == backend:
-            return
+            return                       # 没变 -> 不写盘 (省 I/O)
         d[str(index)] = backend
-        p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n",
-                     encoding="utf-8")
-    except Exception:  # noqa: BLE001
+        _CFG_REF["camera_backend_map"] = d
+        # 立刻落盘: 这次"成功"的结论下次启动就要用, 不能等用户改设置才存。
+        if callable(_SAVE_CB):
+            _SAVE_CB()
+    except Exception:  # noqa: BLE001  静默, 别让记忆失败影响采集
         pass
 
 

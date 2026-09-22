@@ -307,6 +307,11 @@ DEFAULT_CFG = {
     "screen_index": 0,
     "camera_index": 0,
     "camera_backend": "auto",
+    #: 每个摄像头 index **上次真正成功的后端** (形如 {"0": "msmf"})。
+    #: auto 时把它排到最前, 直接命中真摄像头, 免得每次都先撞上 dshow 下的
+    #: 虚拟摄像头。**由程序自己维护** (打开成功时写入), 用户一般不用改;
+    #: 想让它重新探测就删掉这个键 (或整个 config)。
+    "camera_backend_map": {},
     "camera_scale": 1.1,
     "camera_sign": -1,
     "port": "COM3",
@@ -333,6 +338,24 @@ DEFAULT_CFG = {
     "autocal_on_glass_open": True,
     "low_memory_mode": False,
 }
+
+
+def _save_cfg(cfg):
+    """把当前 cfg 存回磁盘 (原子写)。给"运行中自己更新了配置"的地方用 ——
+    比如 camera 模块记住某个 index 成功的后端 (`camera_backend_map`),
+    那个结论**下次启动就要用**, 不能等用户在设置里改点什么才落盘。
+
+    路径从 `cfg["_cfg_path"]` 取 (load_config 放进去的), 所以调用点不用
+    再传一路 cfg_path —— 那些函数 (selftest / run_direct) 签名里都没有它。
+    """
+    cfg_path = cfg.get("_cfg_path")
+    if cfg_path is None:
+        return
+    try:
+        clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
+        _write_json_atomic(cfg_path, clean)
+    except Exception as exc:  # noqa: BLE001  存不上不该影响运行
+        wdlog.log.warn("保存 config 失败: %s" % exc, tag="config")
 
 
 def _write_json_atomic(cfg_path, data):
@@ -423,6 +446,15 @@ def _seed_autostart_once(controller):
 def load_config(path=None):
     cfg_path = config_path(path)
     _seed_config_if_missing(cfg_path)
+    # 记住"这份配置存在哪个文件" —— 运行中需要**自己落盘**的地方要用
+    # (camera 记住某个 index 成功的后端 -> camera_backend_map)。
+    # `_` 前缀的键不会被写进文件 (save() / _save_cfg 里都会过滤掉)。
+    # **在开头就注入**: 下面有几条 return 分支 (文件读不到 / 解析失败),
+    # 只在末尾注入的话那些分支就拿不到路径了 (实测踩过)。
+    def _done(c):
+        c["_cfg_path"] = cfg_path
+        return c
+
     # utf-8-sig: 用记事本/PowerShell 5.1 编辑过的 json 可能带 BOM,
     # 用 utf-8 读会直接抛 "Unexpected UTF-8 BOM"
     try:
@@ -433,7 +465,7 @@ def load_config(path=None):
         # 让程序**能起来**, 总好过闪一下就没了 —— 起来以后用户能在设置里改,
         # 也能看到日志里的原因。
         wdlog.log.warn("读不到 %s, 本次用内置默认值运行" % cfg_path, tag="config")
-        return dict(DEFAULT_CFG)
+        return _done(dict(DEFAULT_CFG))
     except (json.JSONDecodeError, OSError) as exc:
         # 文件被写坏了 (空文件 / 手工改错 / 写一半断电)。**不静默吞掉** ——
         # 把坏文件留个备份再重建, 用户还能找回自己改过的内容。
@@ -448,11 +480,11 @@ def load_config(path=None):
             _write_json_atomic(cfg_path, DEFAULT_CFG)
         except Exception:  # noqa: BLE001
             pass
-        return dict(DEFAULT_CFG)
+        return _done(dict(DEFAULT_CFG))
     # 配置缺键时用内置默认值补齐 (老版本的 config 缺少新加的键很常见)
     for k, v in DEFAULT_CFG.items():
         cfg.setdefault(k, v)
-    return cfg
+    return _done(cfg)
 
 
 def apply_args(cfg, args):
@@ -566,7 +598,7 @@ def selftest(cfg):
 
     wdlog.log.info("启动角度源与截屏...", tag="selftest")
     control = KeyControl(cfg, auto=False)
-    hub = SourceHub(cfg, control)
+    hub = SourceHub(cfg, control, save_cb=lambda: _save_cfg(cfg))
 
     cap = make_capture(region, cfg, display_hz=screen.refreshRate())
     cap.start()
@@ -630,7 +662,7 @@ def run_direct(cfg, smoke=False, seconds=0.0, level=None):
 
     control = KeyControl(cfg, auto=(cfg["source"] != "manual"))
     control.start()
-    hub = SourceHub(cfg, control)
+    hub = SourceHub(cfg, control, save_cb=lambda: _save_cfg(cfg))
 
     cap = make_capture(region, cfg, display_hz=screen.refreshRate())
     cap.start()

@@ -16,14 +16,18 @@ LABELS = {
 
 
 class SourceHub:
-    def __init__(self, cfg, control, autostart=True):
+    def __init__(self, cfg, control, autostart=True, save_cb=None):
         """autostart=False 时不立刻打开设备 —— 托盘模式下玻璃层默认关着,
         没必要一开机就把摄像头占住、白白烧 CPU。等用户真的开启玻璃层再 start_active()。
+
+        `save_cb`: 把 config 落盘的回调。camera 模块记住"这个 index 成功的后端"
+        后要用它立刻保存 (下次启动就要用), 不能等用户改设置才存。
         """
         self.cfg = cfg
         self.control = control
         self._sources = {}
         self._started = set()
+        self._save_cb = save_cb
 
         name = cfg.get("source", "camera")
         if name not in ORDER:
@@ -47,7 +51,11 @@ class SourceHub:
             # 一辈子不碰 cv2。首次导入是主线程同步做的 (几百 ms), 不在采集
             # 线程热路径上, 也没有 import lock 撞车问题 (见 overlay 热路径
             # 注释的反例 —— 那是"绘制回调里 import", 这里是"启动源时 import")。
-            from .camera import CameraAngleSource
+            from .camera import CameraAngleSource, bind_config
+            # 把 config 接给 camera 模块 —— `camera_backend_map` (记住每个
+            # index 成功用的后端) 存在 config.json 里, 而**扫描线程**也要读它
+            # (它不走 CameraAngleSource, 拿不到 cfg), 所以走模块级绑定。
+            bind_config(self.cfg, self._save_cb)
             return CameraAngleSource(self.cfg)
         if name == "serial":
             return SerialAngleSource(self.cfg)

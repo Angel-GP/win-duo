@@ -205,69 +205,18 @@ def _monitor_index_for(origin, size):
     return None
 
 
-_STATE_PATH = None
-#: "上次成功的采集后端"的**内存缓存**。
-#: `remember_capture_backend()` 在每次成功抓帧时都被调用 (WGC/DXGI 两条路径),
-#: 玻璃层显示时最高 ~140 帧/秒 —— 若每次都去 `read_text` + `json.loads` 判"值
-#: 变没变", 就是采集线程里每秒 140 次同步磁盘读, 纯白烧 I/O。这里缓存住,
-#: 只有**值真的变化**时才写盘。`_STATE_LOADED` 区分"没读过"和"读过但没有值"。
-_STATE_CACHE = None
-_STATE_LOADED = False
-
-
-def _backend_state_path():
-    global _STATE_PATH
-    if _STATE_PATH is None:
-        try:
-            _STATE_PATH = paths.config_file("capture_backend.json")
-        except Exception:  # noqa: BLE001
-            return None
-    return _STATE_PATH
-
-
-def load_good_capture_backend():
-    """读"上次成功的后端"。**带内存缓存** —— 第一次读盘, 之后走缓存。"""
-    global _STATE_CACHE, _STATE_LOADED
-    if _STATE_LOADED:
-        return _STATE_CACHE
-    p = _backend_state_path()
-    val = None
-    if p is not None and p.exists():
-        try:
-            val = str(json.loads(p.read_text(encoding="utf-8")).get("backend")
-                      or "") or None
-        except Exception:  # noqa: BLE001  坏了就当没有
-            val = None
-    _STATE_CACHE = val
-    _STATE_LOADED = True
-    return val
-
-
-def remember_capture_backend(name):
-    """记住成功的后端。**只在值变化时写盘** (热路径零 I/O)。"""
-    global _STATE_CACHE, _STATE_LOADED
-    if _STATE_LOADED and _STATE_CACHE == name:
-        return                          # 热路径: 命中缓存, 直接返回 (不碰磁盘)
-    p = _backend_state_path()
-    if p is None:
-        return
-    try:
-        if load_good_capture_backend() == name:
-            return
-        p.write_text(json.dumps({"backend": name}, ensure_ascii=False) + "\n",
-                     encoding="utf-8")
-        _STATE_CACHE = name
-        _STATE_LOADED = True
-    except Exception:  # noqa: BLE001  静默, 别让记忆失败影响采集
-        pass
+# 注: 这里曾有一套"记住上次成功的采集后端"(`capture_backend.json` + 内存缓存)。
+# 现在 auto 的决策改成**黑名单** (只记"打不开的", 见下面 _load_bad_backends),
+# 因为"上次成功的"会把一次偶发失败(比如某次 WGC 起不来回退到 dxgi)**永久
+# 记成首选**, 之后再也不试更优的后端。改完之后 `load_good_capture_backend()`
+# 就只剩自己在读自己写的文件, 成了**死文件** —— 已删除, 连带那个
+# `capture_backend.json` 也不再生成。
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # "哪些后端已知不可用" —— auto 模式用它跳过, 而不是把次优的记成首选
 # ═══════════════════════════════════════════════════════════════════════
-# 与上面的"记住成功的后端"是**两回事**:
-#   - remember_capture_backend: "上次成功的" (仅参考)
-#   - 这里: "上次**失败**的" -> auto 时直接跳过, 免得每次启动都要等它超时。
+# 这里记的是"上次**失败**的" -> auto 时直接跳过, 免得每次启动都要等它超时。
 # 语义上这是**黑名单**, 只记"打不开"的后端; 一旦它某次打开成功就立刻移除。
 _BAD_CACHE = None
 
@@ -901,7 +850,6 @@ class CaptureWorker(threading.Thread):
                 self.last_ms = elapsed if self.last_ms <= 0 else \
                     self.last_ms * 0.8 + elapsed * 0.2
                 self.frames_in += 1
-                remember_capture_backend("wgc")
                 return self._store(arr, arr.shape[1], arr.shape[0], seq + 1, "BGRA")
             # 没帧 = 这一瞬没有新帧
             if self.frame is None:
@@ -920,7 +868,6 @@ class CaptureWorker(threading.Thread):
                 self.last_ms = elapsed if self.last_ms <= 0 else \
                     self.last_ms * 0.8 + elapsed * 0.2
                 self.frames_in += 1
-                remember_capture_backend(self._dxgi.name)
                 return self._store(arr, arr.shape[1], arr.shape[0], seq + 1, "BGRA")
             # 没帧 = 这一瞬没有新帧
             if self.frame is None:
