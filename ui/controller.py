@@ -71,6 +71,13 @@ class AppController(QObject):
             monitors.region_for(self.screen()), cfg,
             display_hz=self.screen().refreshRate())
         self.capture.start()
+        # **等它真的打开**再往下走 (几十毫秒), 这样 `capture.backend` 一开始
+        # 就是准确的 —— 否则界面会有一段时间显示"?"(用户看到的就是"后端未知")。
+        # 失败也不挡启动: 采集线程自己会退回 mss。
+        try:
+            self.capture.open_now(timeout=6.0)
+        except Exception as exc:  # noqa: BLE001
+            print("[capture] 启动时等待后端打开超时: %s" % exc)
         self.overlay = None
         self.glass_on = False
         self._scan_was_running = False
@@ -160,6 +167,77 @@ class AppController(QObject):
             self.hotkeys.release()
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------ 采集后端
+    def set_capture_backend(self, backend):
+        """切换采集后端 (auto / wgc / dxgi / mss) —— **立即生效, 不用重启**。
+
+        做法: 停掉旧采集线程 -> 按新后端建一个 -> **等它真的打开** -> 把
+        overlay 的引用指过去。
+
+        为什么要等打开: `_open()` 是在采集线程里懒调的, start() 返回时
+        `backend` 还是 "?"。不等的话就没法告诉用户"成没成、实际用的是哪个",
+        而且手动选了个不可用的后端也会**静默失败**。
+
+        失败时**回滚**到原来的后端 (不能让用户点了下拉框却用不了)。
+        """
+        backend = str(backend or "auto")
+        old_backend = str(self.cfg.get("capture_backend", "auto"))
+        if backend == old_backend:
+            return True
+        # 先校验名字合法 (免得建了线程才发现是拼错的)
+        if backend not in ("auto", "wgc", "dxgi", "mss"):
+            print("[capture] 未知后端 %r" % backend)
+            self.notified.emit("未知采集后端: %s" % backend)
+            return False
+
+        self.cfg["capture_backend"] = backend
+        old = self.capture
+        try:
+            old.stop()
+            screen = self.screen()
+            new = make_capture(monitors.region_for(screen), self.cfg,
+                               display_hz=screen.refreshRate())
+            new.start()
+            actual = new.open_now(timeout=6.0)      # 等它真打开 (失败会抛)
+            self.capture = new
+            # overlay 每帧从 capturer 取帧; 换对象后要重新指过去, 并让它
+            # 重传第一帧 (尺寸/来源都可能变了)。
+            if self.overlay is not None:
+                self.overlay.capturer = new
+                self.overlay._uploaded_seq = -1
+                self.overlay._last_drawn_seq = -1
+                self.overlay.apply_config()
+            self.save()
+            print("[capture] 已切换后端 %s -> %s (实际在用 %s)"
+                  % (old_backend, backend, actual))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print("[capture] 切换后端失败 (%s -> %s): %s"
+                  % (old_backend, backend, exc))
+            # **回滚**: 恢复旧配置, 并把旧后端的采集重新建起来 —— 否则
+            # 用户点了一下失败的下拉项, 采集就彻底没了。
+            self.cfg["capture_backend"] = old_backend
+            try:
+                self.capture = make_capture(
+                    monitors.region_for(self.screen()), self.cfg,
+                    display_hz=self.screen().refreshRate())
+                self.capture.start()
+                if self.overlay is not None:
+                    self.overlay.capturer = self.capture
+                    self.overlay._uploaded_seq = -1
+                    self.overlay._last_drawn_seq = -1
+                    self.overlay.apply_config()
+                self.capture.open_now(timeout=6.0)
+            except Exception as exc2:  # noqa: BLE001
+                print("[capture] 回滚也失败: %s" % exc2)
+            self.notified.emit("切换采集后端失败: %s" % exc)
+            return False
+
+    def capture_backend(self):
+        """当前采集后端的说明 (给界面显示)。"""
+        name = self.capture.backend if self.capture is not None else "?"
+        return name
 
     # ------------------------------------------------------------ 显示器
     def screen(self):

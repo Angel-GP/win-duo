@@ -182,6 +182,8 @@ class SettingsPanel(QWidget):
         self.sw_autoglass.checkedChanged.connect(self._on_autoglass)
         self.sw_autostart.checkedChanged.connect(self._on_autostart)
         self.sw_lowmem.checkedChanged.connect(self._on_lowmem)
+        self.cmb_capture_backend.currentIndexChanged.connect(
+            self._on_capture_backend)
         for box in self._inputs.values():
             box.changed.connect(self._on_effect)
 
@@ -406,6 +408,23 @@ class SettingsPanel(QWidget):
         self.sw_lowmem.setOffText("关")
         l3.addWidget(self._labeled("低内存模式", self.sw_lowmem))
 
+        # ── 采集后端 ─────────────────────────────────────────────────
+        # 三种抓屏方式性能差很多 (实测: wgc ~0.5ms/帧 < dxgi ~1.1ms <<
+        # mss ~27ms), 所以默认 auto 让系统挑最优; 想强制某个后端 (排查问题时
+        # 对比行为) 就在这里选。**改完立即生效**, 不用重启。
+        self.cmb_capture_backend = ComboBox()
+        try:
+            from render.capture import available_backends
+            for label, val in available_backends():
+                self.cmb_capture_backend.addItem(label, val)
+        except Exception:  # noqa: BLE001
+            for val in ("auto", "wgc", "dxgi", "mss"):
+                self.cmb_capture_backend.addItem(val, val)
+        l3.addWidget(self._labeled("采集后端", self.cmb_capture_backend))
+        self.lbl_capture_state = CaptionLabel("")
+        self.lbl_capture_state.setObjectName("hint")
+        l3.addWidget(self.lbl_capture_state)
+
         # ── 键盘模式 (调试功能) ──────────────────────────────────────
         # **键盘模式的快捷键本质就是调试功能**: 它只在"键盘手动"角度源下
         # 才注册, 用来在没有摄像头/陀螺仪时手动拉浓度、开调试窗。所以整块
@@ -519,6 +538,8 @@ class SettingsPanel(QWidget):
             self.sw_autoglass.setChecked(bool(self.cfg.get("autostart_glass", True)))
             self.sw_autostart.setChecked(autostart.is_enabled())
             self.sw_lowmem.setChecked(bool(self.cfg.get("low_memory_mode", False)))
+            self._sync_capture_combo()
+            self._refresh_capture_state()
         finally:
             self._loading = False
         self._refresh_status()
@@ -799,6 +820,8 @@ class SettingsPanel(QWidget):
         # 白做功。隐藏时直接返回, 再显示时 refresh_all/下一次 tick 会补上。
         if not self.isVisible():
             return
+        # 实际在用的采集后端可能变 (auto 重试 / 回退), 顺手刷新那行说明
+        self._refresh_capture_state()
         try:
             level, name, status, detail = self.controller.hub.resolve()
         except Exception:  # noqa: BLE001
@@ -1070,6 +1093,44 @@ class SettingsPanel(QWidget):
         self.cfg["low_memory_mode"] = bool(checked)
         self.controller.save()
         self.controller.apply_low_memory_mode()
+
+    def _on_capture_backend(self, _idx):
+        """采集后端下拉框变了 -> 立即切换 (不用重启)。"""
+        if self._loading:
+            return
+        val = self.cmb_capture_backend.currentData()
+        if not val:
+            return
+        ok = self.controller.set_capture_backend(val)
+        self._refresh_capture_state()
+        if not ok:
+            # 切失败 (比如手动选了 wgc 但这台机器不支持) -> 把下拉框退回原值,
+            # 免得界面显示的和实际在用的不一致。
+            self._loading = True
+            try:
+                self._sync_capture_combo()
+            finally:
+                self._loading = False
+
+    def _sync_capture_combo(self):
+        """把下拉框设成 cfg 里的值 (不发信号)。"""
+        cur = str(self.cfg.get("capture_backend", "auto"))
+        i = self.cmb_capture_backend.findData(cur)
+        if i >= 0:
+            self.cmb_capture_backend.setCurrentIndex(i)
+
+    def _refresh_capture_state(self):
+        """显示"当前实际在用的后端" —— 与下拉框的选择可能不同 (auto 时由系统定)。"""
+        if getattr(self, "lbl_capture_state", None) is None:
+            return
+        want = str(self.cfg.get("capture_backend", "auto"))
+        actual = self.controller.capture_backend()
+        if want == "auto":
+            self.lbl_capture_state.setText(
+                "auto —— 系统自动挑选最优; 当前实际在用: %s" % actual)
+        else:
+            self.lbl_capture_state.setText(
+                "手动指定 %s; 当前实际在用: %s" % (want, actual))
 
     def _open_log_dialog(self):
         dlg = LogDialog(self)
