@@ -18,6 +18,8 @@ from ctypes import wintypes
 from PyQt6.QtCore import QAbstractNativeEventFilter, QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
+import wdlog
+
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -105,7 +107,7 @@ class HotkeyManager(QObject):
     def register(self, spec, name):
         mods, vk = parse_hotkey(spec)
         if mods is None:
-            print("[hotkey] %r 解析失败" % spec)
+            wdlog.log.warn("%r 解析失败" % spec, tag="hotkey")
             return False
         hid = self._next_id
         # hwnd=NULL: WM_HOTKEY 投递到线程消息队列, 由 native event filter 接

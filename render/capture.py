@@ -40,6 +40,7 @@ import mss
 import numpy as np
 
 import paths
+import wdlog
 
 
 def ensure_dpi_aware():
@@ -353,8 +354,8 @@ class _WgcSource:
         # 还截主屏" (与 _DxgiSource 的 origin 消歧同一bug, 见它的注释)。
         idx = _monitor_index_for(origin, (self.w, self.h))
         if idx is not None:
-            print("[capture] WGC 选屏: origin=%s -> monitor_index=%d"
-                  % (origin, idx))
+            wdlog.log.debug("WGC 选屏: origin=%s -> monitor_index=%d"
+                            % (origin, idx), tag="capture")
         self.cap = WindowsCapture(cursor_capture=False, draw_border=False,
                                   monitor_index=idx)
         self._latest = None
@@ -386,8 +387,8 @@ class _WgcSource:
             # 只警告一次, 防止每帧刷屏。
             if not self._warned_size:
                 self._warned_size = True
-                print("[capture] WGC 帧尺寸 %dx%d != 预期 %dx%d (DPI 虚拟化?), "
-                      "按实际尺寸用" % (fw, fh, self.w, self.h))
+                wdlog.log.warn("WGC 帧尺寸 %dx%d != 预期 %dx%d (DPI 虚拟化?), "
+                               "按实际尺寸用" % (fw, fh, self.w, self.h), tag="capture")
             self.w, self.h = fw, fh
         return arr
 
@@ -524,8 +525,8 @@ class _DxgiSource:
             self.errors += 1
             if self.errors >= self.MAX_ERRORS:
                 raise
-            print("[capture] DXGI 抓帧出错 (%d/%d), 先当作没有新帧: %s"
-                  % (self.errors, self.MAX_ERRORS, exc))
+            wdlog.log.warn("DXGI 抓帧出错 (%d/%d), 先当作没有新帧: %s"
+                           % (self.errors, self.MAX_ERRORS, exc), tag="capture")
             return None
         self.errors = 0
         return frame
@@ -634,14 +635,15 @@ class CaptureWorker(threading.Thread):
             # 两个 GPU 后端都被记成"不可用" -> 直接 mss
             order = []
         if bad:
-            print("[capture] auto: 跳过上次失败的 %s" % ",".join(sorted(bad)))
+            wdlog.log.debug("auto: 跳过上次失败的 %s" % ",".join(sorted(bad)),
+                            tag="capture")
         for name in order:
             if self._open_one(name, strict=False):
                 return
         # 都不可用 -> mss (唯一的软件兜底, 一定能用)
         self.backend = "mss"
         self._sct = mss.mss()
-        print("[capture] 后端 mss (GDI BitBlt), %dx%d" % self.size)
+        wdlog.log.warn("后端 mss (GDI BitBlt), %dx%d" % self.size, tag="capture")
 
     def _open_one(self, name, strict):
         """尝试打开一个指定后端。成功返回 True 并设好 self.backend。
@@ -652,7 +654,8 @@ class CaptureWorker(threading.Thread):
         if name == "mss":
             self.backend = "mss"
             self._sct = mss.mss()
-            print("[capture] 后端 mss (GDI BitBlt), %dx%d" % self.size)
+            wdlog.log.info("后端 mss (GDI BitBlt), %dx%d" % self.size,
+                           tag="capture")
             return True
         if name == "wgc":
             try:
@@ -660,13 +663,13 @@ class CaptureWorker(threading.Thread):
             except Exception as exc:  # noqa: BLE001
                 if strict:
                     raise RuntimeError("WGC 后端不可用: %s" % exc)
-                print("[capture] WGC 不可用, 回退: %s" % exc)
+                wdlog.log.warn("WGC 不可用, 回退: %s" % exc, tag="capture")
                 _remember_bad_backend("wgc")
                 return False
             self.backend = "wgc"
             _clear_bad_backend("wgc")
-            print("[capture] 后端 wgc (Windows.Graphics.Capture), %dx%d @ 桌面坐标 %s"
-                  % (self.size + (self.origin,)))
+            wdlog.log.info("后端 wgc (Windows.Graphics.Capture), %dx%d @ 桌面坐标 %s"
+                           % (self.size + (self.origin,)), tag="capture")
             return True
         if name == "dxgi":
             try:
@@ -674,14 +677,14 @@ class CaptureWorker(threading.Thread):
             except Exception as exc:  # noqa: BLE001
                 if strict:
                     raise RuntimeError("DXGI 后端不可用: %s" % exc)
-                print("[capture] DXGI 不可用, 回退: %s" % exc)
+                wdlog.log.warn("DXGI 不可用, 回退: %s" % exc, tag="capture")
                 _remember_bad_backend("dxgi")
                 return False
             self.backend = self._dxgi.name
             _clear_bad_backend("dxgi")
-            print("[capture] 后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
-                  % (self._dxgi.name, self._dxgi.output_idx, *self.size,
-                     self.origin))
+            wdlog.log.info("后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
+                           % (self._dxgi.name, self._dxgi.output_idx, *self.size,
+                              self.origin), tag="capture")
             return True
         raise RuntimeError("未知采集后端 %r" % name)
 
@@ -821,7 +824,7 @@ class CaptureWorker(threading.Thread):
                 self._rate_n += 1
                 seq = self._pump_once(seq)
             except Exception as exc:  # noqa: BLE001
-                print("[capture] 抓屏失败: %s" % exc)
+                wdlog.log.error("抓屏失败: %s" % exc, tag="capture")
                 time.sleep(0.05)
             finally:
                 self.busy = False
@@ -860,10 +863,10 @@ class CaptureWorker(threading.Thread):
             try:
                 self._wgc = _WgcSource(size, origin=origin)
                 self.backend = "wgc"
-                print("[capture] 已切到显示器: wgc, %dx%d @ 桌面坐标 %s"
-                      % (size + (origin,)))
+                wdlog.log.info("已切到显示器: wgc, %dx%d @ 桌面坐标 %s"
+                               % (size + (origin,)), tag="capture")
             except Exception as exc:  # noqa: BLE001
-                print("[capture] 换屏后 WGC 重开失败, 退回 mss: %s" % exc)
+                wdlog.log.error("换屏后 WGC 重开失败, 退回 mss: %s" % exc, tag="capture")
                 self.backend = "mss"
                 if self._sct is None:
                     self._sct = mss.mss()
@@ -876,10 +879,10 @@ class CaptureWorker(threading.Thread):
         try:
             self._dxgi = _DxgiSource(size, origin=origin)
             self.backend = self._dxgi.name
-            print("[capture] 已切到显示器: %s output=%d, %dx%d @ 桌面坐标 %s"
-                  % (self._dxgi.name, self._dxgi.output_idx, *size, origin))
+            wdlog.log.info("已切到显示器: %s output=%d, %dx%d @ 桌面坐标 %s"
+                           % (self._dxgi.name, self._dxgi.output_idx, *size, origin), tag="capture")
         except Exception as exc:  # noqa: BLE001
-            print("[capture] 换屏后 DXGI 重开失败, 退回 mss: %s" % exc)
+            wdlog.log.error("换屏后 DXGI 重开失败, 退回 mss: %s" % exc, tag="capture")
             self._drop_dxgi()
 
     def _pump_once(self, seq):
@@ -889,7 +892,7 @@ class CaptureWorker(threading.Thread):
             try:
                 arr = self._wgc.grab()
             except Exception as exc:  # noqa: BLE001
-                print("[capture] WGC 出错, 退回 DXGI/mss: %s" % exc)
+                wdlog.log.error("WGC 出错, 退回 DXGI/mss: %s" % exc, tag="capture")
                 self._wgc.release()
                 self._wgc = None
                 arr = None
@@ -909,7 +912,7 @@ class CaptureWorker(threading.Thread):
             try:
                 arr = self._dxgi.grab()
             except Exception as exc:  # noqa: BLE001
-                print("[capture] DXGI 出错, 退回 mss: %s" % exc)
+                wdlog.log.error("DXGI 出错, 退回 mss: %s" % exc, tag="capture")
                 self._drop_dxgi()
                 arr = None
             if arr is not None:

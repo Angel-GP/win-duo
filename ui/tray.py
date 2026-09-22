@@ -5,6 +5,7 @@
 from PyQt6.QtGui import QAction, QActionGroup
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+import wdlog
 from angles.hub import LABELS
 
 from . import autostart
@@ -74,10 +75,12 @@ class DuoTray(QSystemTrayIcon):
 
     # ------------------------------------------------------------ 交互
     def _pick_source(self, name):
+        wdlog.log.debug("用户操作: 托盘切换角度源 -> %s" % name, tag="tray")
         self.controller.set_source(name)
         self.sync(self.controller.glass_on)
 
     def _toggle_autostart(self, checked):
+        wdlog.log.debug("用户操作: 托盘切换开机自启 -> %s" % checked, tag="tray")
         try:
             autostart.set_enabled(checked)
         except Exception as exc:  # noqa: BLE001
@@ -89,9 +92,11 @@ class DuoTray(QSystemTrayIcon):
     def _on_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.DoubleClick,
                       QSystemTrayIcon.ActivationReason.Trigger):
+            wdlog.log.debug("用户操作: 托盘图标激活 (打开设置)", tag="tray")
             self.on_open_panel()
 
     def _quit(self):
+        wdlog.log.debug("用户操作: 托盘退出", tag="tray")
         self.hide()
         app = QApplication.instance()
         if app is not None:
@@ -99,6 +104,7 @@ class DuoTray(QSystemTrayIcon):
 
     # ------------------------------------------------------------ 状态同步
     def sync(self, glass_on):
+        wdlog.log.debug("托盘状态同步: 玻璃层 %s" % ("开" if glass_on else "关"), tag="tray")
         self.act_toggle.setText("关闭玻璃层" if glass_on else "开启玻璃层")
         self.act_auto.setChecked(autostart.is_enabled())
         active = self.controller.hub.active_name()
@@ -111,4 +117,4 @@ class DuoTray(QSystemTrayIcon):
         try:
             self.showMessage("win-duo", message, make_icon(), msec)
         except Exception:  # noqa: BLE001
-            print("[tray] %s" % message)
+            wdlog.log.debug("托盘气泡: %s" % message, tag="tray")

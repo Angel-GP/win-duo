@@ -7,6 +7,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QVBoxLayout
 
+import wdlog
 from paths import log_file
 from .widgets import BodyLabel, PlainTextEdit, PrimaryPushButton, TransparentPushButton, make_icon
 
@@ -165,7 +166,7 @@ class LogDialog(QDialog):
                 % log)
             subprocess.Popen(cmd, creationflags=0x00000010)   # CREATE_NEW_CONSOLE
         except Exception as exc:  # noqa: BLE001
-            print("[log] 打开命令行日志窗口失败:", exc)
+            wdlog.log.error("打开命令行日志窗口失败: %s" % exc, tag="log")
 
     def save_log(self):
         target, _ = QFileDialog.getSaveFileName(
@@ -178,4 +179,4 @@ class LogDialog(QDialog):
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content)
         except Exception as exc:  # noqa: BLE001
-            print("[log] 保存日志失败:", exc)
+            wdlog.log.error("保存日志失败: %s" % exc, tag="log")

@@ -6,6 +6,8 @@
 import sys
 from pathlib import Path
 
+import wdlog
+
 try:
     import winreg
 except ImportError:  # 非 Windows: 让模块仍可导入, 功能全部降级为"不可用"
@@ -59,7 +61,7 @@ def enable():
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
-    print("[autostart] 已开启: %s" % cmd)
+    wdlog.log.info("已开启: %s" % cmd, tag="autostart")
     return cmd
 
 
@@ -70,11 +72,11 @@ def disable():
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as key:
             winreg.DeleteValue(key, APP_NAME)
-        print("[autostart] 已关闭")
+        wdlog.log.info("已关闭", tag="autostart")
     except FileNotFoundError:
         pass
     except OSError as exc:
-        print("[autostart] 关闭失败: %s" % exc)
+        wdlog.log.error("关闭失败: %s" % exc, tag="autostart")
 
 
 def set_enabled(on):

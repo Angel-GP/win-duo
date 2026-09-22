@@ -9,6 +9,7 @@
   2) 必须 SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) 把自己排除出捕获,
      否则 mss 会截到自己的上一帧, 反馈几帧后收敛成一片纯色。
 """
+import atexit
 import ctypes
 import os
 import sys
@@ -25,8 +26,10 @@ from PyQt6.QtWidgets import QApplication, QFileDialog
 from angles.hub import LABELS
 
 import paths
+import wdlog
 
 from .capture import frame_bgr
+from .perfstats import SessionStats, ShowPeriodStats
 from .shader import FS_DUO, VS
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
@@ -204,6 +207,16 @@ class GlassOverlay(QOpenGLWidget):
         self._last_kick = 0.0
         self._last_print = 0.0
         self._locked = False
+        # 重绘率统计: 当前显示周期的采样器 + 整个会话的周期摘要 (atexit 汇总)
+        self.perf_stats = SessionStats()
+        self._period_stats = None
+        # 会话结束 (进程正常退出 / Python 层异常冒出) 时输出汇总。挂在
+        # overlay 的构造里, direct/托盘两种启动模式都自动覆盖, 不用往
+        # main.py 的两个 finally 里各塞一份。atexit 保证在解释器退出、
+        # stdout tee 还活着的时候打出最后一条 INFO。
+        # 注意: native 崩溃 (access violation) 时 atexit 不会跑 —— 那种
+        # 场景 Python 侧本来就什么都来不及输出, 是固有限制。
+        atexit.register(self._atexit_stats)
 
         # 渲染参数全部收进 apply_config(), 这样设置窗口改完能就地生效
         self.idle_hide = 0.004
@@ -233,6 +246,17 @@ class GlassOverlay(QOpenGLWidget):
             from ui.widgets import make_icon
             self.setWindowIcon(make_icon())
         except Exception:  # noqa: BLE001
+            pass
+
+    def _atexit_stats(self):
+        try:
+            # 退出瞬间玻璃层还开着的话, 先把进行中的周期收掉, 别丢最后一个
+            if self._period_stats is not None:
+                self.hideEvent(None)
+            rep = self.perf_stats.report()
+            if rep is not None:
+                wdlog.log.info(rep.replace("\n", "\n  "), tag="perf")
+        except Exception:  # noqa: BLE001  退出路径上统计绝不能挡进程收尾
             pass
 
     def apply_config(self):
@@ -356,15 +380,19 @@ class GlassOverlay(QOpenGLWidget):
         self._backdrop_ready = False
         if getattr(self, "_gl_ready", False):
             self.update()
-        print("[glass] 已移到显示器 %s %dx%d"
-              % (screen.name(), screen.geometry().width(),
-                 screen.geometry().height()))
+        wdlog.log.info("已移到显示器 %s %dx%d"
+                       % (screen.name(), screen.geometry().width(),
+                          screen.geometry().height()), tag="glass")
 
     # ------------------------------------------------------------ 窗口生命周期
     def showEvent(self, _ev):
         # 让 _visible 跟着真实可见性走: main 里已经 show() 过一次, 若初值仍为
         # False, 首次 tick 就不会把浓度 0 的玻璃层收起来, 卡顿依旧。
         self._visible = True
+        # 新显示周期开始。用 showEvent 而不是 tick 里的 _visible 翻转来收口:
+        # controller 有 3 处直接 hide() 不经过 tick (换屏/预热/退出), 只看
+        # _visible 会把那些周期的尾巴漏掉。
+        self._period_stats = ShowPeriodStats()
 
         # 坑 2: 把自己从屏幕捕获中排除, 否则截图会抓到上一次的渲染结果
         if not getattr(self, "_no_exclude", False):
@@ -372,9 +400,9 @@ class GlassOverlay(QOpenGLWidget):
                 r = ctypes.windll.user32.SetWindowDisplayAffinity(
                     int(self.winId()), WDA_EXCLUDEFROMCAPTURE)
                 if not r:
-                    print("[警告] SetWindowDisplayAffinity 失败, 截图可能包含自身")
+                    wdlog.log.warn("SetWindowDisplayAffinity 失败, 截图可能包含自身", tag="glass")
             except Exception as exc:  # noqa: BLE001
-                print("[警告] 显示排除设置异常:", exc)
+                wdlog.log.error("显示排除设置异常: %s" % exc, tag="glass")
 
         # show() 可能被调用多次 (例如选背景图后重新显示), 定时器只能建一次,
         # 否则每显示一次就多一个 16ms 定时器, tick 会被重复触发
@@ -382,6 +410,21 @@ class GlassOverlay(QOpenGLWidget):
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.tick)
         self.timer.start(self._tick_ms())
+
+    def hideEvent(self, _ev):
+        """每次玻璃层隐藏时输出本周期重绘率统计 (INFO)。
+
+        hideEvent 拦得住所有隐藏路径: tick 的空闲隐藏、controller 直接调
+        hide() (换屏/预热/退出)、以及退出时窗口销毁。预热那种 show->hide
+        间隔 <0.1s 的周期采不到样本, summary_line 返回 None, 不打日志。
+        """
+        self._visible = False
+        ps, self._period_stats = self._period_stats, None
+        if ps is not None:
+            line = ps.summary_line()
+            if line is not None:
+                wdlog.log.info(line, tag="perf")
+            self.perf_stats.add_period(ps)
 
     def closeEvent(self, ev):
         try:
@@ -410,16 +453,17 @@ class GlassOverlay(QOpenGLWidget):
         # 打印驱动信息 —— 排查"某类显卡上玻璃层黑屏"时, 这一行能直接说明
         # 拿到的是什么上下文 (版本/厂商/prof ile), 不用再猜。
         try:
-            print("[GL] %s | %s | %s | GLSL %s" % (
+            wdlog.log.info("%s | %s | %s | GLSL %s" % (
                 GL.glGetString(GL.GL_VERSION).decode("latin-1"),
                 GL.glGetString(GL.GL_VENDOR).decode("latin-1"),
                 GL.glGetString(GL.GL_RENDERER).decode("latin-1"),
-                GL.glGetString(GL.GL_SHADING_LANGUAGE_VERSION).decode("latin-1")))
+                GL.glGetString(GL.GL_SHADING_LANGUAGE_VERSION).decode("latin-1")), tag="gl")
         except Exception:  # noqa: BLE001
             pass
-        print("[GL] initializeGL, context valid =", self.context().isValid(),
-              self.context().format().majorVersion(),
-              self.context().format().minorVersion())
+        wdlog.log.debug("initializeGL, context valid = %s %s.%s"
+                        % (self.context().isValid(),
+                           self.context().format().majorVersion(),
+                           self.context().format().minorVersion()), tag="gl")
 
         self.prog = QOpenGLShaderProgram(self)
         ok_v = self.prog.addShaderFromSourceCode(
@@ -428,10 +472,10 @@ class GlassOverlay(QOpenGLWidget):
             QOpenGLShader.ShaderTypeBit.Fragment, FS_DUO)
         ok_l = self.prog.link()
         if not (ok_v and ok_f and ok_l):
-            print("[GL] 着色器编译/链接失败: vs=%s fs=%s link=%s\n%s"
-                  % (ok_v, ok_f, ok_l, self.prog.log()))
+            wdlog.log.error("着色器编译/链接失败: vs=%s fs=%s link=%s\n%s"
+                            % (ok_v, ok_f, ok_l, self.prog.log()), tag="gl")
         else:
-            print("[GL] 着色器编译链接 OK")
+            wdlog.log.debug("着色器编译链接 OK", tag="gl")
         self.prog.bind()
 
         # uniform 位置**在这里查一次就好**。`uniformLocation` 每次都要拿字符串
@@ -446,7 +490,7 @@ class GlassOverlay(QOpenGLWidget):
         }
         missing = [k for k, v in self._uloc.items() if v < 0]
         if missing:
-            print("[GL] 警告: 这些 uniform 没找到 (驱动可能优化掉了): %s" % missing)
+            wdlog.log.warn("这些 uniform 没找到 (驱动可能优化掉了): %s" % missing, tag="gl")
 
         self.cap_tex = self._new_tex(swizzle_bgra=True)   # BGRA 帧, 采样时硬件换通道
         # bd_tex 同样走 swizzle: _upload_backdrop 手上的是 cv2 的 BGR 数据,
@@ -462,7 +506,7 @@ class GlassOverlay(QOpenGLWidget):
         # 顶点属性 (我们的全屏三角形由顶点着色器用 gl_VertexID 生成)。空 VAO 就够。
         self.vao = GL.glGenVertexArrays(1)
         if not self.vao:
-            print("[GL] 警告: glGenVertexArrays 失败 (core 下会画不出东西)")
+            wdlog.log.error("glGenVertexArrays 失败 (core 下会画不出东西)", tag="gl")
 
         self._gl_ready = True
 
@@ -471,7 +515,7 @@ class GlassOverlay(QOpenGLWidget):
         """打印并清掉当前 GL 错误旗标 (调试辅助, 平时无错时零输出)。"""
         err = GL.glGetError()
         if err != 0:
-            print("[GL] %s 处 glError=0x%X" % (tag, err))
+            wdlog.log.error("%s 处 glError=0x%X" % (tag, err), tag="gl")
 
     @staticmethod
     def _new_tex(swizzle_bgra=False):
@@ -539,8 +583,8 @@ class GlassOverlay(QOpenGLWidget):
             # 但不会把整个绘制循环带走。
             if fmt != "BGRA" and not getattr(self, "_fmt_warned", False):
                 self._fmt_warned = True
-                print("[GL] 警告: 帧的 fmt=%r 不是 BGRA, 颜色可能不对"
-                      "(见 paintGL 的 fmt 契约)" % (fmt,))
+                wdlog.log.warn("帧的 fmt=%r 不是 BGRA, 颜色可能不对"
+                               "(见 paintGL 的 fmt 契约)" % (fmt,), tag="gl")
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.cap_tex)
             # **尺寸没变就用 glTexSubImage2D 更新, 不要每帧重新分配纹理存储 +
             # 重建整条 mip 链** (2560x1600 的 glTexImage2D + glGenerateMipmap
@@ -639,10 +683,10 @@ class GlassOverlay(QOpenGLWidget):
         path = self._backdrop_path()
         img = load_image(path) if os.path.exists(path) else None
         if img is not None:
-            print("[backdrop] 已加载 %s" % path)
+            wdlog.log.debug("已加载背景图 %s" % path, tag="backdrop")
         else:
             if os.path.exists(path):
-                print("[backdrop] 无法读取 %s, 回退到模糊桌面" % path)
+                wdlog.log.warn("无法读取背景图 %s, 回退到模糊桌面" % path, tag="backdrop")
             img = self._fallback_backdrop(frame)
         self._upload_backdrop(_resize_fill(img, fw, fh))
         self._backdrop_ready = True
@@ -650,7 +694,7 @@ class GlassOverlay(QOpenGLWidget):
     def reload_backdrop(self):
         frame = self.capturer.latest()
         if not frame:
-            print("[backdrop] 还没有截图, 稍后再试")
+            wdlog.log.debug("还没有截图, 稍后再试", tag="backdrop")
             return
         self._backdrop_ready = False
         self._build_backdrop(frame)
@@ -678,7 +722,7 @@ class GlassOverlay(QOpenGLWidget):
             return
         img = load_image(path)
         if img is None:
-            print("\n[backdrop] 读不出这张图: %s" % path)
+            wdlog.log.error("读不出这张图: %s" % path, tag="backdrop")
             return
         frame = self.capturer.latest()
         if not frame:
@@ -686,7 +730,7 @@ class GlassOverlay(QOpenGLWidget):
         self.cfg["backdrop_path"] = path
         self._upload_backdrop(_resize_fill(img, frame[1], frame[2]))
         self._backdrop_ready = True
-        print("\n[backdrop] 已切换 %s" % path)
+        wdlog.log.info("已切换背景图 %s" % path, tag="backdrop")
 
     def _upload_backdrop(self, bgr):
         """把背景图上传到 bd_tex。
@@ -741,8 +785,8 @@ class GlassOverlay(QOpenGLWidget):
                 self.hub.next_source()
             elif cmd == "toggle_outside":
                 self.outside = 0 if self.outside else 1
-                print("\n[渲染] 出界处理 -> %s"
-                      % ("纯黑(原版)" if self.outside == 0 else "背景兜底(无黑场)"))
+                wdlog.log.info("出界处理 -> %s"
+                               % ("纯黑(原版)" if self.outside == 0 else "背景兜底(无黑场)"), tag="glass")
             elif cmd == "toggle_debug":
                 self.toggle_debug()
             elif cmd == "pick_backdrop":
@@ -755,23 +799,23 @@ class GlassOverlay(QOpenGLWidget):
     def _apply_camera_cmd(self, cmd):
         cam = self.hub.get("camera")
         if cam is None:
-            print("\n[键] 摄像头角度源尚未启动")
+            wdlog.log.warn("摄像头角度源尚未启动", tag="camera")
             return
         if cmd == "calibrate":
             cam.request_calibration()
-            print("\n[键] 请求标定 (上盖完全展开时按才有意义)")
+            wdlog.log.debug("请求标定 (上盖完全展开时按才有意义)", tag="camera")
         elif cmd == "scale_up":
-            print("\n[键] camera_scale = %.2f" % cam.adjust_scale(+0.1))
+            wdlog.log.debug("camera_scale = %.2f" % cam.adjust_scale(+0.1), tag="camera")
         elif cmd == "scale_down":
-            print("\n[键] camera_scale = %.2f" % cam.adjust_scale(-0.1))
+            wdlog.log.debug("camera_scale = %.2f" % cam.adjust_scale(-0.1), tag="camera")
         elif cmd == "flip_sign":
-            print("\n[键] camera_sign = %+d" % cam.flip_sign())
+            wdlog.log.debug("camera_sign = %+d" % cam.flip_sign(), tag="camera")
 
     def toggle_debug(self):
         """开关摄像头特征匹配调试窗 (设置窗口里也有对应按钮)。"""
         cam = self.hub.get("camera")
         if cam is None:
-            print("\n[debug] 摄像头角度源尚未启动, 无法显示匹配窗口")
+            wdlog.log.warn("摄像头角度源尚未启动, 无法显示匹配窗口", tag="debug")
             return
         if self._dbg_window_open:
             self.close_debug()
@@ -780,7 +824,7 @@ class GlassOverlay(QOpenGLWidget):
             self._dbg_seq = -1
             self._dbg_shown = False
             cam.set_debug(True)
-            print("\n[debug] 匹配窗口 开 (置顶小窗; 再点一次按钮或按 x 关闭)")
+            wdlog.log.debug("匹配窗口 开 (置顶小窗; 再点一次按钮或按 x 关闭)", tag="debug")
 
     def close_debug(self):
         """关掉调试窗。
@@ -812,7 +856,7 @@ class GlassOverlay(QOpenGLWidget):
             cv2.waitKey(1)
         except Exception:  # noqa: BLE001
             pass
-        print("\n[debug] 匹配窗口 关")
+        wdlog.log.debug("匹配窗口 关", tag="debug")
 
     def _pump_debug_window(self):
         if not self._dbg_window_open:
@@ -850,7 +894,7 @@ class GlassOverlay(QOpenGLWidget):
                 self._dbg_shown = True
             cv2.waitKey(1)
         except Exception as exc:  # noqa: BLE001
-            print("[debug] 显示失败:", exc)
+            wdlog.log.error("调试窗显示失败: %s" % exc, tag="debug")
             self._dbg_window_open = False
             self._dbg_shown = False
 
@@ -901,7 +945,7 @@ class GlassOverlay(QOpenGLWidget):
                 self._visible = False
                 self._last_vis_change = now
                 self.hide()
-                print("\n[glass] 浓度≈0, 玻璃层已隐藏 -> 直接看真实桌面, 不再卡顿")
+                wdlog.log.debug("浓度≈0, 玻璃层已隐藏 -> 直接看真实桌面, 不再卡顿", tag="glass")
                 self._idle_capture()
                 self._pump_debug_window()
                 self._print_status(name, status, detail)
@@ -918,7 +962,7 @@ class GlassOverlay(QOpenGLWidget):
             self.show()
             self._last_drawn_seq = -1
             self.capturer.kick()
-            print("\n[glass] 玻璃层显示")
+            wdlog.log.info("玻璃层显示", tag="glass")
 
         # 截屏频率: 交给采集线程**自己连续跑**, 但只跑到 capture_hz ——
         # 抓得比重绘还勤的帧上屏前就被覆盖了, 白白多做 16MB 拷贝 (见 apply_config
@@ -939,11 +983,16 @@ class GlassOverlay(QOpenGLWidget):
         # 上游原作者就是 `self.update()` 直接画, 不做任何门控: 固定 16ms tick
         # = 稳定 ~62.5 FPS, 动画非常顺。
         #
-        # 我们以前在这里叠过两层门控, 都在帮倒忙:
+        # 旧判据曾是 `settling or new_frame`, 那会**被动跟随桌面活动**:
+        # 桌面静止时 WGC/合成器只产 ~13 帧/s (实测 pump 58/s 里只有 13 帧是真
+        # 新帧), new_frame 极少命中; 浓度稳定后 settling 也恒 False —— 重绘率
+        # 掉到 13/s 甚至个位数, 用户看到"玻璃层里的桌面越用越卡"。
+        # (这条和他 PR 里"性能问题修复"的结论一致, 所以合到这里只剩一份。)
+        #
+        # 我们以前还叠过两层门控, 都在帮倒忙:
         #   1) `abs(g - _last_drawn_g) > 0.0005` —— g 走指数缓动, 越接近目标
         #      每帧变化越小, 到尾部会小于阈值 -> 判成"没动" -> 动画尾部顿住;
         #   2) 再加 `render_interval` 限速 —— 实测把帧率压到 21~28/s。
-        # 门控本身还带来"该画的那一帧没画"的微小延迟, 手感就是卡。
         # 实测对照: 门控版 27/s -> 无条件版 **62/s**。
         #
         # **唯一的例外**: 用户主动把 render_fps 设成 >0 (想省 CPU/降发热) 时,
@@ -951,7 +1000,18 @@ class GlassOverlay(QOpenGLWidget):
         if self.render_interval <= 0.0 or \
                 (now - self._last_draw_req) >= self.render_interval:
             self._last_draw_req = now
+            # 记下"这次重绘时最新帧的序号" —— `_perf_check()` 用它判断
+            # "帧是不是卡住不动了" (seq 一直不变 = 采集那边没出新帧)。
+            # 从 capturer 现取, 不依赖 tick 里的局部变量 (取帧其实发生在 paintGL)。
+            try:
+                _f = self.capturer.latest()
+                self._last_drawn_seq = _f[3] if _f else -1
+            except Exception:  # noqa: BLE001
+                self._last_drawn_seq = -1
+            self._update_req_count = getattr(self, "_update_req_count", 0) + 1
             self.update()
+
+        self._perf_check()
 
         if LOCK_AT_CLOSE and self.g > 0.985 and not self._locked:
             self._locked = True
@@ -961,6 +1021,112 @@ class GlassOverlay(QOpenGLWidget):
 
         self._pump_debug_window()
         self._print_status(name, status, detail)
+
+    # ------------------------------------------------------------ 性能监控
+    # 重绘率监控的取样窗口: 窗口太短会被单个卡顿帧骗到, 太长则问题出现后
+    # 要等很久才报警。2s 折中 —— 与 _paint_rate 的 0.5s 最小窗口错开, 保证
+    # 每个监控窗口至少拿到 4 次真实的速率采样。
+    _PERF_WINDOW = 2.0
+    #: 重绘率的硬下限: 低于它直接报警 (用户可感知的卡顿)。
+    _PERF_MIN_RATE = 15.0
+    #: "明显下降"的判定: 比稳定基线掉这么多倍就算。基线是历史上较好的
+    #: 重绘率 (指数滑动平均, 只往上缓慢跟随), 0.6 倍意味着掉了 40% ——
+    #: 定太高 (如 0.8) 会被正常抖动反复触发。
+    _PERF_DROP_RATIO = 0.6
+    #: 报警后的冷却时间: 问题持续存在时不要每 2s 刷一条 WARN 刷屏。
+    #: 30s 足够用户读完日志并采取行动, 也不会漏掉"又恶化了一档"。
+    _PERF_COOLDOWN = 30.0
+
+    def _perf_check(self):
+        """重绘率性能监控: 每 _PERF_WINDOW 秒评估一次, 明显下降或低于
+        _PERF_MIN_RATE 时打 WARN, 尽量带齐诊断信息。
+
+        重绘率偏低的可能原因, 按链路从上游到下游:
+          1. 采集端没出新帧 (桌面静止 / 后端挂了) —— 看 seq 是否推进;
+          2. 采集太慢 (后端单帧耗时高, 如 mss 回退) —— 看 capturer.last_ms;
+          3. tick 定时器被饿死 (主线程被别的活拖住) —— 看 tick 间隔;
+          4. render_fps 限速本身 —— rate 接近 render_fps 就不是故障;
+          5. paintGL 排队但没执行 —— 用"请求重绘次数 vs 实际绘制次数"区分。
+        WARN 日志把这五个维度全部带上, 一条日志就能定位是哪一环。
+        """
+        now = time.time()
+        window = now - getattr(self, "_perf_t", None) if getattr(self, "_perf_t", None) else 0.0
+        if window < self._PERF_WINDOW:
+            return
+        self._perf_t = now
+
+        # 本窗口内的计数快照 (与上次相比的增量)
+        paints = self._paint_count - getattr(self, "_perf_p0", self._paint_count)
+        ticks = self._tick_count - getattr(self, "_perf_k0", self._tick_count)
+        updates = getattr(self, "_update_req_count", 0) - getattr(self, "_perf_u0", 0)
+        self._perf_p0 = self._paint_count
+        self._perf_k0 = self._tick_count
+        self._perf_u0 = getattr(self, "_update_req_count", 0)
+
+        # 只监控玻璃层真正显示的时段: 隐藏时空转, 重绘率天然是 0, 不是故障。
+        if not self._visible:
+            self._perf_good = None          # 换个显示周期, 基线重新建立
+            return
+
+        rate = paints / window
+        cap = self.render_fps if self.render_fps > 0 else 0.0
+        # 基线: 显示周期内见过的最好速率的平滑值。None = 还没建立。
+        base = self._perf_good
+        if base is None or rate > base:
+            self._perf_good = base = rate if base is None else min(base * 1.05, rate)
+
+        too_low = rate < self._PERF_MIN_RATE
+        dropped = (base is not None and base >= self._PERF_MIN_RATE
+                   and rate < base * self._PERF_DROP_RATIO)
+        if not (too_low or dropped):
+            return
+        # 贴着上限跑 = 限速生效, 不是故障; 只在"应该更快却没跑到"时报警。
+        if cap > 0 and rate >= cap * 0.85:
+            return
+        if now - getattr(self, "_perf_warn_t", 0.0) < self._PERF_COOLDOWN:
+            return
+        self._perf_warn_t = now
+
+        # ---- 诊断信息: 一条 WARN 说清整条链路 ----
+        frame = self.capturer.latest()
+        seq = frame[3] if frame else -1
+        seq_stalled = (seq != -1 and seq == self._last_drawn_seq)
+        try:
+            cap_ms = self.capturer.last_ms
+            cap_rate = self.capturer.rate_hz
+            backend = self.capturer.backend
+        except Exception:  # noqa: BLE001
+            cap_ms, cap_rate, backend = -1.0, -1.0, "?"
+        tick_gap = window / max(1, ticks)          # 平均 tick 周期
+        # 请求了 update() 但 paintGL 没跑: >2 说明主线程/GL 排队堵了;
+        # ≈0 而 rate 低, 说明根本没请求几次 (上游没新帧或 tick 饿死)。
+        update_backlog = updates - paints
+
+        why = []
+        if seq_stalled:
+            why.append("采集无新帧(seq停在同一值, 桌面静止或采集挂了)")
+        elif cap_rate >= 0 and cap_rate < 5:
+            why.append("截屏速率极低")
+        if cap_ms > 8.0:
+            why.append("后端单帧耗时%.1fms过高" % cap_ms)
+        if update_backlog > 2:
+            why.append("update排队未执行(主线程或GL阻塞)")
+        elif updates <= 1:
+            why.append("tick几乎没请求重绘(tick被饿死或上游无变化)")
+        if not why:
+            why.append("原因不明, 对照各分项排查")
+
+        wdlog.log.warn(
+            "重绘率偏低: %.1f/s (%s, 基线%.1f/s) | 上限%.0f/s 截屏%.1f/s 后端%s "
+            "单帧%.1fms seq=%d%s tick周期%.1fms 请求重绘%d 实际绘制%d(积压%d) "
+            "浓度%.0f%% dpr=%.1f 分辨率%dx%d"
+            % (rate, "低于15下限" if too_low else "比基线明显下降",
+               base if base is not None else 0.0,
+               cap, cap_rate, backend, cap_ms, seq,
+               " seq停滞!" if seq_stalled else "",
+               tick_gap * 1000.0, updates, paints, update_backlog,
+               self.g * 100.0, self.devicePixelRatioF(),
+               self.width(), self.height()), tag="perf")
 
     def _paint_rate(self):
         """每秒真正重绘了几次 —— 用来判断是不是在无谓地满帧空转。
@@ -994,6 +1160,11 @@ class GlassOverlay(QOpenGLWidget):
         if now - self._last_print < 0.1:
             return
         self._last_print = now
+        # 周期重绘率采样: 0.1s 一次快照, 正好与节流同频; O(1) 内存, 长期
+        # 挂机也不涨 (见 perfstats.py 顶部说明)。只在可见时采 —— 空转期为 0
+        # 会把"最差/p1"污染成 0。
+        if self._visible and self._period_stats is not None:
+            self._period_stats.add(self._paint_rate())
 
         bits = ["[%s]" % LABELS.get(name, name)]
         #: 可精简的**数据项**, 按"越靠后越先丢"排列 (超宽时从尾部丢)。
@@ -1020,14 +1191,8 @@ class GlassOverlay(QOpenGLWidget):
             pass
         bits.append("出界=%s" % ("黑" if self.outside == 0 else "背景"))
         # ═══════════════════════════════════════════════════════════════
-        # 按控制台宽度拼行 —— 否则 `\r` 覆盖刷新会错乱
+        # 超宽裁剪: 数据项从尾部逐个丢, 快捷键提示永远保住 (放不下时用紧凑写法)
         # ═══════════════════════════════════════════════════════════════
-        # 状态行用 `\r` 覆盖同一行来刷新。只要它超过控制台宽度就会折行, 而 `\r`
-        # 只回到折行后那一段的行首 -> 提示残留/错乱 (用户反馈的"快捷键提示没有
-        # 正常显示")。摄像头模式下这一行长达 167 列, 80 列控制台必然出事。
-        #
-        # **优先级**: 快捷键提示 > 主信息 ([源] 浓度 状态) > 数据项。超宽时从
-        # 数据项尾部开始丢, 提示永远保住 (放不下时用紧凑写法)。
         hint = "m=换源 c=标定 x=调试 v=出界 b=选背景 +/-=灵敏度"
         short_hint = "m c x v b +/-"
         cols = _console_columns()
@@ -1054,12 +1219,11 @@ class GlassOverlay(QOpenGLWidget):
             cand = "  ".join(bits + [short_hint])
             if fits(cand):
                 line = cand
-        # 4) 连"主信息 + 紧凑提示"都放不下: 只保主信息 + 紧凑提示, 截断主信息
+        # 4) 连"主信息 + 紧凑提示"都放不下: 截断主信息, 提示接回行尾
         if line is None:
             line = "  ".join(bits + [short_hint])
         if not fits(line):
             out, w = [], 0
-            # 给提示留出位置: 先截主信息, 再把提示接回去
             tail = "  " + short_hint
             room = limit - _display_width(tail) - 1
             for ch in "  ".join(bits):
@@ -1069,21 +1233,21 @@ class GlassOverlay(QOpenGLWidget):
                 out.append(ch)
                 w += cw
             line = "".join(out) + "…" + tail
-
         # ═══════════════════════════════════════════════════════════════
-        # 输出方式分两种 —— 关键: `\r` 在**文件里不会覆盖**, 只会在日志中堆成
-        # 一整行一整行的重复 (实测 130 次 \r -> 日志 130 行)。
+        # 输出方式分两种 —— 关键: `\r` 在**文件里不会覆盖**。
         # ═══════════════════════════════════════════════════════════════
-        # 终端 (tty): 用 `\r` 原地刷新状态行, 看着就是一行实时数据。
-        # 非终端 (重定向到日志文件): **不能**用 `\r`。改成只在
-        #   "(阶段/状态) 变化" 时用 `\n` 打一行, 其余时间静默 ——
-        # 这样日志里只留下**有意义的事件** (启动/等待标定/已标定/追踪中/出错),
-        # 而不是每秒几十条一模一样的重复行。
+        # 终端 (tty): 走 `wdlog.log.status_line` —— 它按终端列数截断、用 EL
+        #   擦残尾, 比手写 `\r + 补空格` 更稳 (中文宽度/缩放/换分辨率时不会把
+        #   状态行折成多行导致滚屏雪崩)。
+        # 非终端 (重定向到日志文件): **不能**用 `\r`。`\r` 在文件里不覆盖任何
+        #   东西, 只会把每秒几十次刷新糊成一坨 (实测 130 次 \r -> 日志 130 行
+        #   重复)。改成只在 **"(阶段/状态) 变化"时**打一行, 其余时间静默 ——
+        #   日志里只留下**有意义的事件** (启动/等待标定/已标定/追踪中/出错)。
         state_key = (name, status, self.outside)
         if _stdout_is_tty():
-            print("\r" + line + " " * 4, end="", flush=True)
+            wdlog.log.status_line(line)
             self._last_state_key = state_key
             return
         if state_key != getattr(self, "_last_state_key", None):
             self._last_state_key = state_key
-            print(line, flush=True)
+            wdlog.log.info(line, tag="status")

@@ -9,6 +9,8 @@ import os
 import sys
 from pathlib import Path
 
+import wdlog
+
 from PyQt6.QtCore import Qt, QRegularExpression, pyqtSignal
 from PyQt6.QtGui import QIcon, QRegularExpressionValidator
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel,
@@ -60,7 +62,7 @@ if not _FORCE_FALLBACK:
 
         FLUENT = True
     except Exception as _exc:  # noqa: BLE001
-        print("[ui] 未启用 Fluent 组件 (%s), 退回普通 Qt" % _exc)
+        wdlog.log.warn("未启用 Fluent 组件 (%s), 退回普通 Qt" % _exc, tag="ui")
 
 if not FLUENT:
     class Theme:                       # noqa: N801
@@ -194,7 +196,7 @@ def apply_theme():
             except Exception:  # noqa: BLE001
                 pass
     except Exception as exc:  # noqa: BLE001
-        print("[ui] 设置应用图标失败: %s" % exc)
+        wdlog.log.error("设置应用图标失败: %s" % exc, tag="ui")
 
     if FLUENT:
         setTheme(Theme.AUTO)
@@ -397,7 +399,7 @@ def make_icon(size=64):
         if not icon.isNull():
             _ICON_CACHE.append(icon)
             return icon
-        print("[ui] 图标文件读不出来, 退回运行时绘制: %s" % _ICON_FILE)
+        wdlog.log.warn("图标文件读不出来, 退回运行时绘制: %s" % _ICON_FILE, tag="ui")
     icon = _draw_icon(size)
     _ICON_CACHE.append(icon)
     return icon
