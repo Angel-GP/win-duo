@@ -252,6 +252,10 @@ def card_layout(card, margins=(18, 14, 18, 14), spacing=10):
 #: QDoubleValidator 会在打字途中就拒掉超范围的中间态 (比如范围 30~89 时
 #: 想输 50, 第一个字符 "5" 就被拒), 根本没法用。范围在提交时再夹。
 _NUM_RE = QRegularExpression(r"^\d{0,4}(\.\d{0,3})?$")
+#: 允许负号的版本。**只有下限 < 0 的字段才用它** (比如"重绘上限"的 -1 = 不限速):
+#: 原来的正则没有 `-`, 于是输入框里根本敲不出负号 —— 用户想填 -1 却填不了,
+#: 只能看着默认值, 以为"这个框坏了"。
+_NUM_RE_NEG = QRegularExpression(r"^-?\d{0,4}(\.\d{0,3})?$")
 
 
 class NumberField(QWidget):
@@ -272,7 +276,9 @@ class NumberField(QWidget):
         self._value = float(lo)
 
         self.edit = LineEdit(self)
-        self.edit.setValidator(QRegularExpressionValidator(_NUM_RE, self))
+        # 下限为负的字段允许输入负号 (见 _NUM_RE_NEG 的说明)
+        re_src = _NUM_RE_NEG if self._lo < 0 else _NUM_RE
+        self.edit.setValidator(QRegularExpressionValidator(re_src, self))
         self.edit.setFixedWidth(width)
         self.edit.setAlignment(Qt.AlignmentFlag.AlignRight
                                | Qt.AlignmentFlag.AlignVCenter)
@@ -338,8 +344,12 @@ class NumberField(QWidget):
 
     def _commit(self):
         raw = self.edit.text().strip()
+        # 只有一个负号 / 空 / 只有小数点 = 打字中间态, 保留原值 (别当成 0)
+        if raw in ("", ".", "-"):
+            self.edit.setText(self._fmt(self._value))
+            return
         try:
-            v = float(raw) if raw not in ("", ".") else self._value
+            v = float(raw)
         except ValueError:
             v = self._value
         v = self._clamp(v)
