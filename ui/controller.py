@@ -33,12 +33,24 @@ from .hotkey import HotkeyManager
 #: **摄像头模式下只留紧急停止。** 摄像头模式是"全自动跟手"的, 多一个键反而
 #: 容易误触 (尤其浓度键会和自动跟踪打架、标定/翻转会在你不想动的时候改参数)。
 #: 标定和翻转方向改用设置窗口里的按钮。
+#: 全局热键定义: (内部名, 配置键, 说明文案, 生效模式)
+#:
+#: **生效模式** = 只有当前角度源等于它时才注册 (None = 总是注册):
+#:   - `off` (紧急关闭): None —— **任何模式都要有**, 它是屏幕被玻璃层盖住、
+#:     托盘也点不到时的最后退路。
+#:   - `calibrate` (标定): camera —— 标定的意义是给摄像头"建立基准帧",
+#:     所以只在摄像头源下有意义。串口/键盘源下不注册 (按了也没用, 显示出来
+#:     只会误导)。
+#:   - 其余 (开关玻璃/调试窗/浓度): manual —— 那些是键盘模式下的调节手段。
 HOTKEY_DEFS = (
     ("off", "hotkey_off", "紧急关闭（关玻璃层并退出）", None),
+    ("calibrate", "hotkey_calibrate", "标定基准帧（上盖完全展开时按）", "camera"),
     ("toggle", "hotkey_toggle", "开关玻璃层", "manual"),
     ("debug", "hotkey_debug", "匹配调试窗", "manual"),
     ("level_up", "hotkey_level_up", "浓度 +5%", "manual"),
-    ("level_down", "hotkey_level_down", "浓度 −5%", "manual"),
+    # 注: 用普通半角 `-` 而不是全角 `−` (U+2212) —— 后者在 GBK 等编码下
+    # 会 UnicodeEncodeError, 打印/写日志时直接崩 (实测踩过)。
+    ("level_down", "hotkey_level_down", "浓度 -5%", "manual"),
     ("level_full", "hotkey_level_full", "浓度拉满 100%", "manual"),
     ("level_zero", "hotkey_level_zero", "浓度清零 0%", "manual"),
 )
@@ -123,6 +135,11 @@ class AppController(QObject):
             self.toggle_glass()
         elif name == "off":
             self.emergency_off()
+        elif name == "calibrate":
+            # 标定摄像头基准帧 (上盖完全展开时按才有意义)。
+            # **不依赖设置窗口** —— 摄像头模式下用户可能正对着屏幕合盖,
+            # 有个全局热键就能随时重标, 不用去托盘开窗口。
+            self.calibrate_camera()
         elif name == "level_up":
             self.bump_level(+0.05)
         elif name == "level_down":
@@ -131,8 +148,8 @@ class AppController(QObject):
             self.set_manual_level(1.0)
         elif name == "level_zero":
             self.set_manual_level(0.0)
-        # 注: HOTKEY_DEFS 里没有 calibrate/flip (标定与翻转方向已改成设置窗口的
-        # 按钮), 所以这里不再有对应分支 —— 免得看着像"热键还在"。
+        # 注: HOTKEY_DEFS 里没有 flip (翻转方向已改成设置窗口的按钮),
+        # 所以这里没有对应分支 —— 免得看着像"热键还在"。
         elif name == "debug":
             self.toggle_debug_window()
         else:

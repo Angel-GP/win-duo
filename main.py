@@ -248,6 +248,8 @@ DEFAULT_CFG = {
     "source": "camera",
     "hotkey_toggle": "ctrl+alt+d",
     "hotkey_off": "ctrl+alt+shift+esc",
+    # 标定基准帧: **只在摄像头源下注册** (标定的意义就是给摄像头建基准帧)。
+    "hotkey_calibrate": "ctrl+alt+c",
     "hotkey_level_up": "ctrl+alt+up",
     "hotkey_level_down": "ctrl+alt+down",
     "hotkey_level_full": "ctrl+alt+right",
