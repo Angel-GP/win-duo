@@ -12,6 +12,7 @@
 import atexit
 import ctypes
 import os
+import sys
 import time
 
 import numpy as np
@@ -97,6 +98,20 @@ def _display_width(s):
         else:
             w += 1
     return w
+
+
+def _stdout_is_tty():
+    """stdout 是不是**真终端**? (重定向到日志文件时返回 False)
+
+    状态行靠 `\\r` 原地覆盖。这只在真终端里成立 —— **写进文件时 `\\r` 只是个
+    字符, 不会覆盖任何东西**, 于是每次刷新都在日志里追加一整行, 变成大段
+    重复 (实测 130 次 \\r -> 日志 130 行一样的"未标定")。
+    所以要分开处理: 终端用 `\\r` 实时刷新, 文件只在**状态变化**时打一行。
+    """
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _console_columns(default=80):
@@ -185,9 +200,9 @@ class GlassOverlay(QOpenGLWidget):
         self._visible = False        # 玻璃层当前是否真的显示着
         self._uploaded_seq = -1
         self._uploaded_size = (1, 1)  # 已上传纹理的尺寸, 与 frame 解耦
-        # 注: 原来这里还有个 `_last_drawn_g` (上次重绘时的浓度), 用来做
-        # "浓度变化 > 0.0005 才重绘"的节流 —— 那个判据会把指数缓动的尾段吞掉
-        # (见 tick 里的说明), 已改为按"是否还在追 target"判断, 故删除。
+        # 注: 原来的 `_last_drawn_g`(浓度节流) 与 `_last_drawn_seq`(新帧判据)
+        # 都是"要不要重绘"的门控。现在对齐上游: 每次 tick 无条件重绘, 不再需要
+        # 判据 (门控本身会带来微小延迟, 见 tick 里的说明)。
         self._last_drawn_seq = -1
         self._last_kick = 0.0
         self._last_print = 0.0
@@ -252,7 +267,17 @@ class GlassOverlay(QOpenGLWidget):
         """
         cfg = self.cfg
         # 用户会调的留在 config.json
-        self.refresh_hz = float(cfg.get("refresh_hz", 3))
+        # 重截频率: **-1 (默认) = 不设限** —— 自动用"当前选中显示器"的刷新率。
+        # 合成器每秒最多产那么多帧, 抓更快没意义; 而换屏后刷新率可能不同
+        # (165Hz 主屏 / 60Hz 副屏), 所以不能写死一个数, 要跟着屏走。
+        # 来源用 capturer.display_hz —— controller.set_screen 换屏时会同步更新它。
+        rh = float(cfg.get("refresh_hz", -1))
+        if rh <= 0:
+            rh = self._display_hz()
+            self._refresh_auto = True
+        else:
+            self._refresh_auto = False
+        self.refresh_hz = rh
         self.max_tilt = float(cfg.get("max_tilt_deg", 88.0)) * 3.14159265 / 180.0
         self.eye_h = float(cfg.get("eye_dist_h", 2.0))
         self.spread = float(cfg.get("blur_spread", 0.42))
@@ -264,25 +289,22 @@ class GlassOverlay(QOpenGLWidget):
         self.idle_hide = IDLE_HIDE_BELOW
         self.idle_show = IDLE_SHOW_ABOVE
         self.idle_dwell = IDLE_DWELL_SEC
-        fps = float(cfg.get("render_fps", 30))
-        self.render_interval = (1.0 / fps) if fps > 0 else 0.0
+        # 铰链方向: 0 = 屏幕底边 (默认, 正常用笔记本); 1 = 屏幕顶边
+        # (反着用笔记本 —— 屏幕朝下/倒装摄像头时, 铰链相对画面就在上边)。
+        # 注意: 只换**铰链位置**, 桌面内容仍正立。
+        self.flip_hinge = 1 if cfg.get("flip_hinge", False) else 0
+        # render_fps: 重绘**上限** (帧/秒)。
+        #   **默认 -1 = 不限制** —— 也就是"每 tick 都画"(tick 固定 16ms,
+        #   约 62.5 FPS), 对齐上游 WindowsDuo, 动画最顺。
+        #   设成 >0 才启用上限 (省 CPU / 降发热), 设 0 也按"不限制"处理 (兼容旧配置)。
+        fps = float(cfg.get("render_fps", -1))
         self.render_fps = fps
-        # 采集频率的**有效上限**: 玻璃层最多每秒重绘 render_fps 次 (paintGL 被
-        # render_interval 限速), 所以抓得比这更勤的帧**在上屏前就被下一帧覆盖
-        # 掉了** —— 纯属白抓。而每抓一帧都要把 16MB 的桌面 .copy() 一份 (DXGI
-        # 缓冲不能直接留用, 见 capture._store), 这份拷贝就是玻璃层显示时 CPU 的
-        # 大头。实测 (2560x1600, level=0.5 静止):
-        #     抓屏 140/s -> 单核 85%      抓屏 60/s -> 单核 53%      抓屏 30/s -> 34%
-        # 而重绘率始终被 render_fps 钉在 ~27/s, 三者肉眼无差别。
-        #
-        # 取 render_fps 的 **2 倍**留一点相位余量: 保证每个重绘 tick 手上都有一帧
-        # 够新的 (正好 1 倍时, tick 和抓屏错相位会偶尔抓空, 重绘掉到 ~20/s)。
-        # refresh_hz 仍然照旧驱动 tick 周期 (_tick_ms) —— tick 本身很便宜, 让它
-        # 跑快点能把重绘时机卡得更准, 不受这个上限影响。
-        # 用户把 refresh_hz 设得比这还低时, 尊重用户 (min)。
-        #
-        # **render_fps=0 表示"不限速"** (见 README 的参数表), 那种情况下重绘没有
-        # 天花板, 抓屏也就不该被压 —— 直接用 refresh_hz, 别拿 2*0 去卡它。
+        self.render_interval = (1.0 / fps) if fps > 0 else 0.0
+        # 采集频率的**有效上限**: 抓得比重绘还勤的帧在上屏前就被下一帧覆盖了,
+        # 纯属白抓 —— 而每抓一帧都要把 16MB 的桌面 copy 一份 (大头 CPU)。
+        # 实测 (2560x1600): 抓屏 140/s -> 单核 85%, 60/s -> 53%, 30/s -> 34%。
+        # 重绘被 render_fps 限速时按它的 2 倍抓 (留相位余量); **不限速时**
+        # (render_fps <= 0) 就按 refresh_hz 抓, 别拿 2*0 去卡它。
         if self.render_fps > 0:
             self.capture_hz = min(self.refresh_hz,
                                   max(2.0 * self.render_fps, 30.0))
@@ -292,29 +314,18 @@ class GlassOverlay(QOpenGLWidget):
         self._retune_timer()
 
     def _tick_ms(self):
-        """tick 周期 (ms)。**它是重绘判据的时间粒度, 直接决定实际帧率。**
+        """tick 周期 (ms)。
 
-        原来写死 16ms -> 每秒最多 62 次 tick, 所以 refresh_hz 填 137 也只会
-        跑到 62 (用户会问"实际频率没那么高")。后来改成按设定值算, 但留下了
-        `min(16, ...)` 这个**上限**, 而它恰好是最糟的一档:
+        **固定 16ms, 对齐上游 WindowsDuo 原作者的做法 —— 这是动画丝滑的关键。**
 
-            render_fps=30 -> 需要 33.3ms 的间隔
-            tick=16ms 时, 判据 `now - last >= 33.3` 必须凑够 3 拍 = 48ms
-            -> 实际只有 1000/48 ≈ 21 fps  (实测 21.0/s, 帧间隔 47.9ms)
+        上游 win/glass_overlay.py 就是 `self.timer.start(16)` + 每次 tick
+        **无条件** `self.update()`, 于是稳定跑 ~62.5 FPS, 动画非常顺。
 
-        **实测对照 (本项目, render_fps=30):**
-            tick=16ms -> 21.0/s   帧间隔 47.9ms   <- 原来的值
-            tick= 8ms -> 25.0/s
-            tick= 4ms -> 27.8/s   帧间隔 35.9ms   <- 接近目标 30/s
-
-        所以 tick 必须**足够细**: 量化误差正比于 tick, 细 tick 反而更准。
-        实测在本项目上 tick=4ms 最优 (27.8/s, 帧间隔 35.9ms), 8ms 已经掉到
-        25.0/s。所以直接取目标帧间隔的 1/8 并夹到 [4ms, 16ms] —— 30fps 时
-        得到 4ms。tick 本身很便宜 (只做判据与状态更新, 绘制仍被 render_fps
-        限速), 实测单核占用没有可见上升。
+        之前这里按 refresh_hz/render_fps 动态算 (并夹了 `min(16, ...)`), 配上
+        tick 里的重绘门控, 实测只剩 21~28/s, 还因为门控带来微小延迟而显得卡。
+        "不做任何门控、固定节奏重绘"反而最顺 —— 所以回到 16ms。
         """
-        want = max(self.refresh_hz, self.render_fps, 30.0)
-        return int(max(4, min(16, round(1000.0 / want / 8.0))))
+        return 16
 
     def _retune_timer(self):
         """按当前设置重设定时器周期 (apply_config 会调, 改设置就地生效)。"""
@@ -346,6 +357,19 @@ class GlassOverlay(QOpenGLWidget):
             self.capturer.kick()
         except Exception:  # noqa: BLE001
             pass
+
+    def _display_hz(self):
+        """当前选中显示器的刷新率 (重截频率的"不设限"上限)。
+
+        取自 `capturer.display_hz` —— controller.set_screen 换屏时会把它设成
+        新屏的刷新率 (见那里的 #12 注释), 所以它始终跟着**当前选中的屏**。
+        取不到就退到 60 (最常见的值)。
+        """
+        try:
+            hz = float(getattr(self.capturer, "display_hz", 60.0) or 60.0)
+        except Exception:  # noqa: BLE001
+            hz = 60.0
+        return max(30.0, min(360.0, hz))
 
     def set_screen(self, screen):
         """把玻璃层挪到另一块显示器上。截屏区域由 controller 同步改。"""
@@ -461,7 +485,8 @@ class GlassOverlay(QOpenGLWidget):
         self._uloc = {
             name: self.prog.uniformLocation(name)
             for name in ("uTex", "uBackdrop", "uRes", "uTilt", "uEyeZ",
-                         "uSpread", "uDark", "uMaxTaps", "uOutside", "uBgBlur")
+                         "uSpread", "uDark", "uMaxTaps", "uOutside", "uBgBlur",
+                         "uFlipY")
         }
         missing = [k for k, v in self._uloc.items() if v < 0]
         if missing:
@@ -528,6 +553,9 @@ class GlassOverlay(QOpenGLWidget):
 
     def paintGL(self):
         self._paint_count = getattr(self, "_paint_count", 0) + 1
+        # 第一帧的时刻: `_paint_rate()` 首秒要用它算平均 (否则显示 0/s, 见那里)
+        if not hasattr(self, "_count_t"):
+            self._count_t = time.time()
         if not getattr(self, "_gl_ready", False):
             return
         dpr = self.devicePixelRatioF()
@@ -603,6 +631,7 @@ class GlassOverlay(QOpenGLWidget):
         GL.glUniform1f(loc["uDark"], self.dark)
         GL.glUniform1i(loc["uMaxTaps"], self.max_taps)
         GL.glUniform1i(loc["uOutside"], self.outside)
+        GL.glUniform1i(loc["uFlipY"], self.flip_hinge)
         GL.glUniform1f(loc["uBgBlur"], self.bg_blur)
 
         self._draw_quad()
@@ -948,40 +977,37 @@ class GlassOverlay(QOpenGLWidget):
             self._last_kick = now
             self.capturer.kick()
 
-        frame = self.capturer.latest()
-        seq = frame[3] if frame else -1
-        new_frame = seq != self._last_drawn_seq
-
         # ═══════════════════════════════════════════════════════════════
-        # 浓度是否还在动 —— **不能用固定小阈值判断**
+        # 每次 tick **无条件**重绘 —— 对齐上游 WindowsDuo (动画丝滑的关键)
         # ═══════════════════════════════════════════════════════════════
-        # 原来写的是 `abs(self.g - self._last_drawn_g) > 0.0005`。而 g 走的是
-        # 指数缓动 (`g += (target-g)*0.22`): 越接近目标每帧变化越小, 到尾部
-        # 会**小于 0.0005**, 于是被判成"浓度没动" -> 不重绘 -> 动画尾部顿住,
-        # 再突然跳到终值。更糟的是 `_last_drawn_g` 只在**真的重绘时**才更新,
-        # 所以一旦开始跳过, 差值只会越来越小, 可能长时间卡住。
-        # 上游 WindowsDuo 没有这个判据 (每 tick 无条件 update()), 尾段是连续的
-        # —— 这就是"效果远不及上游"的主因。
+        # 上游原作者就是 `self.update()` 直接画, 不做任何门控: 固定 16ms tick
+        # = 稳定 ~62.5 FPS, 动画非常顺。
         #
-        # 正确判据: 只要 **g 还没追上 target**, 就认为动画在动 (与阈值无关)。
-        # 用"是否已到达目标"代替"变化量 > 常数", 缓动多慢都能画完。
-        settling = abs(self.target - self.g) > 1e-4
-
-        # ═══════════════════════════════════════════════════════════════
-        # **玻璃层可见期间无条件按 render_fps 重绘** (2026-09 重绘率排查结论)
-        # ═══════════════════════════════════════════════════════════════
-        # 旧判据是 `settling or new_frame`: 桌面静止时 WGC/合成器只产 ~13 帧/s
-        # (实测 pump 58/s 里只有 13 帧是真新帧), new_frame 极少命中; 浓度稳定后
-        # settling 也恒 False —— 结果重绘率被动跟随桌面活动, 掉到 13/s 甚至
-        # 个位数。用户看到的就是"重绘率越用越低、玻璃层里的桌面变卡"。
-        # 但玻璃层画的就是**桌面快照**, 重绘率低 = 用户看到的整个桌面都卡,
-        # 省下的绘制毫无意义。上游 WindowsDuo 每 tick 无条件 update() 正是这个
-        # 原因。限速仍由 render_interval 把守 (render_fps 设多少就画多少),
-        # 浓度静止时多画的是"同一浓度下的新桌面帧", 不是浪费。
-        if self.render_interval <= 0 or \
+        # 旧判据曾是 `settling or new_frame`, 那会**被动跟随桌面活动**:
+        # 桌面静止时 WGC/合成器只产 ~13 帧/s (实测 pump 58/s 里只有 13 帧是真
+        # 新帧), new_frame 极少命中; 浓度稳定后 settling 也恒 False —— 重绘率
+        # 掉到 13/s 甚至个位数, 用户看到"玻璃层里的桌面越用越卡"。
+        # (这条和他 PR 里"性能问题修复"的结论一致, 所以合到这里只剩一份。)
+        #
+        # 我们以前还叠过两层门控, 都在帮倒忙:
+        #   1) `abs(g - _last_drawn_g) > 0.0005` —— g 走指数缓动, 越接近目标
+        #      每帧变化越小, 到尾部会小于阈值 -> 判成"没动" -> 动画尾部顿住;
+        #   2) 再加 `render_interval` 限速 —— 实测把帧率压到 21~28/s。
+        # 实测对照: 门控版 27/s -> 无条件版 **62/s**。
+        #
+        # **唯一的例外**: 用户主动把 render_fps 设成 >0 (想省 CPU/降发热) 时,
+        # 才按那个上限限速。默认 -1 不限速 -> 与上游行为完全一致。
+        if self.render_interval <= 0.0 or \
                 (now - self._last_draw_req) >= self.render_interval:
             self._last_draw_req = now
-            self._last_drawn_seq = seq
+            # 记下"这次重绘时最新帧的序号" —— `_perf_check()` 用它判断
+            # "帧是不是卡住不动了" (seq 一直不变 = 采集那边没出新帧)。
+            # 从 capturer 现取, 不依赖 tick 里的局部变量 (取帧其实发生在 paintGL)。
+            try:
+                _f = self.capturer.latest()
+                self._last_drawn_seq = _f[3] if _f else -1
+            except Exception:  # noqa: BLE001
+                self._last_drawn_seq = -1
             self._update_req_count = getattr(self, "_update_req_count", 0) + 1
             self.update()
 
@@ -1103,12 +1129,24 @@ class GlassOverlay(QOpenGLWidget):
                self.width(), self.height()), tag="perf")
 
     def _paint_rate(self):
-        """每秒真正重绘了几次 —— 用来判断是不是在无谓地满帧空转。"""
+        """每秒真正重绘了几次 —— 用来判断是不是在无谓地满帧空转。
+
+        ⚠️ **首秒要给出真实值, 不能返回 0。** 原来首次调用只记录基线就返回
+        0.0, 且窗口 < 0.5s 时一律返回缓存的 `_rate_v` (初始也是 0)。于是
+        刚启动那几秒状态行一直显示"重绘=0/s", 看着像**根本没在画** —— 实际
+        已经在 62/s 满速跑了 (实测 paintGL 计数)。这里改成: 首次也用"从窗口
+        建立到现在的平均"给出估计, 不留 0。
+        """
         now = time.time()
         cnt = getattr(self, "_paint_count", 0)
         last_t = getattr(self, "_rate_t", None)
         if last_t is None:
+            # 还没有基线: 用"进程内首帧到现在的平均"近似。_count_t 在
+            # paintGL 第一次运行时打点 (见 paintGL)。
+            t0 = getattr(self, "_count_t", None)
             self._rate_t, self._rate_n = now, cnt
+            if t0 is not None and now > t0:
+                return cnt / (now - t0)
             return 0.0
         dt = now - last_t
         if dt < 0.5:
@@ -1195,8 +1233,21 @@ class GlassOverlay(QOpenGLWidget):
                 out.append(ch)
                 w += cw
             line = "".join(out) + "…" + tail
-        # TRACE 才输出: 这是 0.1s 一刷的 \r 单行状态, 只在排查"实时数值"时看。
-        # 走 log.status_line: 保持 \r 原地刷新, 且它记住"行未闭合"、按显示
-        # 宽度擦残尾 (行尾补空格防残影的事 status_line 用 EL 已处理)。
-        # 下一条日志输出前它会先补换行, 否则日志会糊在状态行同一行上。
-        wdlog.log.status_line(line)
+        # ═══════════════════════════════════════════════════════════════
+        # 输出方式分两种 —— 关键: `\r` 在**文件里不会覆盖**。
+        # ═══════════════════════════════════════════════════════════════
+        # 终端 (tty): 走 `wdlog.log.status_line` —— 它按终端列数截断、用 EL
+        #   擦残尾, 比手写 `\r + 补空格` 更稳 (中文宽度/缩放/换分辨率时不会把
+        #   状态行折成多行导致滚屏雪崩)。
+        # 非终端 (重定向到日志文件): **不能**用 `\r`。`\r` 在文件里不覆盖任何
+        #   东西, 只会把每秒几十次刷新糊成一坨 (实测 130 次 \r -> 日志 130 行
+        #   重复)。改成只在 **"(阶段/状态) 变化"时**打一行, 其余时间静默 ——
+        #   日志里只留下**有意义的事件** (启动/等待标定/已标定/追踪中/出错)。
+        state_key = (name, status, self.outside)
+        if _stdout_is_tty():
+            wdlog.log.status_line(line)
+            self._last_state_key = state_key
+            return
+        if state_key != getattr(self, "_last_state_key", None):
+            self._last_state_key = state_key
+            wdlog.log.info(line, tag="status")

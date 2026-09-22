@@ -262,6 +262,74 @@ def remember_capture_backend(name):
         pass
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# "哪些后端已知不可用" —— auto 模式用它跳过, 而不是把次优的记成首选
+# ═══════════════════════════════════════════════════════════════════════
+# 与上面的"记住成功的后端"是**两回事**:
+#   - remember_capture_backend: "上次成功的" (仅参考)
+#   - 这里: "上次**失败**的" -> auto 时直接跳过, 免得每次启动都要等它超时。
+# 语义上这是**黑名单**, 只记"打不开"的后端; 一旦它某次打开成功就立刻移除。
+_BAD_CACHE = None
+
+
+def _bad_state_path():
+    try:
+        return paths.config_file("capture_backend_bad.json")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_bad_backends():
+    """已知打不开的后端名集合 (打不开才在里面)。坏了就当空集。"""
+    global _BAD_CACHE
+    if _BAD_CACHE is not None:
+        return _BAD_CACHE
+    val = set()
+    p = _bad_state_path()
+    if p is not None and p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(d, list):
+                val = {str(x) for x in d}
+        except Exception:  # noqa: BLE001
+            val = set()
+    _BAD_CACHE = val
+    return val
+
+
+def _write_bad(bad):
+    p = _bad_state_path()
+    if p is None:
+        return
+    try:
+        p.write_text(json.dumps(sorted(bad), ensure_ascii=False) + "\n",
+                     encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _remember_bad_backend(name):
+    bad = _load_bad_backends()
+    if name not in bad:
+        bad.add(name)
+        _write_bad(bad)
+
+
+def _clear_bad_backend(name):
+    bad = _load_bad_backends()
+    if name in bad:
+        bad.discard(name)
+        _write_bad(bad)
+
+
+def available_backends():
+    """给界面用的后端清单: (显示名, 内部值)。"""
+    return (("自动 (系统推荐最优)", "auto"),
+            ("WGC (Windows.Graphics.Capture)", "wgc"),
+            ("DXGI (Desktop Duplication)", "dxgi"),
+            ("mss (GDI BitBlt, 兜底)", "mss"))
+
+
 class _WgcSource:
     """Windows.Graphics.Capture 封装 (windows-capture 包, 优先于 DDA)。
 
@@ -518,67 +586,107 @@ class CaptureWorker(threading.Thread):
         self.target_hz = 0.0
 
     # ------------------------------------------------------------ 生命周期
+    def open_now(self, timeout=6.0):
+        """**同步**等后端打开好 (供 GUI 切换后端后用)。
+
+        `_open()` 是采集线程里懒调的, 所以 start() 返回时 `self.backend` 还是
+        "?"。切换后端时我们想立刻知道"成没成、用的是什么", 就得在这里等一下。
+        返回实际打开的后端名 (超时/失败时抛异常)。
+        """
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            if self.backend != "?":
+                return self.backend
+            self.kick()                      # 催一下, 让它尽快跑到 _open
+            time.sleep(0.02)
+        raise RuntimeError("等待采集后端打开超时 (backend 仍为 '?')")
+
     def _open(self):
         """幂等 —— start() 里会调一次, 外部也可能先调一次做探测。
 
         不幂等的话第二次会再走一遍探测 —— bettercam 是**单例**, 探测时的
         release() 会把手上正在用的 camera 销毁掉。
 
-        auto 的顺序: 上次成功并记住的后端优先, 否则 wgc -> dda -> mss。
-        WGC 优先于 DDA 的原因见模块 docstring (affinity 排除的可靠性)。
+        ══════════════════════════════════════════════════════════════
+        auto 与手动的语义 (刻意区分, 别混)
+        ══════════════════════════════════════════════════════════════
+        **auto = 系统按"最优"推荐**: 永远从**性能最好**的后端开始试
+        (wgc ~0.5ms/帧 < dxgi ~1.1ms < mss ~27ms), 不可用才往下退。
+        "记住上次成功的后端"在这里**只用于跳过已知不可用的** (比如上次 dxgi
+        起不来), **不会**因为"上次回退到了 dxgi"就再也不试更优的 wgc ——
+        否则一次偶发失败会被永久记住, 之后一直用次优后端。
+
+        **手动选 = 完全听用户的**: 只用那一个, 起不来就**明确报错**
+        (不静默降级 —— 否则用户以为在用 dxgi, 实际跑的是 mss)。
         """
         if self.backend != "?":
             return
         ensure_dpi_aware()
-        good = load_good_capture_backend() if self.want_backend == "auto" else None
-        if good:
-            wdlog.log.debug("上次成功的采集后端是 %s, 优先试它" % good, tag="capture")
-        # **记住的后端排最前。** 原来写成
-        #     order = ["wgc","dxgi"] if good != "wgc" else ["dxgi","wgc"]
-        #     if good == "wgc": order = ["wgc","dxgi"]
-        # 第一行的 else 分支立刻被下一行覆盖 —— 净效果是 good=="dxgi" 时仍是
-        # ["wgc","dxgi"], **"优先上次成功后端"对 dxgi 从来没生效过**。这里显式
-        # 列三种情况。
-        if good == "dxgi":
-            order = ["dxgi", "wgc"]
-        elif good == "mss":
-            order = []                       # 用户上次确认只有 mss 能用
-        else:
-            order = ["wgc", "dxgi"]          # 默认: WGC 优先 (affinity 更可靠)
+
+        # 手动指定: 只试这一个, 失败就硬失败 (含 mss)
+        if self.want_backend != "auto":
+            self._open_one(self.want_backend, strict=True)
+            return
+
+        # auto: 按性能从好到差试; 记住的后端只用来**跳过已知不可用的**
+        bad = _load_bad_backends()
+        order = [b for b in ("wgc", "dxgi") if b not in bad]
+        if not order:
+            # 两个 GPU 后端都被记成"不可用" -> 直接 mss
+            order = []
+        if bad:
+            wdlog.log.debug("auto: 跳过上次失败的 %s" % ",".join(sorted(bad)),
+                            tag="capture")
         for name in order:
-            if self.want_backend not in ("auto", name):
-                continue
-            if name == "wgc":
-                try:
-                    self._wgc = _WgcSource(self.size, origin=self.origin)
-                    self.backend = "wgc"
-                    wdlog.log.info("后端 wgc (Windows.Graphics.Capture), %dx%d @ 桌面坐标 %s"
-                                   % (self.size + (self.origin,)), tag="capture")
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    wdlog.log.warn("WGC 不可用%s: %s"
-                                   % (" (记住的后端, 回退继续试)" if good == "wgc" else "",
-                                      exc), tag="capture")
-                    if self.want_backend == "wgc":
-                        raise
-                    continue
-            if name == "dxgi":
-                try:
-                    self._dxgi = _DxgiSource(self.size, origin=self.origin)
-                    self.backend = self._dxgi.name
-                    wdlog.log.info("后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
-                                   % (self._dxgi.name, self._dxgi.output_idx, *self.size,
-                                      self.origin), tag="capture")
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    if self.want_backend == "dxgi":
-                        # **强制 dxgi 失败就硬失败**: 验证某个后端的渲染时
-                        # 静默降到 mss 会让测试者以为自己还在测 dxgi。
-                        raise RuntimeError("强制 dxgi 后端不可用: %s" % exc)
-                    wdlog.log.warn("DXGI 不可用, 退回 mss: %s" % exc, tag="capture")
+            if self._open_one(name, strict=False):
+                return
+        # 都不可用 -> mss (唯一的软件兜底, 一定能用)
         self.backend = "mss"
         self._sct = mss.mss()
         wdlog.log.warn("后端 mss (GDI BitBlt), %dx%d" % self.size, tag="capture")
+
+    def _open_one(self, name, strict):
+        """尝试打开一个指定后端。成功返回 True 并设好 self.backend。
+
+        `strict=True` (手动指定) 时失败会抛异常 —— 手动选择必须让用户知道
+        失败了, 不能悄悄换一个。
+        """
+        if name == "mss":
+            self.backend = "mss"
+            self._sct = mss.mss()
+            wdlog.log.info("后端 mss (GDI BitBlt), %dx%d" % self.size,
+                           tag="capture")
+            return True
+        if name == "wgc":
+            try:
+                self._wgc = _WgcSource(self.size, origin=self.origin)
+            except Exception as exc:  # noqa: BLE001
+                if strict:
+                    raise RuntimeError("WGC 后端不可用: %s" % exc)
+                wdlog.log.warn("WGC 不可用, 回退: %s" % exc, tag="capture")
+                _remember_bad_backend("wgc")
+                return False
+            self.backend = "wgc"
+            _clear_bad_backend("wgc")
+            wdlog.log.info("后端 wgc (Windows.Graphics.Capture), %dx%d @ 桌面坐标 %s"
+                           % (self.size + (self.origin,)), tag="capture")
+            return True
+        if name == "dxgi":
+            try:
+                self._dxgi = _DxgiSource(self.size, origin=self.origin)
+            except Exception as exc:  # noqa: BLE001
+                if strict:
+                    raise RuntimeError("DXGI 后端不可用: %s" % exc)
+                wdlog.log.warn("DXGI 不可用, 回退: %s" % exc, tag="capture")
+                _remember_bad_backend("dxgi")
+                return False
+            self.backend = self._dxgi.name
+            _clear_bad_backend("dxgi")
+            wdlog.log.info("后端 %s (DXGI), output=%d, %dx%d @ 桌面坐标 %s"
+                           % (self._dxgi.name, self._dxgi.output_idx, *self.size,
+                              self.origin), tag="capture")
+            return True
+        raise RuntimeError("未知采集后端 %r" % name)
 
     def _drop_dxgi(self):
         if self._dxgi is not None:

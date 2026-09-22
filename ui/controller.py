@@ -35,12 +35,24 @@ import wdlog
 #: **摄像头模式下只留紧急停止。** 摄像头模式是"全自动跟手"的, 多一个键反而
 #: 容易误触 (尤其浓度键会和自动跟踪打架、标定/翻转会在你不想动的时候改参数)。
 #: 标定和翻转方向改用设置窗口里的按钮。
+#: 全局热键定义: (内部名, 配置键, 说明文案, 生效模式)
+#:
+#: **生效模式** = 只有当前角度源等于它时才注册 (None = 总是注册):
+#:   - `off` (紧急关闭): None —— **任何模式都要有**, 它是屏幕被玻璃层盖住、
+#:     托盘也点不到时的最后退路。
+#:   - `calibrate` (标定): camera —— 标定的意义是给摄像头"建立基准帧",
+#:     所以只在摄像头源下有意义。串口/键盘源下不注册 (按了也没用, 显示出来
+#:     只会误导)。
+#:   - 其余 (开关玻璃/调试窗/浓度): manual —— 那些是键盘模式下的调节手段。
 HOTKEY_DEFS = (
     ("off", "hotkey_off", "紧急关闭（关玻璃层并退出）", None),
+    ("calibrate", "hotkey_calibrate", "标定基准帧（上盖完全展开时按）", "camera"),
     ("toggle", "hotkey_toggle", "开关玻璃层", "manual"),
     ("debug", "hotkey_debug", "匹配调试窗", "manual"),
     ("level_up", "hotkey_level_up", "浓度 +5%", "manual"),
-    ("level_down", "hotkey_level_down", "浓度 −5%", "manual"),
+    # 注: 用普通半角 `-` 而不是全角 `−` (U+2212) —— 后者在 GBK 等编码下
+    # 会 UnicodeEncodeError, 打印/写日志时直接崩 (实测踩过)。
+    ("level_down", "hotkey_level_down", "浓度 -5%", "manual"),
     ("level_full", "hotkey_level_full", "浓度拉满 100%", "manual"),
     ("level_zero", "hotkey_level_zero", "浓度清零 0%", "manual"),
 )
@@ -61,6 +73,13 @@ class AppController(QObject):
             monitors.region_for(self.screen()), cfg,
             display_hz=self.screen().refreshRate())
         self.capture.start()
+        # **等它真的打开**再往下走 (几十毫秒), 这样 `capture.backend` 一开始
+        # 就是准确的 —— 否则界面会有一段时间显示"?"(用户看到的就是"后端未知")。
+        # 失败也不挡启动: 采集线程自己会退回 mss。
+        try:
+            self.capture.open_now(timeout=6.0)
+        except Exception as exc:  # noqa: BLE001
+            print("[capture] 启动时等待后端打开超时: %s" % exc)
         self.overlay = None
         self.glass_on = False
         self._scan_was_running = False
@@ -125,6 +144,11 @@ class AppController(QObject):
             self.toggle_glass()
         elif name == "off":
             self.emergency_off()
+        elif name == "calibrate":
+            # 标定摄像头基准帧 (上盖完全展开时按才有意义)。
+            # **不依赖设置窗口** —— 摄像头模式下用户可能正对着屏幕合盖,
+            # 有个全局热键就能随时重标, 不用去托盘开窗口。
+            self.calibrate_camera()
         elif name == "level_up":
             self.bump_level(+0.05)
         elif name == "level_down":
@@ -133,8 +157,8 @@ class AppController(QObject):
             self.set_manual_level(1.0)
         elif name == "level_zero":
             self.set_manual_level(0.0)
-        # 注: HOTKEY_DEFS 里没有 calibrate/flip (标定与翻转方向已改成设置窗口的
-        # 按钮), 所以这里不再有对应分支 —— 免得看着像"热键还在"。
+        # 注: HOTKEY_DEFS 里没有 flip (翻转方向已改成设置窗口的按钮),
+        # 所以这里没有对应分支 —— 免得看着像"热键还在"。
         elif name == "debug":
             self.toggle_debug_window()
         else:
@@ -145,6 +169,77 @@ class AppController(QObject):
             self.hotkeys.release()
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------ 采集后端
+    def set_capture_backend(self, backend):
+        """切换采集后端 (auto / wgc / dxgi / mss) —— **立即生效, 不用重启**。
+
+        做法: 停掉旧采集线程 -> 按新后端建一个 -> **等它真的打开** -> 把
+        overlay 的引用指过去。
+
+        为什么要等打开: `_open()` 是在采集线程里懒调的, start() 返回时
+        `backend` 还是 "?"。不等的话就没法告诉用户"成没成、实际用的是哪个",
+        而且手动选了个不可用的后端也会**静默失败**。
+
+        失败时**回滚**到原来的后端 (不能让用户点了下拉框却用不了)。
+        """
+        backend = str(backend or "auto")
+        old_backend = str(self.cfg.get("capture_backend", "auto"))
+        if backend == old_backend:
+            return True
+        # 先校验名字合法 (免得建了线程才发现是拼错的)
+        if backend not in ("auto", "wgc", "dxgi", "mss"):
+            print("[capture] 未知后端 %r" % backend)
+            self.notified.emit("未知采集后端: %s" % backend)
+            return False
+
+        self.cfg["capture_backend"] = backend
+        old = self.capture
+        try:
+            old.stop()
+            screen = self.screen()
+            new = make_capture(monitors.region_for(screen), self.cfg,
+                               display_hz=screen.refreshRate())
+            new.start()
+            actual = new.open_now(timeout=6.0)      # 等它真打开 (失败会抛)
+            self.capture = new
+            # overlay 每帧从 capturer 取帧; 换对象后要重新指过去, 并让它
+            # 重传第一帧 (尺寸/来源都可能变了)。
+            if self.overlay is not None:
+                self.overlay.capturer = new
+                self.overlay._uploaded_seq = -1
+                self.overlay._last_drawn_seq = -1
+                self.overlay.apply_config()
+            self.save()
+            print("[capture] 已切换后端 %s -> %s (实际在用 %s)"
+                  % (old_backend, backend, actual))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print("[capture] 切换后端失败 (%s -> %s): %s"
+                  % (old_backend, backend, exc))
+            # **回滚**: 恢复旧配置, 并把旧后端的采集重新建起来 —— 否则
+            # 用户点了一下失败的下拉项, 采集就彻底没了。
+            self.cfg["capture_backend"] = old_backend
+            try:
+                self.capture = make_capture(
+                    monitors.region_for(self.screen()), self.cfg,
+                    display_hz=self.screen().refreshRate())
+                self.capture.start()
+                if self.overlay is not None:
+                    self.overlay.capturer = self.capture
+                    self.overlay._uploaded_seq = -1
+                    self.overlay._last_drawn_seq = -1
+                    self.overlay.apply_config()
+                self.capture.open_now(timeout=6.0)
+            except Exception as exc2:  # noqa: BLE001
+                print("[capture] 回滚也失败: %s" % exc2)
+            self.notified.emit("切换采集后端失败: %s" % exc)
+            return False
+
+    def capture_backend(self):
+        """当前采集后端的说明 (给界面显示)。"""
+        name = self.capture.backend if self.capture is not None else "?"
+        return name
 
     # ------------------------------------------------------------ 显示器
     def screen(self):

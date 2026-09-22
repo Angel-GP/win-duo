@@ -1030,8 +1030,13 @@ class CameraAngleSource(AngleSource):
                         self._matches = len(tracker.last_good)
                         self._status = "追踪中"
                     else:
+                        # 设备已出图, 但还没标定基准帧 —— 这是**预备启动**阶段:
+                        # 摄像头在跑、画面在采, 只是还没建立参考帧, 所以测不出
+                        # 角度。以前这里写"未标定(请标定)", 措辞像"出错了",
+                        # 而且它**每帧都被重新赋值**, 配合状态行刷新会在日志里
+                        # 反复出现。改成明确的阶段名: 相机已就绪、等一次标定。
                         self._matches = len(tracker.last_good)
-                        self._status = ("未标定(请标定)" if not tracker.has_reference
+                        self._status = ("预备启动(等待标定)" if not tracker.has_reference
                                         else "匹配不足")
                     self.detail = {
                         "pitch": self._pitch_deg,

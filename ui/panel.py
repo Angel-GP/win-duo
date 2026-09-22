@@ -14,9 +14,11 @@
 from pathlib import Path
 import time
 
-from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QSizePolicy,
-                             QStackedWidget, QVBoxLayout, QWidget)
+from PyQt6.QtCore import (QEvent, QEasingCurve, QPropertyAnimation, QRectF,
+                          Qt, QThread, QTimer, pyqtProperty, pyqtSignal)
+from PyQt6.QtGui import QColor, QPainter, QPen, QTransform
+from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QPushButton,
+                             QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
 import wdlog
 from angles.hub import LABELS
@@ -28,6 +30,11 @@ from .widgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, LineEdit,
                       SwitchButton, TransparentPushButton, card_layout, make_icon, row)
 
 SOURCE_ORDER = ("camera", "serial", "manual")
+#: **主窗「角度源」里列出来的源。**
+#: 不含 `manual` —— 键盘手动不是日常使用的角度源, 而是"没接摄像头/陀螺仪时
+#: 的调试手段", 所以它的入口收进「高级设置 -> 调试」里的「键盘模式」按钮,
+#: 主窗只留真正常用的摄像头 / ESP32。
+PANEL_SOURCES = ("camera", "serial")
 OUTSIDE = (("black", "纯黑 (原版)"), ("backdrop", "背景图兜底 (无黑场)"))
 
 #: 退出时还没结束、又不能在原生调用里被打断的线程寄存处。
@@ -35,15 +42,163 @@ OUTSIDE = (("black", "纯黑 (原版)"), ("backdrop", "背景图兜底 (无黑�
 #: 它们都是 daemon 线程, 进程退出时由系统回收。
 _ORPHANED = []
 
+
+class _CurPageStack(QStackedWidget):
+    """`QStackedWidget`, 但 **sizeHint 只按"当前页"算**。
+
+    Qt 原版的 `sizeHint()` 取的是**所有子页里最大**的那个 —— 于是内容矮的页
+    (「启动与标定」只有 ~130px) 会被最高那页 (~300px) 撑到同样高, 底部留一大
+    片空白。
+
+    原来为了消掉这个空白用了 `setFixedHeight(当前页sizeHint)`, 但那是**硬**
+    约束: 一旦标签因为换行 / DPI / 字体需要更高, 页面被钉死在旧高度 ->
+    **控件互相挤压、遮挡**。
+
+    这里改成只覆盖 sizeHint (软约束): 高度跟着当前页走, 空间不够时 Qt 仍会
+    把弹窗撑高, 不会再压扁内容。
+    """
+
+    def sizeHint(self):                      # noqa: N802
+        cur = self.currentWidget()
+        if cur is None:
+            return super().sizeHint()
+        s = cur.sizeHint()
+        # 宽度也按当前页 (免得窄页被宽页撑出大片右边空白)
+        return s
+
+    def minimumSizeHint(self):               # noqa: N802
+        cur = self.currentWidget()
+        if cur is None:
+            return super().minimumSizeHint()
+        return cur.minimumSizeHint()
+
 #: 数值输入项: (config 键, 标签, 最小, 最大, 步进, 单位, 小数位)
 INPUTS = (
     ("camera_scale", "灵敏度", 0.1, 3.0, 0.1, "", 2),
     ("max_tilt_deg", "最大转角", 30, 89, 1, "°", 0),
     ("eye_dist_h", "眼距", 0.5, 6.0, 0.1, "×屏高", 1),
     ("blur_spread", "模糊强度", 0.0, 1.5, 0.01, "", 2),
-    ("refresh_hz", "重截频率", 1, 120, 1, "Hz", 0),
-    ("render_fps", "重绘上限", 1, 120, 1, "帧/秒", 0),
+    # 重截频率: **-1 = 不设限** (默认) —— 自动用当前选中显示器的刷新率。
+    # 上限由 _refresh_refresh_max() 动态设成那块屏的刷新率 (本机 165),
+    # 120 只是面板显示前的保守占位。
+    ("refresh_hz", "重截频率", -1, 120, 1, "Hz", 0),
+    # 重绘上限: **-1 = 不限制** (默认; 每 tick 都画 ≈62.5 FPS, 动画最顺)。
+    # 上限 **62 而不是 120** —— tick 固定 16ms, 重绘的物理上限就是 1000/16
+    # ≈ 62.5/s, 填更大也不会更快 (120 是假的可用值)。
+    ("render_fps", "重绘上限", -1, 62, 1, "帧/秒", 0),
 )
+
+
+class _RotatingScreenButton(TransparentPushButton):
+    """一个带**旋转动画**的小屏幕图标按钮: 点一下把铰链方向反转。
+
+    用途: 反着用笔记本时 (屏幕朝下 / 摄像头倒装), 铰链相对画面就跑到了**上边**,
+    这时折叠动画的方向是反的。点这个按钮把铰链换到另一边修正过来。
+
+    为什么做成旋转图标而不是普通按钮: "铰链在哪一边"是**空间关系**, 用文字
+    ("底边/顶边")要读, 而一个**转过去的屏幕图标**能一眼看懂。点击时图标平滑
+    转 180°, 用户立刻明白"铰链换边了"。
+
+    ⚠️ **必须继承 TransparentPushButton (而不是裸 QPushButton)** —— 面板上另外
+    两个按钮 (标定/反转开合) 用的都是它。继承裸 QPushButton 会丢掉 Fluent 的
+    透明按钮样式, 三个按钮**材质不一致**, 一眼就看得出这一个"不是一伙的"。
+    """
+
+    #: 图标占的宽度 (左侧)。文字从它后面开始, 见 paintEvent。
+    _ICON_W = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 文字**不加前导空格** —— 缩进由 paintEvent 里自己排 (空格会因为居中
+        # 而和图标错位, 看起来就是"文字偏右")。
+        self.setText("反转铰链方向")
+        self.setToolTip("反着用笔记本时点这里: 把铰链从屏幕底边换到顶边")
+        self._angle = 0.0
+        self._anim = QPropertyAnimation(self, b"angle", self)
+        self._anim.setDuration(320)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    def sizeHint(self):                            # noqa: N802
+        # 在"文字宽度"基础上多留出图标的位置, 否则图标会压到文字上。
+        s = super().sizeHint()
+        return s.__class__(s.width() + self._ICON_W, s.height())
+
+    # 动画驱动这个属性 (0 -> 180)
+    def _get_angle(self):
+        return self._angle
+
+    def _set_angle(self, v):
+        self._angle = float(v)
+        self.update()
+
+    angle = pyqtProperty(float, _get_angle, _set_angle)
+
+    def set_flipped(self, flipped, animate=False):
+        """设成"铰链在上边/在下边"状态。`animate=True` 时平滑转过去。"""
+        target = 180.0 if flipped else 0.0
+        if animate and abs(self._angle - target) > 1:
+            self._anim.stop()
+            self._anim.setStartValue(self._angle)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._set_angle(target)
+
+    def paintEvent(self, ev):                      # noqa: N802
+        """画按钮: **左侧旋转的小屏幕图标 + 紧跟其后的文字**。
+
+        不用 QPushButton 自带的文字绘制, 因为它的对齐 (居中) 会和图标打架 ——
+        实测就是"图标在左、文字居中", 看着像文字**偏右**、和图标分了家。
+        这里自己排: 图标在最左, 文字**紧接图标**开始, 两者是一个整体。
+        """
+        # 先把文字设为空, 让父类只画**背景/边框** (保留 Fluent 的透明材质),
+        # 文字由下面自己画 —— 否则会出现"两份文字"。
+        real = self.text()
+        if real:
+            self.setText("")
+            try:
+                super().paintEvent(ev)
+            finally:
+                self.setText(real)
+        else:
+            super().paintEvent(ev)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        col = self.palette().color(self.foregroundRole())
+        h = self.height()
+        # 图标: 靠左, 垂直居中
+        side = max(8, min(h - 12, 16))
+        x = 8.0
+        y = (h - side * 0.78) / 2.0 - side * 0.11
+        # 绕图标中心旋转 (动画角度)
+        p.save()
+        p.translate(x + side / 2.0, y + side * 0.39)
+        p.rotate(self._angle)
+        p.translate(-(x + side / 2.0), -(y + side * 0.39))
+        rect = QRectF(x, y, side, side * 0.78)
+        pen = QPen(col)
+        pen.setWidthF(1.3)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, 1.5, 1.5)
+        # 铰链那条粗线: **加粗的一边就是铰链所在边** —— 旋转后一眼看出它换到
+        # 了上边还是下边。
+        pen2 = QPen(col)
+        pen2.setWidthF(2.4)
+        p.setPen(pen2)
+        p.drawLine(int(rect.left()), int(rect.top()),
+                   int(rect.right()), int(rect.top()))
+        p.restore()
+        # 文字: 紧接图标右侧, 垂直居中
+        if real:
+            p.setPen(col)
+            p.setFont(self.font())
+            tx = x + side + 5.0
+            ty = (h + p.fontMetrics().ascent() - p.fontMetrics().descent()) / 2.0
+            p.drawText(QRectF(tx, 0, max(0.0, self.width() - tx - 4), h),
+                       int(Qt.AlignmentFlag.AlignLeft
+                           | Qt.AlignmentFlag.AlignVCenter), real)
 
 
 class CameraScanThread(QThread):
@@ -142,6 +297,8 @@ class SettingsPanel(QWidget):
         self.sw_autoglass.checkedChanged.connect(self._on_autoglass)
         self.sw_autostart.checkedChanged.connect(self._on_autostart)
         self.sw_lowmem.checkedChanged.connect(self._on_lowmem)
+        self.cmb_capture_backend.currentIndexChanged.connect(
+            self._on_capture_backend)
         for box in self._inputs.values():
             box.changed.connect(self._on_effect)
 
@@ -185,34 +342,77 @@ class SettingsPanel(QWidget):
     # ---------------------------------------------------------- 角度源
     def _build_source_card(self):
         card = CardWidget()
+        # 存起来: 切源后要强制它重排 (见 _relayout_source_card)
+        self._source_card = card
         lay = card_layout(card)
 
         self.seg_source = SegmentBar()
-        for name in SOURCE_ORDER:
+        # 只列 PANEL_SOURCES (摄像头 / ESP32) —— 键盘手动的入口在调试页。
+        for name in PANEL_SOURCES:
             self.seg_source.add(LABELS.get(name, name), name)
         lay.addWidget(row(StrongBodyLabel("角度源"), None, self.seg_source,
                           spacing=8)[0])
 
+        # ── 按角度源切换的"源设置"行 ────────────────────────────────
+        # 摄像头模式显示「摄像头 + 扫描」, ESP32 模式显示「串口」——
+        # 两者都放在**同一位置**, 用 QStackedWidget 按当前源切换显示。
+        # 这样主窗一眼就能看到"当前源该怎么设", 不用去高级设置里翻。
+        self.stack_src_setting = QStackedWidget()
+
+        # (a) 摄像头: 选择设备 + 扫描
         self.cmb_camera = ComboBox()
         self.btn_scan = TransparentPushButton("扫描")
         self.btn_scan.clicked.connect(self.start_scan)
-        lay.addWidget(self._labeled("摄像头", row(self.cmb_camera, self.btn_scan,
-                                                  spacing=6)[0]))
+        cam_box, _ = row(self.cmb_camera, self.btn_scan, spacing=6,
+                         stretch_last=False)
+        self.stack_src_setting.addWidget(self._labeled("摄像头", cam_box))
 
-        # 摄像头相关的快捷操作 (标定基准帧 / 翻转方向)
+        # (b) ESP32: 串口名 (原来在「高级设置 -> 启动与标定」里, 挪到这里)
+        self.edt_port = LineEdit()
+        self.edt_port.setPlaceholderText("COM3")
+        port_box, _ = row(self.edt_port, spacing=6)
+        self.stack_src_setting.addWidget(self._labeled("ESP32 串口", port_box))
+
+        lay.addWidget(self.stack_src_setting)
+
+        # 摄像头相关的快捷操作 (标定基准帧 / 翻转方向) —— 只在摄像头模式有意义。
+        # **要藏就藏这一整行 (外层 _labeled 容器)**: 只藏内层的话外层还占着
+        # 一行高, ESP32 模式下就会留下一块 43px 的空白 (实测)。
         self.btn_calib = TransparentPushButton("标定基准帧")
         self.btn_calib.clicked.connect(self._quick_calibrate)
-        self.btn_flip = TransparentPushButton("翻转方向")
+        self.btn_flip = TransparentPushButton("反转开合方向")
         self.btn_flip.clicked.connect(self._quick_flip)
-        lay.addWidget(self._labeled("", row(self.btn_calib, self.btn_flip, spacing=6)[0]))
+        # 「反转铰链方向」: 点一下把铰链从屏幕底边换到顶边 (给"反着用笔记本"
+        # 的场景), 再点一下换回来。按钮上画一个**小屏幕图标并做 180° 旋转
+        # 动画** —— 一眼就看出"这次会把铰链转到哪一边"。
+        self.btn_hinge = _RotatingScreenButton()
+        self.btn_hinge.clicked.connect(self._toggle_hinge)
+        # 三个按钮**等间距**排一行, 末尾留伸缩把整组推向左。
+        #
+        # ⚠️ **这一行不要用 `_labeled("", ...)`** —— 那会给它套一个 78px 的
+        # **空标签** (+10px 间距), 于是:
+        #   1. 按钮组被推到 x=88 -> 看着"太靠右" (用户反馈);
+        #   2. 整行 sizeHint 变成 78+10+312=400+, 而卡片可用宽只有 402 ->
+        #      **右侧被裁**, "反转铰链方向"末尾几个字被切掉。
+        # 这里是"没有标签的一行", 直接放按钮组即可 (左边跟卡片内边距对齐,
+        # 反而和上面各行的**控件列**对齐不上 —— 但那本来也不是标签行)。
+        ops_inner, ops_lay = row(self.btn_calib, self.btn_flip, self.btn_hinge,
+                                 spacing=8)
+        ops_lay.addStretch(1)
+        self.row_cam_ops = ops_inner          # 显隐用 (见 _refresh_sources)
+        lay.addWidget(ops_inner)
 
+        # 当前模式的快捷键提示。
+        # **只在摄像头 / ESP32 模式显示** —— 那两模式下热键是"兜底手段"
+        # (紧急关闭、标定), 用户需要知道按什么。键盘模式那一大串浓度/调试键
+        # 不在这里 (会把主窗撑长), 统一在「高级设置 -> 调试」的键盘模式块里。
         self.lbl_keys = CaptionLabel("")
-        self.lbl_keys.setWordWrap(True)
+        self._auto_height_label(self.lbl_keys)
         self.lbl_keys.setObjectName("hint")
         lay.addWidget(self.lbl_keys)
 
         self.lbl_scan = CaptionLabel("")
-        self.lbl_scan.setWordWrap(True)
+        self._auto_height_label(self.lbl_scan)
         lay.addWidget(self.lbl_scan)
         return card
 
@@ -233,8 +433,11 @@ class SettingsPanel(QWidget):
         self._adv_dialog = QDialog(self)
         self._adv_dialog.setWindowTitle("win-duo 高级设置")
         self._adv_dialog.setWindowIcon(make_icon())
-        # 可缩放 / 可最大化 (只给最小尺寸, 不锁宽)
-        self._adv_dialog.setMinimumSize(400, 320)
+        # 可缩放 / 可最大化 (只给最小尺寸, 不锁宽)。
+        # **高度最小值要给小**: 之前是 320, 而「启动与标定」页内容只要 ~234px,
+        # 于是那一页必然留 ~86px 空白 (setMinimumSize 是硬下限, 缩不下去)。
+        # 取 200: 仍能容下最矮那页, 又把空白压掉。
+        self._adv_dialog.setMinimumSize(400, 200)
         self._adv_dialog.resize(430, 400)
         # Qt 的 QDialog 默认旗标**不含**最大化/最小化按钮, 要显式加上才能最大化。
         self._adv_dialog.setWindowFlags(
@@ -250,9 +453,15 @@ class SettingsPanel(QWidget):
         self.tab_adv.add("效果参数", "effect")
         self.tab_adv.add("启动与标定", "launch")
         self.tab_adv.add("调试", "debug")
+        # **垂直方向固定**: 标签栏只占一行高。不设的话它会被布局拉伸 ——
+        # 实测弹窗里它被拉到 153px (占了弹窗一半), 三个按钮变得又高又空,
+        # 看起来就是"UI 异常"。(stack 用 setFixedHeight 后多余空间会全给它。)
+        self.tab_adv.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                   QSizePolicy.Policy.Fixed)
         body.addWidget(self.tab_adv)
 
-        self.stack_adv = QStackedWidget()
+        # 用 _CurPageStack: sizeHint 只按当前页算 (否则矮页被最高页撑出空白)
+        self.stack_adv = _CurPageStack()
 
         # 页面 1: 效果参数 (出界模式、转角、眼距、模糊、重截频率、背景图)
         p1 = QWidget()
@@ -304,10 +513,8 @@ class SettingsPanel(QWidget):
         self.sw_autostart.setOnText("开")
         self.sw_autostart.setOffText("关")
         l2.addWidget(self._labeled("开机自启", self.sw_autostart))
-
-        self.edt_port = LineEdit()
-        self.edt_port.setPlaceholderText("COM3")
-        l2.addWidget(self._labeled("ESP32 串口", self.edt_port))
+        # 注: 「ESP32 串口」输入框已挪到**主窗**「角度源」下面 —— 那里按当前源
+        # 显示对应设置 (摄像头选择 / 串口), 比藏在高级设置里直观得多。
         self.stack_adv.addWidget(p2)
 
         # 页面 3: 调试 (匹配调试窗、查看日志)
@@ -330,7 +537,46 @@ class SettingsPanel(QWidget):
         self.sw_lowmem.setOnText("开")
         self.sw_lowmem.setOffText("关")
         l3.addWidget(self._labeled("低内存模式", self.sw_lowmem))
-        l3.addStretch(1)
+
+        # ── 采集后端 ─────────────────────────────────────────────────
+        # 三种抓屏方式性能差很多 (实测: wgc ~0.5ms/帧 < dxgi ~1.1ms <<
+        # mss ~27ms), 所以默认 auto 让系统挑最优; 想强制某个后端 (排查问题时
+        # 对比行为) 就在这里选。**改完立即生效**, 不用重启。
+        self.cmb_capture_backend = ComboBox()
+        try:
+            from render.capture import available_backends
+            for label, val in available_backends():
+                self.cmb_capture_backend.addItem(label, val)
+        except Exception:  # noqa: BLE001
+            for val in ("auto", "wgc", "dxgi", "mss"):
+                self.cmb_capture_backend.addItem(val, val)
+        l3.addWidget(self._labeled("采集后端", self.cmb_capture_backend))
+        self.lbl_capture_state = CaptionLabel("")
+        self.lbl_capture_state.setObjectName("hint")
+        l3.addWidget(self.lbl_capture_state)
+
+        # ── 键盘模式 (调试功能) ──────────────────────────────────────
+        # **键盘模式的快捷键本质就是调试功能**: 它只在"键盘手动"角度源下
+        # 才注册, 用来在没有摄像头/陀螺仪时手动拉浓度、开调试窗。所以整块
+        # 放在调试页 —— 含一个"切到键盘模式"的按钮 + 该模式的全部快捷键。
+        l3.addWidget(StrongBodyLabel("键盘模式"))
+        self.btn_manual = TransparentPushButton("切到键盘手动")
+        self.btn_manual.clicked.connect(self._switch_to_manual)
+        self.lbl_manual_state = CaptionLabel("")
+        self.lbl_manual_state.setObjectName("hint")
+        l3.addWidget(self._labeled("", row(self.btn_manual, self.lbl_manual_state,
+                                          spacing=8)[0]))
+        # 键盘模式专属的快捷键列表
+        self.lbl_keys_manual = CaptionLabel("")
+        self._auto_height_label(self.lbl_keys_manual)
+        self.lbl_keys_manual.setObjectName("hint")
+        self.lbl_keys_manual.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        l3.addWidget(self.lbl_keys_manual)
+        # 注: 原来这里还有一组「全部快捷键」(列各模式的键做对照)。它与上面的
+        # 「键盘模式」高度重复, 所以删掉 —— 调试页只保留键盘模式这一组。
+        # 也**不加 addStretch**: 页面高度要由内容决定 (见 _fit_adv_page 会按
+        # 当前页 sizeHint 设固定高); 加了 stretch 反而让 sizeHint 虚高、留白。
         self.stack_adv.addWidget(p3)
 
         body.addWidget(self.stack_adv)
@@ -369,6 +615,47 @@ class SettingsPanel(QWidget):
         lay.setStretch(1, 1)
         return box
 
+    @staticmethod
+    def _auto_height_label(lbl):
+        """让一个 wordWrap 的提示标签**只占它实际需要的高度**。
+
+        为什么要这个: `QLabel` 开了 `wordWrap` 后, `sizeHint()` 会按**最坏
+        情况** (整个文本挤在一行) 去估高度, 算出来**虚高** —— 实测两行文字
+        只需要 32px, sizeHint 却报 51px。后果有三个, 都是用户看到的:
+          - 布局按虚高分配 -> 卡片/sizeHint 一起虚高 -> **顶部/底部空白**;
+          - 空间不够时 Qt 又按真实需要压缩 -> 标签被压到 34px -> **文字被裁**;
+          - 于是同一个标签高度在 34~51 之间摇摆 -> **看起来"错位/跳动"**。
+
+        这里按"当前宽度下真正需要几行"来设固定高度, 并在宽度变化时重算
+        (见 resizeEvent 钩子), 高度就稳定了。
+        """
+        lbl.setWordWrap(True)
+        lbl.setSizePolicy(QSizePolicy.Policy.Preferred,
+                          QSizePolicy.Policy.Fixed)
+
+        def fit():
+            fm = lbl.fontMetrics()
+            avail = max(40, lbl.width())
+            text = lbl.text()
+            # **空文本就彻底隐藏** —— 否则它仍占一行高 + 布局间距 (实测白白
+            # 多出 ~28px 空白, 看着就是"这块区域太大")。
+            if not text.strip():
+                lbl.setVisible(False)
+                return
+            lbl.setVisible(True)
+            # **自己算行数**, 不用 heightForWidth —— 后者偏保守 (实测 1 行文字
+            # 会给 22px, 而 fm.height() 只要 16px), 多出来的就成了空白。
+            rows = 0
+            for line in (text.splitlines() or [""]):
+                w = fm.horizontalAdvance(line)
+                rows += max(1, -(-w // avail))      # 向上取整的换行数
+            h = max(1, rows) * fm.height() + 2      # +2 余量, 免得最后一行被切
+            if lbl.height() != h:
+                lbl.setFixedHeight(h)
+
+        lbl._fit_height = fit
+        return lbl
+
     # ================================================================ 刷新
     def refresh_all(self):
         self._loading = True
@@ -381,6 +668,8 @@ class SettingsPanel(QWidget):
             self.sw_autoglass.setChecked(bool(self.cfg.get("autostart_glass", True)))
             self.sw_autostart.setChecked(autostart.is_enabled())
             self.sw_lowmem.setChecked(bool(self.cfg.get("low_memory_mode", False)))
+            self._sync_capture_combo()
+            self._refresh_capture_state()
         finally:
             self._loading = False
         self._refresh_status()
@@ -394,30 +683,211 @@ class SettingsPanel(QWidget):
                 self.cmb_screen.setCurrentIndex(self.cmb_screen.count() - 1)
 
     def _refresh_sources(self):
-        self.seg_source.set_current(self.controller.hub.active_name())
+        # 键盘手动不在主窗这一排里 (它在调试页), 所以当前是 manual 时
+        # **不高亮任何一项** —— 硬 set_current("manual") 找不到项会出错。
+        active = self.controller.hub.active_name()
+        if active in PANEL_SOURCES:
+            self.seg_source.set_current(active)
+        # 主窗那一行"源设置"跟着当前源切换:
+        #   摄像头 -> 摄像头选择 + 扫描 (+ 标定/翻转按钮)
+        #   ESP32  -> 串口名
+        # 键盘模式两者都用不上, 显示摄像头那页 (无害), 但把摄像头专属按钮藏掉。
+        is_cam = (active == "camera")
+        self.stack_src_setting.setCurrentIndex(0 if active != "serial" else 1)
+        self.row_cam_ops.setVisible(is_cam)
+        # 铰链方向按钮的图标状态跟配置同步 (不播动画, 免得每次刷新都转一下)
+        if getattr(self, "btn_hinge", None) is not None:
+            self.btn_hinge.set_flipped(
+                bool(self.cfg.get("flip_hinge", False)), animate=False)
         self._fill_camera_combo()
         self.edt_port.setText(str(self.cfg.get("port", "COM3")))
         self._refresh_hotkeys()
+        # **切源后必须强制重排这一块。** 否则会出现这个真 bug:
+        # ESP32 -> 摄像头时, 上面那行从"串口输入框"换成"摄像头+扫描", 加上
+        # 标定/翻转按钮重新出现、快捷键提示从 1 行变 2 行 —— 内容变高了, 但
+        # 布局还按旧尺寸算, 于是**按钮被压扁、甚至被下面的提示遮住**。
+        # (实测: 卡片内容底 133 > 卡片高 132 -> 溢出; 按钮高只有 18px 而非 31px。)
+        self._relayout_source_card()
+
+    def _relayout_source_card(self):
+        """让主窗「角度源」卡片按新内容重新算尺寸。
+
+        `setVisible` 切换 / `QStackedWidget` 换页之后, Qt **不保证**立刻重排;
+        必须显式 invalidate + activate, 再让卡片和窗口重新贴合高度。
+        """
+        card = getattr(self, "_source_card", None)
+        stack = getattr(self, "stack_src_setting", None)
+        if stack is not None:
+            cur = stack.currentWidget()
+            if cur is not None:
+                cur.updateGeometry()
+                lay = cur.layout()
+                if lay is not None:
+                    lay.invalidate()
+                    lay.activate()
+        if card is not None:
+            card.updateGeometry()
+            lay = card.layout()
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+        # 内容可能变高 -> 窗口跟着长 (但不超过屏幕, 见 _fit_height)
+        self._loading = True
+        try:
+            self._fit_hint_labels()
+            self.updateGeometry()
+            self._grow_to_fit()
+        finally:
+            self._loading = False
+
+    def _grow_to_fit(self):
+        """窗口内容变高后, 把它撑到刚好放得下 (不超出屏幕)。
+
+        与 `_fit_height` 的区别: 那个只在**首次显示**跑一次; 这个可以在运行时
+        反复调 (切源 / 扫描结果变化), 保证不会出现"内容比窗口高 -> 控件被遮"。
+        用户手动拉大过就不动它 (尊重用户)。
+        """
+        if self.isMaximized():
+            return
+        try:
+            need = self.sizeHint().height()
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr is not None:
+                avail = scr.availableGeometry().height()
+                if avail > 100:
+                    need = min(need, avail - 40)
+            if need > self.height():
+                self.resize(self.width(), need)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _refresh_hotkeys(self):
-        """列出**当前真正生效**的全局热键。
+        """刷新两处快捷键文案。
 
-        启动器用的是 pythonw, 没有控制台 —— 以前键盘模式靠 msvcrt 读控制台按键,
-        那样根本读不到, 所以键盘模式"没生效"。现在改为全局热键, 并且要在这里
-        明明白白告诉用户按什么 (只列注册成功的, 免得显示一堆按了没反应的键)。
+        - **主窗 `lbl_keys`**: 只在**摄像头 / ESP32** 模式显示当前可用的热键
+          (就是"紧急关闭 + 标定"这种兜底手段)。键盘模式不在这里显示 ——
+          那一大串浓度/调试键会撑长主窗, 它们在下面那处。
+        - **调试页 `lbl_keys_manual`**: 键盘模式块 (状态 + 该模式全部键)。
         """
+        active = self.controller.hub.active_name()
+        manual_now = (active == "manual")
+
+        # ---- 键盘模式: 状态 + 该模式的快捷键 ----
         try:
-            lines = self.controller.hotkey_lines()
+            from .controller import HOTKEY_DEFS
         except Exception:  # noqa: BLE001
-            lines = []
-        manual = self.controller.hub.active_name() == "manual"
-        if not lines:
-            self.lbl_keys.setText("")
+            HOTKEY_DEFS = ()
+
+        def spec_of(key):
+            return str(self.cfg.get(key, "") or "(未设置)")
+
+        # ---- 主窗: 摄像头/ESP32 才显示 (键盘模式靠调试页那块) ----
+        main_lbl = getattr(self, "lbl_keys", None)
+        if main_lbl is not None:
+            if manual_now:
+                main_lbl.setText("")       # 键盘模式不在主窗列 (见调试页)
+            else:
+                try:
+                    rows = self.controller.hotkey_lines()
+                except Exception:  # noqa: BLE001
+                    rows = []
+                main_lbl.setText(
+                    "\n".join("  %s  %s" % (k, v.replace("−", "-"))
+                              for k, v in rows))
+
+        if getattr(self, "lbl_manual_state", None) is not None:
+            self.lbl_manual_state.setText(
+                "（当前已是键盘模式）" if manual_now
+                else "（当前是 %s）" % self.controller.hub.active_label())
+        # 按钮文案跟着状态走 —— 它是**开关**: 进了键盘模式后要能切回去
+        # (键盘模式已不在主窗"角度源"那一排里, 这是唯一的出口)。
+        btn = getattr(self, "btn_manual", None)
+        if btn is not None:
+            btn.setText("切回传感器源" if manual_now else "切到键盘手动")
+        manual_rows = ["%s  %s" % (spec_of(key), label.replace("−", "-"))
+                       for name, key, label, mode in HOTKEY_DEFS
+                       if mode == "manual"]
+        if getattr(self, "lbl_keys_manual", None) is not None:
+            self.lbl_keys_manual.setText("\n".join(manual_rows))
+
+        self._fit_hint_labels()
+
+    def _fit_hint_labels(self):
+        """把三个 wordWrap 提示标签的高度按实际文字重算一遍, 并让弹窗跟着改高。
+
+        必须在**每次 setText 之后**调用 —— 标签高度依赖当前文字行数, 不刷新
+        就会出现"文字换了但高度还是旧的" -> 裁字或留白。
+
+        ⚠️ **同时要重算弹窗高度 (`_fit_adv_page`)。** 否则会出现这个真 bug:
+        默认 ESP32 -> 切到键盘模式时, 调试页的快捷键列表从 1 条变 6 条,
+        标签变高了, 但弹窗高度还停在旧值 -> **下面的快捷键被遮住一部分**。
+        (原来只在切 tab 时才调 _fit_adv_page, 切"模式"时不会。)
+        """
+        for lbl in (getattr(self, "lbl_keys", None),
+                    getattr(self, "lbl_scan", None),
+                    getattr(self, "lbl_keys_manual", None)):
+            if lbl is None:
+                continue
+            fn = getattr(lbl, "_fit_height", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001
+                    pass
+        # 标签高度变了 -> 当前页需要的高度也变了 -> 弹窗跟着调
+        d = getattr(self, "_adv_dialog", None)
+        if d is not None and d.isVisible():
+            page = self.stack_adv.currentWidget()
+            if page is not None:
+                lay = page.layout()
+                if lay is not None:
+                    lay.activate()          # 先让布局把新高度算出来
+            self._fit_adv_page()
+            if not d.isMaximized():
+                d.adjustSize()
+                self._clamp_adv_to_screen()
+
+    def resizeEvent(self, ev):
+        """窗口宽度变了 -> 提示标签可能换行数, 重算高度。"""
+        super().resizeEvent(ev)
+        self._fit_hint_labels()
+        # 弹窗也重算 (它有自己的宽度)
+        d = getattr(self, "_adv_dialog", None)
+        if d is not None and d.isVisible():
+            QTimer.singleShot(0, self._fit_hint_labels)
+
+    def _switch_to_manual(self):
+        """在"键盘手动"和上一个真实传感器源之间切换 (调试用)。
+
+        **做成开关**: 键盘模式不在主窗的"角度源"那一排里了 (它的入口就在
+        这个按钮), 所以必须有办法切回去 —— 否则进了键盘模式就只能改配置文件
+        才能出去。切回去时优先回摄像头, 没摄像头就回 ESP32。
+        """
+        active = self.controller.hub.active_name()
+        if active == "manual":
+            # 切回去: 优先摄像头, 其次串口
+            target = "camera" if self._camera_usable() else "serial"
+        else:
+            target = "manual"
+        try:
+            self.controller.set_source(target)
+        except Exception as exc:  # noqa: BLE001
+            print("[ui] 切换角度源失败: %s" % exc)
             return
-        head = ("键盘模式快捷键（全局生效，不需要窗口焦点）:"
-                if manual else "全局热键:")
-        body = "\n".join("      %-22s %s" % (k, v) for k, v in lines)
-        self.lbl_keys.setText(head + "\n" + body)
+        self.controller.save()
+        # 切源后热键会重新注册 —— 刷新界面各处 (含本页快捷键文案)
+        self._loading = True
+        try:
+            self._refresh_sources()
+        finally:
+            self._loading = False
+
+    def _camera_usable(self):
+        """摄像头源当前是否可用 (用于决定"切回去"的目标)。"""
+        try:
+            return self.controller.hub.device_available("camera") is not False
+        except Exception:  # noqa: BLE001
+            return True
 
     def _fill_camera_combo(self):
         self.cmb_camera.clear()
@@ -447,22 +917,30 @@ class SettingsPanel(QWidget):
         # setValue 就不会误夹。
         self._refresh_refresh_max()
         for key, box in self._inputs.items():
-            box.setValue(self.cfg.get(key, 0), emit=False)
+            # 缺失时用该字段自己的下限 (而不是硬编码 0) —— 否则 refresh_hz
+            # 缺失时会填 0, 而 0 的语义是"不设限", 与默认 -1 不同, 容易混。
+            lo = getattr(box, "_lo", 0)
+            box.setValue(self.cfg.get(key, lo), emit=False)
         self.edt_backdrop.setText(str(self.cfg.get("backdrop_path", "")))
 
     def _refresh_refresh_max(self):
-        """"重截频率"的上限设成**显示器刷新率** —— 固定值, 不做动态测量。
+        """"重截频率"的上限设成**当前选中显示器的刷新率** —— 固定值, 不做动态测量。
 
         之前拿实测单帧耗时算上限, 结果它随负载在 18~165 之间跳, 用户看到一个
         变来变去的数字只会困惑。上限就该是一个稳定的"最高可用频率":
         合成器每秒最多产那么多帧, 填更高也没有用。
+
+        ⚠️ **下限必须是 -1 (不设限), 不能写成 1。** 原来这里 `set_range(1, hi)`
+        会把 INPUTS 里定义的 -1 下限冲掉 —— 于是输入框里根本填不了 -1, 用户
+        看到的是"这个框写不了 -1", 实际是这里每次刷新都把它夹回 1。
         """
         box = self._inputs.get("refresh_hz")
         if box is None:
             return
         hi = max(1, int(round(self.controller.screen_hz())))
-        if int(box._hi) != hi:
-            box.set_range(1, hi)
+        # 下限固定 -1 (=-1 表示"自动跟随刷新率/不设限")
+        if int(box._hi) != hi or int(box._lo) != -1:
+            box.set_range(-1, hi)
 
     def _refresh_glass(self):
         on = self.controller.glass_on
@@ -476,6 +954,8 @@ class SettingsPanel(QWidget):
         # 白做功。隐藏时直接返回, 再显示时 refresh_all/下一次 tick 会补上。
         if not self.isVisible():
             return
+        # 实际在用的采集后端可能变 (auto 重试 / 回退), 顺手刷新那行说明
+        self._refresh_capture_state()
         try:
             level, name, status, detail = self.controller.hub.resolve()
         except Exception:  # noqa: BLE001
@@ -507,10 +987,15 @@ class SettingsPanel(QWidget):
 
     # ================================================================ 交互
     def _fit_height(self):
-        """首次显示时把窗口高度贴合内容 —— 不留底部空白。
+        """首次显示时把窗口高度贴合内容 —— 不留底部空白, 也**不超出屏幕**。
 
         只做一次 (`self._fitted`): 之后用户手动拉大/最大化都不再干预。
         用 sizeHint 而不是 setFixedHeight, 所以窗口仍然可自由缩放/最大化。
+
+        ⚠️ **必须夹到屏幕可用高度。** 原来直接 `resize(w, sizeHint().height())`,
+        内容一多 (快捷键列表、扫描结果) 窗口就长得比屏幕还高 -> **下半截跑到
+        屏幕外**, 用户看到的就是"切换后把其他组件遮住了 / 窗口底不见了"。
+        实测: 主窗高 401、y=849, 屏幕可用底只有 1019 -> 超出 231px。
         """
         if self._fitted:
             return
@@ -518,7 +1003,37 @@ class SettingsPanel(QWidget):
         if self.isMaximized():
             return
         h = max(self.minimumHeight(), self.sizeHint().height())
+        # 夹到当前屏幕的可用高度 (留一点边距, 免得贴着任务栏)
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            avail = scr.availableGeometry().height() if scr is not None else 0
+            if avail > 100:
+                h = min(h, avail - 40)
+        except Exception:  # noqa: BLE001
+            pass
         self.resize(self.width(), h)
+        # 位置也拉回屏幕内 (内容变高后底边可能已经出屏)
+        self._clamp_to_screen()
+
+    def _clamp_to_screen(self):
+        """把窗口挪回当前屏幕的可用区域内 (底边/右边出屏时)。"""
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr is None:
+                return
+            a = scr.availableGeometry()
+            g = self.frameGeometry()
+            x, y = g.x(), g.y()
+            if x + g.width() > a.x() + a.width():
+                x = a.x() + a.width() - g.width()
+            if y + g.height() > a.y() + a.height():
+                y = a.y() + a.height() - g.height()
+            x = max(a.x(), x)
+            y = max(a.y(), y)
+            if (x, y) != (g.x(), g.y()):
+                self.move(x, y)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _open_advanced(self):
         """弹出高级设置窗 (modeless, 跟随主窗但不阻塞)。"""
@@ -531,7 +1046,11 @@ class SettingsPanel(QWidget):
         if first:
             # **只在首次显示时贴合内容**。之后用户可能拉大/最大化了, 再调
             # adjustSize 会把它强行缩回去, 跟最大化打架。
+            # 先让 stack 贴合当前页高度, adjustSize 才不会被"最高那页"撑大。
+            self._fit_adv_page()
             d.adjustSize()
+        # 无论首次还是再次打开, 都拉回屏幕内 (内容可能变长过)
+        self._clamp_adv_to_screen()
         d.raise_()
         d.activateWindow()
 
@@ -550,10 +1069,78 @@ class SettingsPanel(QWidget):
         mapping = {"effect": 0, "launch": 1, "debug": 2}
         if key in mapping:
             self.stack_adv.setCurrentIndex(mapping[key])
+            self._fit_adv_page()
             # 换页后贴合新页内容 —— 但用户已拉大/最大化时别动, 否则会缩回去
             d = self._adv_dialog
             if not d.isMaximized():
                 QTimer.singleShot(0, d.adjustSize)
+                QTimer.singleShot(0, self._clamp_adv_to_screen)
+
+    def _clamp_adv_to_screen(self):
+        """把高级设置弹窗挪回、缩回屏幕可用区域内。
+
+        它按内容长高 (快捷键列表一长就变高), 长过头就会**下半截跑到屏幕外**。
+        这里: 先夹高度, 再把位置挪回屏内。
+        """
+        d = getattr(self, "_adv_dialog", None)
+        if d is None or not d.isVisible() or d.isMaximized():
+            return
+        try:
+            scr = d.screen() or self.screen() or QApplication.primaryScreen()
+            if scr is None:
+                return
+            a = scr.availableGeometry()
+            g = d.frameGeometry()
+            h = min(g.height(), max(200, a.height() - 40))
+            if h != g.height():
+                d.resize(d.width(), h)
+                g = d.frameGeometry()
+            x, y = g.x(), g.y()
+            if x + g.width() > a.x() + a.width():
+                x = a.x() + a.width() - g.width()
+            if y + g.height() > a.y() + a.height():
+                y = a.y() + a.height() - g.height()
+            d.move(max(a.x(), x), max(a.y(), y))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _fit_adv_page(self):
+        """让弹窗高度贴合**当前这一页**, 不留一大片空白。
+
+        `QStackedWidget.sizeHint()` 取的是**所有子页里最大**的那个, 所以
+        「启动与标定」只有 ~130px 内容, 却会被最高页 (效果参数 ~300px) 撑到
+        同样高 —— 底部一大片空白。`adjustSize()` 也救不了 (它信的正是这个
+        sizeHint)。
+
+        解法: **让 stack 的 sizeHint 跟随当前页** (见下面的 _CurPageStack)。
+        不能用 `setFixedHeight`: 那是**硬**约束, 一旦标签因为换行/DPI 需要更高
+        的高度, 页面被钉死 -> 控件互相挤压/遮挡 (用户反馈的"切换后控件互遮")。
+        """
+        # 只需通知 stack 重新算 sizeHint (它会按当前页返回), 再让布局生效
+        self.stack_adv.updateGeometry()
+        page = self.stack_adv.currentWidget()
+        if page is not None:
+            page.updateGeometry()
+            lay = page.layout()
+            if lay is not None:
+                lay.activate()
+
+    def _toggle_hinge(self):
+        """反转铰链方向 (底边 <-> 顶边), 并让按钮图标转过去。"""
+        cur = bool(self.cfg.get("flip_hinge", False))
+        new = not cur
+        self.cfg["flip_hinge"] = new
+        self.controller.save()
+        # 让 overlay 立刻按新设置重画 (它每帧都从 cfg 读, apply_config 会刷新)
+        try:
+            if self.controller.overlay is not None:
+                self.controller.overlay.apply_config()
+                self.controller.overlay.update()
+        except Exception:  # noqa: BLE001
+            pass
+        if getattr(self, "btn_hinge", None) is not None:
+            self.btn_hinge.set_flipped(new, animate=True)
+        print("[ui] 铰链方向 -> %s" % ("顶边 (反着用)" if new else "底边"))
 
     def _quick_calibrate(self):
         wdlog.log.debug("用户操作: 标定基准帧", tag="ui")
@@ -595,7 +1182,13 @@ class SettingsPanel(QWidget):
         wdlog.log.debug("用户操作: 角度源 -> %s" % key, tag="ui")
         self.controller.set_source(key)
         self.controller.save()
-        self._refresh_hotkeys()
+        # 用 _refresh_sources 而不是只刷热键 —— 它能一并把主窗那行"源设置"
+        # 切到对应的控件 (摄像头选择 / 串口), 以及显隐标定按钮。
+        self._loading = True
+        try:
+            self._refresh_sources()
+        finally:
+            self._loading = False
         self._refresh_status()
 
     def _on_camera(self, _pos):
@@ -673,6 +1266,44 @@ class SettingsPanel(QWidget):
         wdlog.log.debug("用户操作: 打开运行日志窗口", tag="ui")
         self._open_log_dialog()
 
+    def _on_capture_backend(self, _idx):
+        """采集后端下拉框变了 -> 立即切换 (不用重启)。"""
+        if self._loading:
+            return
+        val = self.cmb_capture_backend.currentData()
+        if not val:
+            return
+        ok = self.controller.set_capture_backend(val)
+        self._refresh_capture_state()
+        if not ok:
+            # 切失败 (比如手动选了 wgc 但这台机器不支持) -> 把下拉框退回原值,
+            # 免得界面显示的和实际在用的不一致。
+            self._loading = True
+            try:
+                self._sync_capture_combo()
+            finally:
+                self._loading = False
+
+    def _sync_capture_combo(self):
+        """把下拉框设成 cfg 里的值 (不发信号)。"""
+        cur = str(self.cfg.get("capture_backend", "auto"))
+        i = self.cmb_capture_backend.findData(cur)
+        if i >= 0:
+            self.cmb_capture_backend.setCurrentIndex(i)
+
+    def _refresh_capture_state(self):
+        """显示"当前实际在用的后端" —— 与下拉框的选择可能不同 (auto 时由系统定)。"""
+        if getattr(self, "lbl_capture_state", None) is None:
+            return
+        want = str(self.cfg.get("capture_backend", "auto"))
+        actual = self.controller.capture_backend()
+        if want == "auto":
+            self.lbl_capture_state.setText(
+                "auto —— 系统自动挑选最优; 当前实际在用: %s" % actual)
+        else:
+            self.lbl_capture_state.setText(
+                "手动指定 %s; 当前实际在用: %s" % (want, actual))
+
     def _open_log_dialog(self):
         dlg = LogDialog(self)
         dlg.exec()
@@ -702,6 +1333,7 @@ class SettingsPanel(QWidget):
         self.btn_scan.setEnabled(False)
         wdlog.log.debug("用户操作: 开始扫描摄像头", tag="scan")
         self.lbl_scan.setText("扫描中… 会逐个打开摄像头, 约需几秒")
+        self._fit_hint_labels()
         self.controller.begin_scan()
         self._scan = CameraScanThread(self)
         self._scan.scanned.connect(self._on_scanned)
@@ -722,6 +1354,8 @@ class SettingsPanel(QWidget):
             self._fill_camera_combo()
         finally:
             self._loading = False
+        # 扫描结果文字变了 (行数可能变), 重算提示标签高度
+        self._fit_hint_labels()
 
     # ================================================================ 生命周期
     def showEvent(self, ev):

@@ -67,15 +67,26 @@ if (-not $SkipPipUpgrade) {
 Write-Host "== [3/3] install dependencies ==" -ForegroundColor Cyan
 # Single source of truth: read the dependency list from requirements.txt
 # (do NOT hardcode package names here -- keep the two in sync automatically).
+#
+# ⚠️ **必须用 UTF-8 读进来再喂给 pip, 不能直接 `-r requirements.txt`。**
+# requirements.txt 里有中文注释 (UTF-8), 而 pip 在中文 Windows 上会用 GBK 去
+# 解码它 -> `UnicodeDecodeError: 'gbk' codec can't decode byte 0x80` ->
+# 依赖装不上、脚本直接 throw。这里读成 UTF-8 文本、只取非注释行, 写到一个
+# 纯 ASCII 的临时文件里再安装 (已实测)。
+$reqSrc = Join-Path $root "requirements.txt"
+$reqAscii = Join-Path $tmp "req_ascii.txt"
+$reqLines = Get-Content -LiteralPath $reqSrc -Encoding UTF8 |
+    Where-Object { $_.Trim() -and -not $_.Trim().StartsWith("#") }
+Set-Content -LiteralPath $reqAscii -Value $reqLines -Encoding ASCII
 & $py -m pip install --disable-pip-version-check --cache-dir "$root\.pipcache" `
-    -i $IndexUrl --prefer-binary -r (Join-Path $root "requirements.txt")
+    -i $IndexUrl --prefer-binary -r $reqAscii
 if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 
 Write-Host ""
 Write-Host "== installed ==" -ForegroundColor Green
 & $py -c @"
 import importlib
-for m in ['cv2','numpy','PyQt6','OpenGL','mss','serial','PIL','qfluentwidgets']:
+for m in ['cv2','numpy','PyQt6','OpenGL','mss','serial','bettercam','qfluentwidgets']:
     try:
         mod = importlib.import_module(m)
         print('  %-16s OK   %s' % (m, getattr(mod, '__version__', '?')))
