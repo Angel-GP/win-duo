@@ -263,14 +263,14 @@ DEFAULT_CFG = {
     "camera_sign": -1,
     "port": "COM3",
     "baud": 115200,
-    "refresh_hz": 165.0,
-    # 重绘上限 (帧/秒)。**合盖动画是"浓度驱动"的** (每帧 level 都在变 -> 每帧都
-    # 需要重绘), 所以这个值直接决定动画顺滑度。实测本机 (2560x1600):
-    #     30 -> 27/s  单核 66.9%
-    #     60 -> 48/s  单核 77.7%     <- 帧率 +78%, CPU 只 +11pt (拐点)
-    #     90 -> 55/s  单核 82.2%     <- 收益递减
-    # 取 60: 顺滑度提升明显, 代价可接受。机器吃力可在设置里调低。
-    "render_fps": 60,
+    # 重截频率 (截屏上限, 帧/秒)。**-1 = 不设限 (默认)** —— 自动按"当前选中
+    # 显示器"的最高刷新率来 (合成器每秒最多产那么多帧, 抓更快没意义)。
+    # 设成 >0 才用固定值。换屏后自动跟随新屏的刷新率。
+    "refresh_hz": -1,
+    # 重绘上限 (帧/秒)。**-1 = 不限制 (默认)** —— 每 tick 都重绘, 而 tick 固定
+    # 16ms, 所以稳定 ~62.5 FPS, 与上游 WindowsDuo 行为一致, 动画最顺。
+    # 设成 >0 才启用上限 (想省 CPU / 降发热时用); 0 也按"不限制"处理 (兼容旧配置)。
+    "render_fps": -1,
     "capture_backend": "auto",
     "max_tilt_deg": 88.0,
     "eye_dist_h": 2.0,
@@ -458,8 +458,12 @@ def print_banner(cfg, region):
           % (cfg["max_tilt_deg"], cfg["eye_dist_h"]))
     print("              blur_spread=%.2f  出界=%s"
           % (cfg["blur_spread"], cfg["outside_mode"]))
-    print("  截屏      : %dx%d @ %.0fHz"
-          % (region["width"], region["height"], cfg.get("refresh_hz", 3)))
+    # 重截频率: -1 = 不设限 (自动用当前屏刷新率), 这时别打印 "-1Hz" —— 直接
+    # 显示"跟随刷新率", 免得用户以为配错了。
+    _rh = float(cfg.get("refresh_hz", -1))
+    print("  截屏      : %dx%d @ %s"
+          % (region["width"], region["height"],
+             ("%.0fHz" % _rh) if _rh > 0 else "自动(跟随屏幕刷新率)"))
     print("=" * 68)
 
 
