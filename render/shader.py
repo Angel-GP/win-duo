@@ -43,6 +43,7 @@ uniform float uDark;       // 单位模糊半径损失的光量
 uniform int   uMaxTaps;
 uniform int   uOutside;    // 0 = 出界纯黑(原版)  1 = 背景兜底(无黑场)
 uniform float uBgBlur;     // 背景相对前景的模糊比例
+uniform int   uFlipY;      // 1 = 铰链在**顶边** (反着用笔记本), 0 = 底边 (默认)
 in  vec2 vUV;
 out vec4 fragColor;
 
@@ -61,8 +62,14 @@ vec3 backdrop(vec2 screenUV, float radius) {
 }
 
 void main() {
-    // vUV: (0,0)=左下 (GL 约定)。铰链 = 屏幕底边。
-    vec2 p = vUV * uRes;                 // y 自底向上, y=0 在铰链
+    // vUV: (0,0)=左下 (GL 约定)。铰链默认 = 屏幕底边 (vUV.y=0)。
+    //
+    // **uFlipY=1 时铰链换到顶边** —— 给"反着用笔记本"(屏幕朝下/倒装摄像头)
+    // 的情况用。注意: 只是把**铰链位置**换到另一边, **桌面内容仍然正立**
+    // (用户看的是同一张桌面, 不是把它倒过来)。
+    //   `hingeY` = 该像素到**铰链**的距离 (0 = 贴着铰链, 越大越远)
+    float hingeY = (uFlipY == 1) ? (1.0 - vUV.y) : vUV.y;
+    vec2 p = vec2(vUV.x, hingeY) * uRes;
     float tilt = uTilt;
     vec2 uvFlat = vec2(vUV.x, 1.0 - vUV.y);   // 平视采样 (截图行序 top-first)
 
@@ -95,7 +102,14 @@ void main() {
     // 磨砂玻璃吸光: 与散射成正比地变暗
     float att = max(1.0 - uDark * radius, 0.0);
 
-    vec2 uvHit = vec2(hit.x / uRes.x, 1.0 - hit.y / uRes.y);
+    // 落点 -> 采样 UV。**y 要按铰链位置换算回去**:
+    //   hit.y 是在"到铰链的距离"那套坐标里的 (0 = 贴着铰链)。
+    //   铰链在底边时, 它等于"离底边的高度" -> uv.y = 1 - hit.y/H;
+    //   铰链在顶边时, 它等于"离顶边的深度" -> uv.y = hit.y/H。
+    // 少了这一步, 翻转后采样会**上下颠倒**(内容跟着倒过来), 而我们要的是
+    // 内容始终正立、只有铰链换边。
+    float hitV = (uFlipY == 1) ? (hit.y / uRes.y) : (1.0 - hit.y / uRes.y);
+    vec2 uvHit = vec2(hit.x / uRes.x, hitV);
 
     if (radius < 0.5) {
         fragColor = vec4(textureLod(uTex, uvHit, 0.0).rgb * att, 1.0);
@@ -119,13 +133,23 @@ void main() {
 
     vec3 sum = vec3(0.0);
     float cov = 0.0;
+    // 盘式采样的**垂直偏移方向**也跟铰链在哪一边有关:
+    //   hit.y 是"到铰链的距离", 铰链在底边时它向上增长 -> uv.y 减少 (取负);
+    //   铰链在顶边时它向下增长 -> uv.y 增加 (取正)。
+    // 不跟着翻的话, 模糊核会上下镜像 —— 单看模糊几乎看不出来, 但**靠近铰链
+    // 那条边**的覆盖率会算错, 边上会出现不该有的硬边/漏光。
+    float vSign = (uFlipY == 1) ? 1.0 : -1.0;
     for (int i = 0; i < taps; ++i) {
         float r = effR * sqrt((float(i) + 0.5) / float(taps));
         float a = float(i) * GOLDEN + rot;
         vec2 off = r * vec2(cos(a), sin(a));          // px, 界面平面坐标
-        vec2 uv  = uvHit + vec2(off.x / uRes.x, -off.y / uRes.y);
+        vec2 uv  = uvHit + vec2(off.x / uRes.x, vSign * off.y / uRes.y);
         float cx = smoothstep(0.0, footX, uv.x) * (1.0 - smoothstep(1.0 - footX, 1.0, uv.x));
-        float cy = smoothstep(0.0, footY, 1.0 - uv.y) * (1.0 - smoothstep(1.0 - footY, 1.0, 1.0 - uv.y));
+        // 垂直覆盖率按"离铰链的距离"算 —— 铰链换边时这个量是 uv.y 还是
+        // 1-uv.y 也跟着换, 否则贴铰链那条边的羽化会落到错误的一侧。
+        float hingeDist = (uFlipY == 1) ? uv.y : (1.0 - uv.y);
+        float cy = smoothstep(0.0, footY, hingeDist)
+                 * (1.0 - smoothstep(1.0 - footY, 1.0, hingeDist));
         float w  = cx * cy;
         sum += textureLod(uTex, uv, lod).rgb * w;
         cov += w;

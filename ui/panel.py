@@ -14,9 +14,11 @@
 from pathlib import Path
 import time
 
-from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QSizePolicy,
-                             QStackedWidget, QVBoxLayout, QWidget)
+from PyQt6.QtCore import (QEvent, QEasingCurve, QPropertyAnimation, QRectF,
+                          Qt, QThread, QTimer, pyqtProperty, pyqtSignal)
+from PyQt6.QtGui import QColor, QPainter, QPen, QTransform
+from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QPushButton,
+                             QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
 from angles.hub import LABELS
 
@@ -84,6 +86,118 @@ INPUTS = (
     # ≈ 62.5/s, 填更大也不会更快 (120 是假的可用值)。
     ("render_fps", "重绘上限", -1, 62, 1, "帧/秒", 0),
 )
+
+
+class _RotatingScreenButton(TransparentPushButton):
+    """一个带**旋转动画**的小屏幕图标按钮: 点一下把铰链方向反转。
+
+    用途: 反着用笔记本时 (屏幕朝下 / 摄像头倒装), 铰链相对画面就跑到了**上边**,
+    这时折叠动画的方向是反的。点这个按钮把铰链换到另一边修正过来。
+
+    为什么做成旋转图标而不是普通按钮: "铰链在哪一边"是**空间关系**, 用文字
+    ("底边/顶边")要读, 而一个**转过去的屏幕图标**能一眼看懂。点击时图标平滑
+    转 180°, 用户立刻明白"铰链换边了"。
+
+    ⚠️ **必须继承 TransparentPushButton (而不是裸 QPushButton)** —— 面板上另外
+    两个按钮 (标定/反转开合) 用的都是它。继承裸 QPushButton 会丢掉 Fluent 的
+    透明按钮样式, 三个按钮**材质不一致**, 一眼就看得出这一个"不是一伙的"。
+    """
+
+    #: 图标占的宽度 (左侧)。文字从它后面开始, 见 paintEvent。
+    _ICON_W = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 文字**不加前导空格** —— 缩进由 paintEvent 里自己排 (空格会因为居中
+        # 而和图标错位, 看起来就是"文字偏右")。
+        self.setText("反转铰链方向")
+        self.setToolTip("反着用笔记本时点这里: 把铰链从屏幕底边换到顶边")
+        self._angle = 0.0
+        self._anim = QPropertyAnimation(self, b"angle", self)
+        self._anim.setDuration(320)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    def sizeHint(self):                            # noqa: N802
+        # 在"文字宽度"基础上多留出图标的位置, 否则图标会压到文字上。
+        s = super().sizeHint()
+        return s.__class__(s.width() + self._ICON_W, s.height())
+
+    # 动画驱动这个属性 (0 -> 180)
+    def _get_angle(self):
+        return self._angle
+
+    def _set_angle(self, v):
+        self._angle = float(v)
+        self.update()
+
+    angle = pyqtProperty(float, _get_angle, _set_angle)
+
+    def set_flipped(self, flipped, animate=False):
+        """设成"铰链在上边/在下边"状态。`animate=True` 时平滑转过去。"""
+        target = 180.0 if flipped else 0.0
+        if animate and abs(self._angle - target) > 1:
+            self._anim.stop()
+            self._anim.setStartValue(self._angle)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._set_angle(target)
+
+    def paintEvent(self, ev):                      # noqa: N802
+        """画按钮: **左侧旋转的小屏幕图标 + 紧跟其后的文字**。
+
+        不用 QPushButton 自带的文字绘制, 因为它的对齐 (居中) 会和图标打架 ——
+        实测就是"图标在左、文字居中", 看着像文字**偏右**、和图标分了家。
+        这里自己排: 图标在最左, 文字**紧接图标**开始, 两者是一个整体。
+        """
+        # 先把文字设为空, 让父类只画**背景/边框** (保留 Fluent 的透明材质),
+        # 文字由下面自己画 —— 否则会出现"两份文字"。
+        real = self.text()
+        if real:
+            self.setText("")
+            try:
+                super().paintEvent(ev)
+            finally:
+                self.setText(real)
+        else:
+            super().paintEvent(ev)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        col = self.palette().color(self.foregroundRole())
+        h = self.height()
+        # 图标: 靠左, 垂直居中
+        side = max(8, min(h - 12, 16))
+        x = 8.0
+        y = (h - side * 0.78) / 2.0 - side * 0.11
+        # 绕图标中心旋转 (动画角度)
+        p.save()
+        p.translate(x + side / 2.0, y + side * 0.39)
+        p.rotate(self._angle)
+        p.translate(-(x + side / 2.0), -(y + side * 0.39))
+        rect = QRectF(x, y, side, side * 0.78)
+        pen = QPen(col)
+        pen.setWidthF(1.3)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, 1.5, 1.5)
+        # 铰链那条粗线: **加粗的一边就是铰链所在边** —— 旋转后一眼看出它换到
+        # 了上边还是下边。
+        pen2 = QPen(col)
+        pen2.setWidthF(2.4)
+        p.setPen(pen2)
+        p.drawLine(int(rect.left()), int(rect.top()),
+                   int(rect.right()), int(rect.top()))
+        p.restore()
+        # 文字: 紧接图标右侧, 垂直居中
+        if real:
+            p.setPen(col)
+            p.setFont(self.font())
+            tx = x + side + 5.0
+            ty = (h + p.fontMetrics().ascent() - p.fontMetrics().descent()) / 2.0
+            p.drawText(QRectF(tx, 0, max(0.0, self.width() - tx - 4), h),
+                       int(Qt.AlignmentFlag.AlignLeft
+                           | Qt.AlignmentFlag.AlignVCenter), real)
 
 
 class CameraScanThread(QThread):
@@ -265,12 +379,27 @@ class SettingsPanel(QWidget):
         # 一行高, ESP32 模式下就会留下一块 43px 的空白 (实测)。
         self.btn_calib = TransparentPushButton("标定基准帧")
         self.btn_calib.clicked.connect(self._quick_calibrate)
-        self.btn_flip = TransparentPushButton("翻转方向")
+        self.btn_flip = TransparentPushButton("反转开合方向")
         self.btn_flip.clicked.connect(self._quick_flip)
-        ops_inner, _ = row(self.btn_calib, self.btn_flip, spacing=6,
-                           stretch_last=True)
-        self.row_cam_ops = self._labeled("", ops_inner)
-        lay.addWidget(self.row_cam_ops)
+        # 「反转铰链方向」: 点一下把铰链从屏幕底边换到顶边 (给"反着用笔记本"
+        # 的场景), 再点一下换回来。按钮上画一个**小屏幕图标并做 180° 旋转
+        # 动画** —— 一眼就看出"这次会把铰链转到哪一边"。
+        self.btn_hinge = _RotatingScreenButton()
+        self.btn_hinge.clicked.connect(self._toggle_hinge)
+        # 三个按钮**等间距**排一行, 末尾留伸缩把整组推向左。
+        #
+        # ⚠️ **这一行不要用 `_labeled("", ...)`** —— 那会给它套一个 78px 的
+        # **空标签** (+10px 间距), 于是:
+        #   1. 按钮组被推到 x=88 -> 看着"太靠右" (用户反馈);
+        #   2. 整行 sizeHint 变成 78+10+312=400+, 而卡片可用宽只有 402 ->
+        #      **右侧被裁**, "反转铰链方向"末尾几个字被切掉。
+        # 这里是"没有标签的一行", 直接放按钮组即可 (左边跟卡片内边距对齐,
+        # 反而和上面各行的**控件列**对齐不上 —— 但那本来也不是标签行)。
+        ops_inner, ops_lay = row(self.btn_calib, self.btn_flip, self.btn_hinge,
+                                 spacing=8)
+        ops_lay.addStretch(1)
+        self.row_cam_ops = ops_inner          # 显隐用 (见 _refresh_sources)
+        lay.addWidget(ops_inner)
 
         # 当前模式的快捷键提示。
         # **只在摄像头 / ESP32 模式显示** —— 那两模式下热键是"兜底手段"
@@ -565,6 +694,10 @@ class SettingsPanel(QWidget):
         is_cam = (active == "camera")
         self.stack_src_setting.setCurrentIndex(0 if active != "serial" else 1)
         self.row_cam_ops.setVisible(is_cam)
+        # 铰链方向按钮的图标状态跟配置同步 (不播动画, 免得每次刷新都转一下)
+        if getattr(self, "btn_hinge", None) is not None:
+            self.btn_hinge.set_flipped(
+                bool(self.cfg.get("flip_hinge", False)), animate=False)
         self._fill_camera_combo()
         self.edt_port.setText(str(self.cfg.get("port", "COM3")))
         self._refresh_hotkeys()
@@ -986,6 +1119,23 @@ class SettingsPanel(QWidget):
             lay = page.layout()
             if lay is not None:
                 lay.activate()
+
+    def _toggle_hinge(self):
+        """反转铰链方向 (底边 <-> 顶边), 并让按钮图标转过去。"""
+        cur = bool(self.cfg.get("flip_hinge", False))
+        new = not cur
+        self.cfg["flip_hinge"] = new
+        self.controller.save()
+        # 让 overlay 立刻按新设置重画 (它每帧都从 cfg 读, apply_config 会刷新)
+        try:
+            if self.controller.overlay is not None:
+                self.controller.overlay.apply_config()
+                self.controller.overlay.update()
+        except Exception:  # noqa: BLE001
+            pass
+        if getattr(self, "btn_hinge", None) is not None:
+            self.btn_hinge.set_flipped(new, animate=True)
+        print("[ui] 铰链方向 -> %s" % ("顶边 (反着用)" if new else "底边"))
 
     def _quick_calibrate(self):
         self.controller.calibrate_camera()

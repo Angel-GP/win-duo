@@ -277,6 +277,9 @@ DEFAULT_CFG = {
     "blur_spread": 0.42,
     "outside_mode": "black",
     "backdrop_path": "desk_bg.png",
+    # 铰链方向: false = 屏幕底边 (正常用笔记本); true = 屏幕顶边
+    # (反着用笔记本时 —— 屏幕朝下/摄像头倒装, 铰链相对画面跑到了上边)。
+    "flip_hinge": False,
     "autostart_glass": True,
     "autostart_seeded": False,
     "autocal_on_glass_open": True,

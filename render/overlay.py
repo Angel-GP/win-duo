@@ -265,6 +265,10 @@ class GlassOverlay(QOpenGLWidget):
         self.idle_hide = IDLE_HIDE_BELOW
         self.idle_show = IDLE_SHOW_ABOVE
         self.idle_dwell = IDLE_DWELL_SEC
+        # 铰链方向: 0 = 屏幕底边 (默认, 正常用笔记本); 1 = 屏幕顶边
+        # (反着用笔记本 —— 屏幕朝下/倒装摄像头时, 铰链相对画面就在上边)。
+        # 注意: 只换**铰链位置**, 桌面内容仍正立。
+        self.flip_hinge = 1 if cfg.get("flip_hinge", False) else 0
         # render_fps: 重绘**上限** (帧/秒)。
         #   **默认 -1 = 不限制** —— 也就是"每 tick 都画"(tick 固定 16ms,
         #   约 62.5 FPS), 对齐上游 WindowsDuo, 动画最顺。
@@ -437,7 +441,8 @@ class GlassOverlay(QOpenGLWidget):
         self._uloc = {
             name: self.prog.uniformLocation(name)
             for name in ("uTex", "uBackdrop", "uRes", "uTilt", "uEyeZ",
-                         "uSpread", "uDark", "uMaxTaps", "uOutside", "uBgBlur")
+                         "uSpread", "uDark", "uMaxTaps", "uOutside", "uBgBlur",
+                         "uFlipY")
         }
         missing = [k for k, v in self._uloc.items() if v < 0]
         if missing:
@@ -582,6 +587,7 @@ class GlassOverlay(QOpenGLWidget):
         GL.glUniform1f(loc["uDark"], self.dark)
         GL.glUniform1i(loc["uMaxTaps"], self.max_taps)
         GL.glUniform1i(loc["uOutside"], self.outside)
+        GL.glUniform1i(loc["uFlipY"], self.flip_hinge)
         GL.glUniform1f(loc["uBgBlur"], self.bg_blur)
 
         self._draw_quad()
