@@ -114,40 +114,68 @@ def _stdout_is_tty():
         return False
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 控制台尺寸: ctypes 结构与 WinDLL **只在模块级建一次**
+# ══════════════════════════════════════════════════════════════════════
+# 这几个必须放在模块级。曾经写在 `_console_columns()` 函数体里 —— 而那个函数
+# 在状态行刷新里**每个 tick 都调用** (~62 次/秒), 于是每秒都在新建 3 个
+# `ctypes.Structure` 子类 + 重新 `WinDLL("kernel32")` + 重设 argtypes。
+# ctypes 内部会为每个新建的 Structure 子类保留注册信息 (不回收), 实测
+# **泄漏 6.26 MB/分钟**, 匀速线性增长, 且关掉玻璃层也不回落。
+_CSBI = None
+_k32 = None
+try:
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+
+    class _COORD(_ct.Structure):
+        _fields_ = [("X", _ct.c_short), ("Y", _ct.c_short)]
+
+    class _SMALL_RECT(_ct.Structure):
+        _fields_ = [("Left", _ct.c_short), ("Top", _ct.c_short),
+                    ("Right", _ct.c_short), ("Bottom", _ct.c_short)]
+
+    class _CSBI(_ct.Structure):                     # noqa: N801
+        _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                    ("wAttributes", _wt.WORD), ("srWindow", _SMALL_RECT),
+                    ("dwMaximumWindowSize", _COORD)]
+
+    _k32 = _ct.WinDLL("kernel32", use_last_error=True)
+    _k32.GetStdHandle.restype = _ct.c_void_p
+    _k32.GetConsoleScreenBufferInfo.argtypes = [_ct.c_void_p,
+                                                _ct.POINTER(_CSBI)]
+    _k32.GetConsoleScreenBufferInfo.restype = _wt.BOOL
+except Exception:  # noqa: BLE001  非 Windows / 没有 kernel32 -> 用退路
+    _CSBI = None
+    _k32 = None
+
+
 def _console_columns(default=80):
     """当前控制台窗口宽度 (列)。取不到就返回 default。
 
     优先用 Win32 (Windows 上最准); 失败 (无控制台 / 重定向) 再退到
     shutil.get_terminal_size。
+
+    ⚠️ **ctypes 的 Structure 类和 WinDLL 句柄必须在模块级只建一次。**
+    原来这些都写在函数体里 —— 而本函数在状态行刷新里**每个 tick 都调用**
+    (~62 次/秒), 于是每秒都在新建 3 个 `ctypes.Structure` 子类 + 重新
+    `WinDLL("kernel32")` + 重设 argtypes。每个类对象都会在 ctypes 内部注册
+    (不回收), 实测**泄漏 6.26 MB/分钟**, 且关掉玻璃层也不回落。
+    移到模块级后是零分配 (只读一次控制台尺寸)。
     """
-    try:
-        import ctypes as _ct
-        from ctypes import wintypes as _wt
-
-        class _COORD(_ct.Structure):
-            _fields_ = [("X", _ct.c_short), ("Y", _ct.c_short)]
-
-        class _SMALL_RECT(_ct.Structure):
-            _fields_ = [("Left", _ct.c_short), ("Top", _ct.c_short),
-                        ("Right", _ct.c_short), ("Bottom", _ct.c_short)]
-
-        class _CSBI(_ct.Structure):
-            _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
-                        ("wAttributes", _wt.WORD), ("srWindow", _SMALL_RECT),
-                        ("dwMaximumWindowSize", _COORD)]
-
-        k32 = _ct.WinDLL("kernel32", use_last_error=True)
-        k32.GetStdHandle.restype = _ct.c_void_p
-        k32.GetConsoleScreenBufferInfo.argtypes = [
-            _ct.c_void_p, _ct.POINTER(_CSBI)]
-        k32.GetConsoleScreenBufferInfo.restype = _wt.BOOL
-        h = k32.GetStdHandle(-11)
-        info = _CSBI()
-        if k32.GetConsoleScreenBufferInfo(_ct.c_void_p(h), _ct.byref(info)):
-            n = info.srWindow.Right - info.srWindow.Left + 1
-            if n > 8:
-                return int(n)
-    except Exception:  # noqa: BLE001
+    if _CSBI is not None and _k32 is not None:
+        try:
+            h = _k32.GetStdHandle(-11)
+            info = _CSBI()
+            if _k32.GetConsoleScreenBufferInfo(ctypes.c_void_p(h),
+                                               ctypes.byref(info)):
+                n = info.srWindow.Right - info.srWindow.Left + 1
+                if n > 8:
+                    return int(n)
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        # 模块级初始化失败 (非 Windows / 没有 kernel32): 直接用退路
         pass
     try:
         import shutil

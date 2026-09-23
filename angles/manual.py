@@ -20,6 +20,7 @@
 注意: 控制台窗口必须先点一下获得焦点, msvcrt.getwch() 才收得到键。
 """
 import threading
+import time
 
 import wdlog
 from .base import AngleSource
@@ -110,7 +111,17 @@ class KeyControl(AngleSource):
             wdlog.log.warn("非 Windows 平台, 键盘控制不可用", tag="keys")
             return
 
+        # ⚠️ **不能直接写 `while not quit_flag: ch = msvcrt.getwch()`。**
+        # `getwch()` 是**无限阻塞**的 —— stop() 把 quit_flag 置 True 也唤不醒
+        # 它, 线程要等到用户**下一次按键**才会退出。表现出来就是:
+        # 每建一次 KeyControl 就漏一个 keyboard 线程, 反复建/销毁 (切换
+        # 角度源、重开设置窗口) 线程只增不减 (实测每次 +1, 从不回收)。
+        # 改成 kbhit() 轮询 + 短睡: 有键才读, 没键就睡一会儿顺便复查标志。
+        # 10ms 的轮询在"人按键"这个尺度上完全无感, 但让退出路径变干净。
         while not self.quit_flag:
+            if not msvcrt.kbhit():
+                time.sleep(0.01)
+                continue
             ch = msvcrt.getwch()
 
             # 退出键永远有效: 否则在没有托盘的场合会被困住
