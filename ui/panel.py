@@ -184,11 +184,18 @@ class _RotatingScreenButton(TransparentPushButton):
         p.drawRoundedRect(rect, 1.5, 1.5)
         # 铰链那条粗线: **加粗的一边就是铰链所在边** —— 旋转后一眼看出它换到
         # 了上边还是下边。
+        #
+        # ⚠️ **画在底边 (rect.bottom()), 不是顶边。** 图标语义要和设置对齐:
+        #   flip_hinge=False (默认) -> 铰链在**屏幕底边**, 正常用笔记本;
+        #   flip_hinge=True        -> 铰链换到顶边 (反着用)。
+        # `_angle=0` 就是默认态, 所以此时粗线必须在**底边**。原来画在 top(),
+        # 于是默认态显示"铰链在上边"、反转后才"在下边" —— 和设置**正好相反**,
+        # 这就是"图标是反的"。
         pen2 = QPen(col)
         pen2.setWidthF(2.4)
         p.setPen(pen2)
-        p.drawLine(int(rect.left()), int(rect.top()),
-                   int(rect.right()), int(rect.top()))
+        p.drawLine(int(rect.left()), int(rect.bottom()),
+                   int(rect.right()), int(rect.bottom()))
         p.restore()
         # 文字: 紧接图标右侧, 垂直居中
         if real:
