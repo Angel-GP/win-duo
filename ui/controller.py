@@ -109,6 +109,92 @@ class AppController(QObject):
         if self.cfg.get("low_memory_mode", False):
             self._start_release_poll()
 
+        # 显示器/分辨率变化要跟着走 (见 _watch_screens 的说明)
+        #: 已经接过几何变化信号的屏 (去重, 避免重复连接)
+        self._watched_screens = set()
+        self._watch_screens()
+        #: 显示变化后的防抖定时器 (惰性创建)
+        self._screen_timer = None
+
+    # ------------------------------------------------------------ 显示器变化
+    def _watch_screens(self):
+        """订阅 QScreen 的几何变化信号, 分辨率/缩放一变就重开采集设备。
+
+        **为什么必须有**: 采集层 (WGC/DXGI) 在打开时就**绑定了某块屏的具体
+        分辨率**。全屏独占游戏会改显示模式, 退出后分辨率变回来 —— 这时
+        WGC 会话会被系统关掉、DXGI 的 output 也失效, 采集层再也拿不到新帧,
+        玻璃层就停在最后一帧 (表现是"桌面看着像卡住了")。旧代码只在用户
+        **手动**在设置里换屏时才调 set_region(), 完全没监听系统层面的变化。
+
+        这里只做"通知采集层重新挑设备": 调用 capture.set_region() 会置
+        `_reopen_pending`, 由采集线程在两帧之间的安全点自己重建 —— 绝不能在
+        主线程直接重建 (见 capture.set_region 的说明: 会 native 崩溃)。
+        """
+        try:
+            # 局部导入 QApplication: 本模块在 ui/__init__ 里被导入, 而那时
+            # QtWidgets 可能还没被子模块引用; 跟本文件其它两处保持一致。
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app is None:
+                return
+            app.screenAdded.connect(self._on_screen_added)
+            app.screenRemoved.connect(lambda _s: self._on_screens_changed())
+            for scr in app.screens():
+                self._connect_screen(scr)
+        except Exception as exc:  # noqa: BLE001  监听失败不该挡启动
+            wdlog.log.debug("显示器变化监听未建立: %s" % exc, tag="ui")
+
+    def _connect_screen(self, screen):
+        """给一块屏接上几何变化信号 (只接一次, 见 _watch_screens 的说明)。"""
+        try:
+            if screen in self._watched_screens:
+                return
+            self._watched_screens.add(screen)
+            screen.geometryChanged.connect(
+                lambda _g, s=screen: self._on_screens_changed())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_screen_added(self, screen):
+        """热插一块新屏: 也给它接上信号, 再统一重新套用一次。
+
+        必须在这里接 —— 否则新屏之后的分辨率变化收不到 (启动时只遍历了当时
+        存在的屏)。`_watched_screens` 去重, 避免重复连接导致一次变化触发多次。
+        """
+        self._connect_screen(screen)
+        self._on_screens_changed()
+
+    def _on_screens_changed(self):
+        """显示变化 -> 防抖后重新套用当前选中的屏 (见 _watch_screens 的说明)。
+
+        防抖是必要的: 一次分辨率切换会连着发好几个 geometryChanged, 每个都
+        重建一次采集设备既慢又容易撞上"设备正在重建"。500ms 足够合并它们。
+        """
+        if self._shutting_down:
+            return
+        if self._screen_timer is None:
+            self._screen_timer = QTimer(self)
+            self._screen_timer.setSingleShot(True)
+            self._screen_timer.timeout.connect(self._apply_screen_change)
+        self._screen_timer.start(500)
+
+    def _apply_screen_change(self):
+        """把当前的屏几何/刷新率重新套给采集层与玻璃层。"""
+        if self._shutting_down:
+            return
+        try:
+            screen = self.screen()
+            if screen is None:
+                return
+            wdlog.log.info("检测到显示器变化, 重新套用 %s %dx%d"
+                           % (screen.name(), screen.geometry().width(),
+                              screen.geometry().height()), tag="ui")
+            # 走和"用户手动换屏"同一条路径 —— 它已经处理好了采集区域、
+            # 刷新率、以及玻璃层窗口几何与首帧闪黑。
+            self.set_screen(screen)
+        except Exception as exc:  # noqa: BLE001
+            wdlog.log.error("显示器变化后重新套用失败: %s" % exc, tag="ui")
+
     # ------------------------------------------------------------ 全局热键
     def register_hotkeys(self):
         """按当前角度源注册/注销热键。切换角度源时会再调一次。"""
@@ -972,6 +1058,13 @@ class AppController(QObject):
         self._shutting_down = True
         self._stop_release_poll()
         self._stop_soft_poll()
+        # 显示变化防抖定时器也要停 —— 否则退出路径上它还可能触发一次
+        # _apply_screen_change, 去碰正在被拆掉的采集/玻璃层对象。
+        if self._screen_timer is not None:
+            try:
+                self._screen_timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self.release_hotkeys()
         except Exception:  # noqa: BLE001
