@@ -678,6 +678,8 @@ def print_banner(cfg, region):
     # 运行还是打包 exe"直接决定了很多行为: sys.stderr 存不存在、路径解析到
     # 哪、Python 是系统装的还是随 exe 封进去的 —— 排查时这些都要先知道。
     # 单独一个 try: 任何一项取不到 (裁剪过的环境) 也不能把 banner 打断。
+    # **日志/配置的完整路径不在这里打**: 版本那一行已经带了运行目录, 而这两条
+    # 路径又长又每次一样, 只是把 banner 撑开、把真正会变的信息挤下去。
     try:
         if _paths.is_frozen():
             form = "打包 exe (%s)" % sys.executable
@@ -688,8 +690,6 @@ def print_banner(cfg, region):
         w("  版本      : %s   %s" % (_paths.__version__, form), tag="banner")
         w("  Python    : %s" % py, tag="banner")
         w("  系统      : %s" % platform.platform(), tag="banner")
-        w("  日志      : %s" % _log_file_path, tag="banner")
-        w("  配置      : %s" % DEFAULT_CONFIG, tag="banner")
     except Exception as exc:  # noqa: BLE001
         w("  环境摘要  : 取不到 (%s)" % exc, tag="banner")
     w("-" * 68, tag="banner")
