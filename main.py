@@ -678,14 +678,14 @@ def print_banner(cfg, region):
     # 运行还是打包 exe"直接决定了很多行为: sys.stderr 存不存在、路径解析到
     # 哪、Python 是系统装的还是随 exe 封进去的 —— 排查时这些都要先知道。
     # 单独一个 try: 任何一项取不到 (裁剪过的环境) 也不能把 banner 打断。
-    # **日志/配置的完整路径不在这里打**: 版本那一行已经带了运行目录, 而这两条
-    # 路径又长又每次一样, 只是把 banner 撑开、把真正会变的信息挤下去。
+    # **不带任何路径**: 又长又每次一样, 只会把 banner 撑开、把会变的信息挤
+    # 下去。运行形态只用一个词说清 (源码运行 / 程序运行)。
     try:
         if _paths.is_frozen():
-            form = "打包 exe (%s)" % sys.executable
+            form = "程序运行"
             py = "%s (随 exe 封装)" % platform.python_version()
         else:
-            form = "源码运行 (%s)" % _paths.data_dir()
+            form = "源码运行"
             py = platform.python_version()
         w("  版本      : %s   %s" % (_paths.__version__, form), tag="banner")
         w("  Python    : %s" % py, tag="banner")
