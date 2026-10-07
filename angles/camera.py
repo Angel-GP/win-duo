@@ -119,6 +119,33 @@ CAMERA_AE_SETTLE_FRAMES = 30
 #: 对 msmf/其它后端**没有意义**, 所以只在 dshow 链路里设 (见 _configure_dshow)。
 DSHOW_AUTO_EXPOSURE = 0.75
 
+# ═══════════════════════════════════════════════════════════════════
+# 自动标定的"等画面稳定"门控
+# ═══════════════════════════════════════════════════════════════════
+# 问题: 旧实现只要**出图满 1.5 秒**就立刻自动标定, 完全不管画面稳没稳。而
+# 摄像头刚打开的那一两秒自动曝光/白平衡还在收敛 (整幅亮度在漂), 打完游戏
+# (独占全屏抢过摄像头/改过分辨率) 之后重开设备时尤其明显。这时标定就把一张
+# 未收敛的画面当成了"上盖完全展开"的基准 —— 之后所有角度都带一个固定偏移,
+# 读数变负, 浓度恒为 0, 表现就是"摄像头在跑、但合盖没有动画"。
+#
+# 判据用**降采样后的帧间平均绝对差**: INTER_AREA 把 16x16 块的传感器噪声
+# 平均掉 (~16 倍), 静止场景实测 < 0.5; 而自动曝光收敛过程中整幅亮度在漂,
+# 明显 > 2。比看特征点匹配数可靠 (匹配数在曝光漂移时也会很高)。
+#: 连续多少帧"画面稳定"才允许自动标定。
+CALIB_STABLE_FRAMES = 15
+#: "画面稳定"的帧间平均绝对差阈值 (灰度级)。
+CALIB_STABLE_DIFF = 2.0
+#: 自动标定的**兜底时限** (秒, 从本次打开设备算起)。
+#: 画面一直不稳 (风扇/闪烁灯/有人在镜头前走动) 时必须仍然标一次 —— 宁可基准
+#: 略偏 (有下面的负读数自愈负责纠正), 也绝不能永远不标定 (那就是完全没动画)。
+CALIB_FALLBACK_SEC = 8.0
+#: 自动标定要求的**最少帧数** (保持旧行为: 约 1.5 秒出图)。
+CALIB_MIN_FRAMES_FACTOR = 1.5
+
+#: 摄像头流失活后最多自动重开几次。设备真坏了 (被拔/被独占) 时不能无限重开
+#: 刷屏, 超过这个次数就停下并报错, 让用户去设置里换设备。
+MAX_REOPEN_TRIES = 3
+
 
 def _limit_opencv_threads(n):
     if n and int(n) > 0:
@@ -487,6 +514,28 @@ VISIT_MIN_INLIERS = 14
 #: 最多保留多少个采样点 (防止长时间运行后无限增长)。
 MAX_SAMPLES = 72
 
+# ═══════════════════════════════════════════════════════════════════
+# 负读数处理: 钳底 + 自动归零 (状态层, 不是输出层)
+# ═══════════════════════════════════════════════════════════════════
+# ⚠️ **必须做在状态层 (这里), 做在输出层是空操作。**
+# `angle_to_level()` 里已经有 `clip(180 + sign*scale*pitch, 0, 180)`, 也就是说
+# pitch<0 本来就被压成和 0 完全一样的结果 —— 在它外面再 `max(0, ...)` 一次,
+# 逐点输出完全相同 (用 probe_clamp_sim.py 验过)。真正的问题是**负读数意味着
+# 基准标晚了**: 标定时上盖并不完全展开, 于是完全展开时读数为负、整个读数表
+# 朝负方向平移。只有把"负"这件事写回**参考基准**, 后面的累积才会跟着被拉正。
+#
+# 两道处理, 互补:
+#   1. **钳底** (立即生效): angle 不允许为负。代价是把"真的把上盖反着掰过去"
+#      也当成 0 —— 但那本来就是无意义姿态 (屏幕朝下), 当 0 是对的。
+#   2. **自动归零** (自愈): 连续多帧持续为负 -> 认定基准标晚了, 把**当前帧**
+#      重设为"完全展开"的新基准, 并把所有已记录的绝对角度一并平移。
+#      比只钳底更彻底: 钳底后前若干度的合盖仍然没有反应 (死区), 自动归零
+#      把这段死区也消掉了。持续多帧才触发, 单帧噪声不会误判。
+#: 连续这么多帧读数为负才触发自动归零。
+AUTO_ZERO_CONFIRM = 10
+#: 负到这个程度 (度) 才计入。取比死区略大的值, 避免噪声在 0 附近来回触发。
+AUTO_ZERO_TRIGGER_DEG = 2.0
+
 
 class OrbTracker:
     """上盖俯仰角跟踪器。
@@ -534,6 +583,14 @@ class OrbTracker:
         #: 按角度均匀采样的"回访点", 用于绝对校正
         self._samples = []
 
+        #: 连续负读数计数 + 是否启用自动归零 (见 AUTO_ZERO_* 的说明)。
+        #: `auto_zero` 由上层按 config 传入; 关掉时只保留钳底。
+        self._neg_streak = 0
+        self.auto_zero = True
+        self._auto_zero_count = 0
+        #: 画面稳定判据用: 上一帧的降采样灰度
+        self._prev_small = None
+
         self._oneuro = OneEuroFilter(min_cutoff=min_cutoff, beta=beta,
                                      d_cutoff=d_cutoff)
 
@@ -576,6 +633,9 @@ class OrbTracker:
         self.angle = 0.0
         self._oneuro.reset()
         self._samples = [{"angle": 0.0, "des": des, "kp": kp}]
+        # 人工/自动标定就是"明确声明此刻是展开" —— 负读数累计必须清零,
+        # 否则上一次的负streak会跨标定继续累加, 一次噪声就触发误归零。
+        self._neg_streak = 0
         return True
 
     def _prepare(self, gray):
@@ -787,11 +847,62 @@ class OrbTracker:
                 self._install_reference(prepared, kp, des, self.angle)
 
         self._maybe_sample(kp, des, self.angle)
+        self._settle_negative(self.angle, prepared, kp, des)
 
         if dt is None:
             dt = 1.0 / 30.0
         dt = float(np.clip(dt, 1e-3, 0.2))
         return self._oneuro.filter(self.angle, dt)
+
+    # ---------------- 负读数处理 (见 AUTO_ZERO_* 的说明) ----------------
+    def _settle_negative(self, raw_angle, prepared, kp, des):
+        """把负读数收敛到 0: 先钳底, 持续为负则自动归零 (重建展开基准)。
+
+        **只在状态层做** —— 输出层 (`angle_to_level`) 的 clip 已经等价, 在那里
+        再钳一次是空操作 (见文件里 AUTO_ZERO_* 的说明与 probe_clamp_sim.py)。
+
+        `raw_angle` 是**钳底之前**的原始读数 (弧度)。判据必须用它: `self.angle`
+        在本函数里马上会被钳成 0, 拿它判断永远是"不为负", 自动归零永不触发。
+
+        钳底会**顺带把 `_ref_base` 一起钳** —— 它记录"参考帧对应的绝对角度",
+        是下一帧 `guess = _ref_base + step` 的起点。只钳 `self.angle` 而不钳它,
+        下一帧又会从负的起点算起, 钳底当场失效。
+        """
+        raw = float(raw_angle)
+        if raw >= 0.0:
+            self._neg_streak = 0
+            return
+
+        # 1) 立即钳底 (连同参考基准的结算点)
+        self.angle = 0.0
+        if self._ref_base < 0.0:
+            self._ref_base = 0.0
+
+        # 2) 持续为负 -> 自动归零: 把**当前帧**重设为"完全展开"的新基准。
+        #    用原始读数判断, 且要求负得够明显 (躲开 0 附近的噪声)。
+        if not self.auto_zero:
+            return
+        if np.degrees(raw) >= -AUTO_ZERO_TRIGGER_DEG:
+            return
+        self._neg_streak += 1
+        if self._neg_streak < AUTO_ZERO_CONFIRM:
+            return
+        self._neg_streak = 0
+        self._auto_zero_count += 1
+        # 坐标平移量: 旧坐标系里"当前姿态"读作 raw。新坐标系里它必须读作 0,
+        # 所以把所有旧的绝对角度统一减去 raw (raw 为负 -> 整体上移)。
+        shift = -raw
+        # 已记录的采样点存的是"绝对角度 + 该角度的描述子"。基准一挪, 旧角度
+        # 全部作废 —— **必须一起平移**, 否则回访校正会把读数拽回错误的旧坐标系。
+        for s in self._samples:
+            s["angle"] += shift
+        # 真正把参考帧换成当前帧, 并声明它对应角度 0 —— 这才叫"重新归零"。
+        self._install_reference(prepared, kp, des, 0.0)
+        self.angle = 0.0
+        self._ref_base = 0.0
+        self._oneuro.reset()
+        wdlog.log.info("检测到持续负读数, 已自动归零基准 (第 %d 次)"
+                       % self._auto_zero_count, tag="camera")
 
     # ---------------- 调试 ----------------
     def draw_matches(self, cur_gray=None):
@@ -833,6 +944,9 @@ class CameraAngleSource(AngleSource):
         self.deadzone = CAMERA_DEADZONE
         # 自动标定由用户在设置里控制 (autocal_on_glass_open); 源码常量只是默认。
         self.autocal = bool(cfg.get("autocal_on_glass_open", CAMERA_AUTOCAL))
+        # 负读数自动归零 (见 AUTO_ZERO_* 的说明)。默认开 —— 它只修"基准标晚
+        # 了"这种情况, 用户想完全手动控制基准时可以关掉。
+        self.auto_zero = bool(cfg.get("auto_zero_on_negative", True))
         self.target_fps = CAMERA_FPS
         self.min_cutoff = CAMERA_MIN_CUTOFF
         self.beta = CAMERA_BETA
@@ -864,6 +978,17 @@ class CameraAngleSource(AngleSource):
         self._dbg_img = None
         self._dbg_seq = 0
         self._open_error = None
+        #: 连续读到 None 的帧数 (设备还在、但 read() 一直失败)。
+        #: 见 _run 里的失活判定 —— 游戏/采集卡抢走摄像头后 read() 会永远返回
+        #: None, 旧实现只是 `sleep(0.01); continue` 无限空转: 句柄还开着
+        #: (看起来"摄像头被调用"), 状态停在"追踪中", 但再也没有动画。
+        self._null_frames = 0
+        #: 本次打开设备以来已经重开过几次 (防止坏设备导致无限重开风暴)
+        self._reopen_count = 0
+        #: 自动标定门控用的画面稳定检测状态
+        self._stable_n = 0
+        self._prev_small = None
+        self._opened_at = 0.0
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -884,6 +1009,13 @@ class CameraAngleSource(AngleSource):
             self._orphan = None
         self._stop = False
         self._open_error = None
+        # 重开计数在**每次用户/上层显式 start() 时清零** —— 它是"本轮运行"的
+        # 限额, 不是进程级累计。否则一次网络摄像头的偶发失活会把额度用光,
+        # 之后用户重新开玻璃层也不再自愈。
+        self._reopen_count = 0
+        self._null_frames = 0
+        self._stable_n = 0
+        self._prev_small = None
         with self._lock:
             self._status = "正在打开…"
         self._thread = threading.Thread(target=self._run, name="camera-angle",
@@ -936,6 +1068,38 @@ class CameraAngleSource(AngleSource):
     def request_calibration(self):
         self._cal_request = True
 
+    def _stable_enough(self, gray):
+        """画面是否已经稳定到可以自动标定 (见 CALIB_STABLE_* 的说明)。
+
+        判据: 把当前帧降采样成 16x16 的小图, 和上一帧比**平均绝对差**。
+        - 降采样用 INTER_AREA, 把每块的传感器噪声平均掉 (~16 倍), 静止场景
+          实测 < 0.5, 而自动曝光收敛过程中整幅亮度在漂, 明显 > 2 —— 区分度
+          很干净。它比"看特征点匹配数"可靠: 曝光漂移时匹配数照样很高。
+        - 连续 CALIB_STABLE_FRAMES 帧稳定 -> 允许标定;
+        - 或者出图已超过 CALIB_FALLBACK_SEC (画面一直不稳: 风扇/闪烁灯/有人
+          走动) -> 也允许标定, 但要求至少出图 CALIB_MIN_FRAMES_FACTOR 秒。
+          宁可基准略偏 (还有负读数自动归零兜底), 也绝不能永远不标定。
+        """
+        try:
+            small = cv2.resize(gray, (16, 16), interpolation=cv2.INTER_AREA)
+        except Exception:  # noqa: BLE001  尺寸异常等: 不挡标定
+            return self._frames > int(self.target_fps * CALIB_MIN_FRAMES_FACTOR)
+
+        prev, self._prev_small = self._prev_small, small
+        if prev is not None:
+            diff = float(np.abs(small.astype(np.int16)
+                                - prev.astype(np.int16)).mean())
+            if diff <= CALIB_STABLE_DIFF:
+                self._stable_n += 1
+            else:
+                self._stable_n = 0
+
+        if self._stable_n >= CALIB_STABLE_FRAMES:
+            return True
+        # 兜底: 画面一直不稳也要标一次 (但别在刚出图的头一两帧就标)
+        return (time.time() - self._opened_at >= CALIB_FALLBACK_SEC
+                and self._frames > int(self.target_fps * CALIB_MIN_FRAMES_FACTOR))
+
     def set_debug(self, on):
         self._want_debug = bool(on)
 
@@ -973,6 +1137,8 @@ class CameraAngleSource(AngleSource):
                 min_cutoff=self.min_cutoff, beta=self.beta,
                 d_cutoff=self.d_cutoff, backend=self.backend,
                 threads=self.threads, axis=self.axis)
+            # 负读数自动归零由 config 控制 (见 AUTO_ZERO_* 的说明)
+            self._tracker.auto_zero = self.auto_zero
         except Exception as exc:  # noqa: BLE001
             self._open_error = str(exc)
             with self._lock:
@@ -991,6 +1157,8 @@ class CameraAngleSource(AngleSource):
             self._status = "已打开, 等待标定"
 
         tracker = self._tracker
+        #: 自动标定门控的计时起点 (本次打开设备的时刻)
+        self._opened_at = time.time()
         t_prev = None
         t_fps = time.time()
         n_fps = 0
@@ -1002,8 +1170,22 @@ class CameraAngleSource(AngleSource):
                 loop_start = time.time()
                 frame = tracker.read()
                 if frame is None:
+                    # ---- 设备失活判定 --------------------------------------
+                    # `read()` 持续返回 None 说明**流已经断了**(设备被别的程序
+                    # 抢走 / 驱动重置 / 游戏改了显示模式后的会话失效)。旧实现
+                    # 只 `sleep(0.01); continue` 无限空转 —— 摄像头句柄还开着
+                    # ("看起来有被调用"), 状态停在"追踪中", 但再也不出帧,
+                    # 合盖自然没有动画, 而且永远不会自愈。
+                    # 这里给足 ~3 秒 (300 帧 x 10ms) 的容忍, 超时就主动重开设备。
+                    self._null_frames += 1
+                    if self._null_frames >= 300:
+                        wdlog.log.warn("连续 %d 帧读不到画面, 摄像头可能已被别的"
+                                       "程序占用或设备重置, 尝试重开"
+                                       % self._null_frames, tag="camera")
+                        break
                     time.sleep(0.01)
                     continue
+                self._null_frames = 0
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 self._frames += 1
@@ -1016,15 +1198,21 @@ class CameraAngleSource(AngleSource):
                     wdlog.log.info("标定" + ("成功" if ok
                                             else "失败: 特征点不足, 请对着有纹理的场景"), tag="camera")
 
-                # 启动后自动标定一次, 让程序开箱可用
-                if (self.autocal and not tracker.has_reference
-                        and self._frames > int(self.target_fps * 1.5)):
-                    ok = tracker.set_reference(gray)
-                    with self._lock:
-                        self._status = ("自动标定成功" if ok
-                                        else "自动标定失败(请手动标定)")
-                    wdlog.log.info("自动标定" + ("成功" if ok
-                                                else "失败, 请手动标定"), tag="camera")
+                # 启动后自动标定一次, 让程序开箱可用。
+                #
+                # **必须等画面稳定再标定** (见 CALIB_STABLE_* 的说明): 只等
+                # "出图满 1.5 秒"的话, 会自动曝光/白平衡还在漂的那一刻就把
+                # 未收敛画面当成"完全展开"基准 —— 之后读数整体偏移变负、
+                # 浓度恒为 0 (打完游戏重开摄像头时最容易踩到)。
+                # 画面一直不稳时由 CALIB_FALLBACK_SEC 兜底, 绝不永远不标定。
+                if self.autocal and not tracker.has_reference:
+                    if self._stable_enough(gray):
+                        ok = tracker.set_reference(gray)
+                        with self._lock:
+                            self._status = ("自动标定成功" if ok
+                                            else "自动标定失败(请手动标定)")
+                        wdlog.log.info("自动标定" + ("成功" if ok
+                                                    else "失败, 请手动标定"), tag="camera")
 
                 dt = (loop_start - t_prev) if t_prev is not None else None
                 t_prev = loop_start
@@ -1083,3 +1271,33 @@ class CameraAngleSource(AngleSource):
                 tracker.release()
             except Exception:  # noqa: BLE001
                 pass
+
+        # ---- 设备失活后的自动重开 ----------------------------------------
+        # 走到这里有两种情况:
+        #   1. 被 stop() 要求退出 (`self._stop`) —— 什么都不做;
+        #   2. `read()` 持续失败触发的 break —— 主动重开设备, 让程序自愈。
+        # 重开有次数上限: 设备真的坏了(被拔了/被独占)时不能无限重开刷屏,
+        # 超过上限就停下并报错, 让用户去设置里换设备。
+        if self._stop or self._reopen_count >= MAX_REOPEN_TRIES:
+            if not self._stop and self._reopen_count >= MAX_REOPEN_TRIES:
+                with self._lock:
+                    self._status = "设备反复失活, 已停止重试"
+                wdlog.log.error("摄像头连续 %d 次失活, 停止自动重开 "
+                                "(请在设置里换设备或检查是否被别的程序占用)"
+                                % self._reopen_count, tag="camera")
+            return
+        self._reopen_count += 1
+        with self._lock:
+            self._status = "正在重新打开…"
+        wdlog.log.info("重新打开摄像头 (第 %d 次)" % self._reopen_count, tag="camera")
+        # 给设备一点时间从"被占用"状态释放出来, 否则立刻重开会继续失败
+        for _ in range(20):
+            if self._stop:
+                return
+            time.sleep(0.1)
+        self._frames = 0
+        self._null_frames = 0
+        self._stable_n = 0
+        self._prev_small = None
+        self._tracker = None
+        self._run()

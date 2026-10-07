@@ -336,6 +336,11 @@ DEFAULT_CFG = {
     "autostart_glass": True,
     "autostart_seeded": False,
     "autocal_on_glass_open": True,
+    # 负读数自动归零: 基准标晚了 (标定时上盖没完全展开, 常见于打完游戏摄像头
+    # 刚重开、画面还没稳) 会让所有读数整体偏负, 浓度恒为 0 -> "没有合盖动画"。
+    # 开着时程序检测到持续负读数会自动把当前帧重设为展开基准 (自愈)。
+    # 想完全手动控制基准就改成 false (此时只做负值钳底, 不会自动挪基准)。
+    "auto_zero_on_negative": True,
     "low_memory_mode": False,
 }
 
