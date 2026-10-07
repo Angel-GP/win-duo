@@ -9,12 +9,13 @@ from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QSizePolicy,
                              QVBoxLayout, QWidget)
 
+import logkeep
 import paths
 import wdlog
 from paths import log_file
-from .widgets import (BodyLabel, CaptionLabel, ComboBox, LineEdit, PlainTextEdit,
-                      PrimaryPushButton, StrongBodyLabel, TransparentPushButton,
-                      make_icon)
+from .widgets import (BodyLabel, CaptionLabel, ComboBox, LineEdit, NumberField,
+                      PlainTextEdit, PrimaryPushButton, StrongBodyLabel,
+                      TransparentPushButton, make_icon)
 
 #: 日志文件: <数据目录>/diagnostics/debug/log/last.log (打包后是 exe 旁边)
 #:
@@ -305,6 +306,37 @@ class LogSettingsDialog(QDialog):
         self.lbl_cur = self._hint_label()
         lay.addWidget(self.lbl_cur)
 
+        # ── 保留策略 (时间 / 数量) ────────────────────────────────
+        # 语义见 logkeep 的文件头: 两个维度**各自独立、同时生效** (取交集);
+        # -1 = 该维度不设限; 任一为 0 = 一个都不留 = 不保存日志。
+        self.num_days = NumberField(-1, 3650, 0, "天", show_range=False)
+        self.num_days.setValue(
+            logkeep.as_int(self.cfg.get("log_keep_days"),
+                           logkeep.DEFAULT_DAYS), emit=False)
+        self.num_days.changed.connect(self._on_retention)
+        self.num_count = NumberField(-1, 9999, 0, "个", show_range=False)
+        self.num_count.setValue(
+            logkeep.as_int(self.cfg.get("log_keep_count"),
+                           logkeep.DEFAULT_COUNT), emit=False)
+        self.num_count.changed.connect(self._on_retention)
+        lay.addLayout(self._row("保留时间", self._hrow(
+            self.num_days, self._cap("(-1 = 不限)"))))
+        lay.addLayout(self._row("保留数量", self._hrow(
+            self.num_count, self._cap("(-1 = 不限)"))))
+
+        self.lbl_keep = self._hint_label()
+        lay.addWidget(self.lbl_keep)
+
+        # 立即按新策略清一次 —— 否则改完要等下次启动才看得到效果,
+        # 用户会以为"设了没用"。**只删旧日志**, 绝不动本次运行的文件。
+        row_keep = QHBoxLayout()
+        row_keep.setSpacing(8)
+        self.btn_prune = TransparentPushButton("立即清理旧日志")
+        self.btn_prune.clicked.connect(self._prune_now)
+        row_keep.addWidget(self.btn_prune)
+        row_keep.addStretch(1)
+        lay.addLayout(row_keep)
+
         # ── 查看 / 保存 ───────────────────────────────────────────
         lay.addWidget(StrongBodyLabel("日志文件"))
         row2 = QHBoxLayout()
@@ -329,6 +361,7 @@ class LogSettingsDialog(QDialog):
         # 高度改由 _fit_height() 贴合内容 (见那里的说明)。
         self._update_preview(self.edt_fmt.text())
         self._update_level_hint()
+        self._update_keep_hint()
 
     # ------------------------------------------------------------ 布局小工具
     @staticmethod
@@ -352,6 +385,13 @@ class LogSettingsDialog(QDialog):
         for w in widgets:
             h.addWidget(w)
         return box
+
+    @staticmethod
+    def _cap(text):
+        """灰色小字说明 (跟在输入框后面的那种)。"""
+        lab = CaptionLabel(text)
+        lab.setObjectName("hint")
+        return lab
 
     @staticmethod
     def _hint_label():
@@ -436,6 +476,55 @@ class LogSettingsDialog(QDialog):
             return
         self.cfg["log_name_format"] = text
         self._persist()
+
+    # ------------------------------------------------------------ 保留策略
+    def _retention(self):
+        """输入框里的保留策略 `(天数, 数量)`。"""
+        return int(self.num_days.value()), int(self.num_count.value())
+
+    def _on_retention(self, _v=None):
+        """任一保留值提交了 -> 写回 cfg 并落盘。**清理发生在下次启动**。"""
+        days, count = self._retention()
+        self.cfg["log_keep_days"] = days
+        self.cfg["log_keep_count"] = count
+        self._persist()
+        self._update_keep_hint()
+
+    def _update_keep_hint(self):
+        days, count = self._retention()
+        on = logkeep.enabled(days, count)
+        txt = "生效于下次启动: %s" % logkeep.describe(days, count)
+        if not on:
+            txt += "\n本次已经在写了；重启后不再落盘（只写控制台）"
+        self.lbl_keep.setText(txt)
+        # 不保存日志时这些入口没有意义 (last.log 会被摘掉, 打开也是空的)
+        for b in (self.btn_view, self.btn_save, self.btn_prune):
+            b.setEnabled(on)
+        if sys.platform == "win32":
+            self.btn_console.setEnabled(on)
+        self._fit_height()
+
+    def _prune_now(self):
+        """立刻按当前策略清一次 —— 否则改完要等下次启动才看得到效果。
+
+        **保护 `paths.CURRENT_LOG`**: 那是本次运行正在写的文件, 删了它等于把
+        用户正在看的这份日志抽掉 (而且 tee 还开着句柄, 在 Windows 上会删不掉)。
+        """
+        days, count = self._retention()
+        if not logkeep.enabled(days, count):
+            return
+        try:
+            deleted, kept, errors = logkeep.prune(
+                LOG_FILE.parent, paths.CURRENT_LOG, days, count)
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_keep.setText("清理失败: %s" % exc)
+            return
+        msg = "已清理 %d 个旧日志，保留 %d 个" % (deleted, kept)
+        if errors:
+            msg += "（%d 个删不掉，已跳过）" % len(errors)
+        self.lbl_keep.setText(msg + "\n" + logkeep.describe(days, count))
+        wdlog.log.info("用户操作: 立即清理旧日志 -> %s" % msg, tag="log")
+        self._fit_height()
 
     # ------------------------------------------------------------ 落盘
     def _persist(self):

@@ -46,7 +46,31 @@ _RUN_START = time.time()
 
 
 #: 本次运行的日志路径 —— **只算一次**, 见 _run_log_path()。
+#: `None` 是合法结果, 表示"本次不保存日志" (保留时间/数量里有一个是 0)。
 _RUN_LOG_PATH = None
+#: 是否已经算过。**必须和上面的值分开**: 算出来的结果本身可能就是 None,
+#: 拿 None 当"还没算"的哨兵会导致每次调用都重算 (撞名探测会跟着反复跑)。
+_RUN_LOG_RESOLVED = False
+
+
+def _argv_config_path():
+    """从 `sys.argv` 里提前捞出 `--config` 指的文件; 没写返回 None。
+
+    为什么要在 argparse 之前自己扒一遍: 日志路径 (以及"这次到底要不要保存日志")
+    必须在**模块导入时**定下来, 那时 `parse_args()` 还没跑。若只认默认配置路径,
+    `--config other.json` 里的 `log_keep_days` / `log_name_format` 就会被无视 ——
+    表现是"我明明设了不保存日志, 它还在写", 而且日志文件名也不按模板走。
+
+    只认 `--config X` 和 `--config=X` 两种写法 (argparse 支持的其它花活不管:
+    认不出来就退回默认路径, 不会更糟)。`-c` 之类的缩写同理不认。
+    """
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--config="):
+            return a.split("=", 1)[1]
+    return None
 
 
 def _early_cfg_value(key, default=None, path=None):
@@ -56,6 +80,9 @@ def _early_cfg_value(key, default=None, path=None):
     和日志 tee 都要用它), 而那时 `load_config` / `DEFAULT_CFG` 都还没定义 ——
     它们在本文件更靠下的位置。所以这里自己开一次 json, 只读不写。
 
+    `path` 没给时先看 `sys.argv` 里的 `--config` (见 `_argv_config_path`),
+    再退回默认路径 —— 否则命令行指定的配置文件会被静默无视。
+
     **任何异常都退回 default**: 文件不存在、JSON 坏了、没这个键 —— 启动路径上
     不能因为读不到一个配置项就抛出去。
     局部 import paths: 本函数在模块级 `import paths` 之前就被调用。
@@ -63,6 +90,8 @@ def _early_cfg_value(key, default=None, path=None):
     try:
         import json as _json
         import paths as _p
+        if path is None:
+            path = _argv_config_path()
         target = path if path is not None else _p.config_file("config.json")
         with open(target, "r", encoding="utf-8-sig") as fh:
             return _json.load(fh).get(key, default)
@@ -70,8 +99,31 @@ def _early_cfg_value(key, default=None, path=None):
         return default
 
 
+def _early_retention(path=None):
+    """从 config.json 读日志保留策略 `(天数, 数量)`。
+
+    和 `_early_cfg_value` 同样的理由: `_run_log_path()` 在模块导入时就要知道
+    "这次到底要不要写日志文件", 那时 `load_config` / `DEFAULT_CFG` 都还没定义。
+
+    **值坏掉时退回默认, 不退成 0** —— 0 的含义是"不保存日志", 一个笔误
+    (比如写成 `"abc"`) 绝不该让用户的日志凭空消失 (见 logkeep.as_int)。
+
+    ⚠️ **必须局部 import logkeep**: 本函数第一次被调用时 (`_enable_faulthandler`
+    在模块级第 193 行就调了), 模块级的 `import logkeep` 还在更靠下的位置 ——
+    用模块级的会 NameError。而那个 NameError 会被 `_enable_faulthandler` 的
+    裸 except 吞掉, 表现是"日志静默全丢", 极难查。(这个坑真踩过。)
+    """
+    import logkeep as _lk
+    return (_lk.as_int(_early_cfg_value("log_keep_days",
+                                        _lk.DEFAULT_DAYS, path),
+                       _lk.DEFAULT_DAYS),
+            _lk.as_int(_early_cfg_value("log_keep_count",
+                                        _lk.DEFAULT_COUNT, path),
+                       _lk.DEFAULT_COUNT))
+
+
 def _run_log_path():
-    """本次运行的日志文件路径。
+    """本次运行的日志文件路径; **`None` 表示本次不保存日志**。
 
     **在启动时算一次就固定**: faulthandler 和 _TeeLogger 必须写同一个文件,
     所以两边都从这里取, 不能各自 time.strftime 一次 (跨秒就会分成两个文件);
@@ -81,10 +133,20 @@ def _run_log_path():
 
     名字由配置里的 `log_name_format` 模板生成 (设置窗口可改)。**模板改动只影响
     下一次启动** —— 本次的文件在进程一起来就打开了, 没法改名。
+
+    什么时候返回 None: 保留时间或保留数量有一个是 0 (见 logkeep 的语义说明)。
+    这时整个进程不落盘, 只写控制台。
     """
-    global _RUN_LOG_PATH
-    if _RUN_LOG_PATH is None:
-        import paths as _p
+    global _RUN_LOG_PATH, _RUN_LOG_RESOLVED
+    if _RUN_LOG_RESOLVED:
+        return _RUN_LOG_PATH
+
+    # 局部 import: 本函数首次被调用时模块级的 import 还没执行 (见 _early_retention)
+    import logkeep as _lk
+    import paths as _p
+
+    days, count = _early_retention()
+    if _lk.enabled(days, count):
         fmt = _early_cfg_value("log_name_format", _p.LOG_NAME_FORMAT)
         stamp = _p.format_log_name(fmt, _RUN_START)
         # **同一秒里起第二次要错开。** 文件名只精确到秒, 而 open_log 用的是
@@ -98,6 +160,15 @@ def _run_log_path():
             path = _p.log_file("%s-%d.log" % (stamp, n))
             n += 1
         _RUN_LOG_PATH = path
+    else:
+        _RUN_LOG_PATH = None        # 保留时间/数量里有 0 -> 本次不落盘
+
+    # ⚠️ **只在算完之后才置位。** 中途抛异常时若已经置位, 就会留下"算过了、
+    # 结果是 None"的**毒化缓存**: 之后每次调用都静默返回 None, 本次运行的日志
+    # 整个消失 —— 而异常还可能被上层 (`_enable_faulthandler` 的裸 except) 吞掉,
+    # 连个线索都没有。(这个坑真踩过: 模块级 import logkeep 排在
+    # `_enable_faulthandler()` 之后, 第一次调用 NameError, 日志就全丢了。)
+    _RUN_LOG_RESOLVED = True
     return _RUN_LOG_PATH
 
 
@@ -105,6 +176,19 @@ def _last_log_path():
     """`last.log` —— 始终指向**最新一次运行**的日志 (见 _TeeLogger._link_last)。"""
     import paths as _p
     return _p.log_file("last.log")
+
+
+def _drop_stale_last(last_path):
+    """摘掉上一次运行留下的 `last.log` (本次不保存日志时用)。
+
+    不摘的话, 日志窗会读到**上一轮**的旧内容, 看起来像"这次也在记日志"。
+    只删目录项: `last.log` 是硬链接, 那次运行的文件本身还在, 历史不受影响。
+    """
+    try:
+        if last_path is not None and os.path.exists(last_path):
+            os.unlink(last_path)
+    except Exception:  # noqa: BLE001  删不掉也只是留着, 不该挡住启动
+        pass
 
 # **让 native 崩溃 (0xC0000409 / access violation) 也吐出 Python 栈。**
 # "Unhandled Python exception" 一行什么都说明不了 —— faulthandler 会在
@@ -128,10 +212,13 @@ def _enable_faulthandler():
         # 路径统一走 _run_log_path(): **必须和 _TeeLogger 打开的是同一个文件**
         # (每次运行一个新文件), 否则崩溃栈会写到另一个文件里。
         _log = _run_log_path()
-        _log.parent.mkdir(parents=True, exist_ok=True)
-        faulthandler.enable(file=open(_log, "a", encoding="utf-8"),
-                            all_threads=True)
-        return
+        # None = 本次不保存日志 (保留时间/数量里有 0)。那就没有文件可写,
+        # 直接走下面的 stderr 退路 —— 别在这里 AttributeError。
+        if _log is not None:
+            _log.parent.mkdir(parents=True, exist_ok=True)
+            faulthandler.enable(file=open(_log, "a", encoding="utf-8"),
+                                all_threads=True)
+            return
     except Exception:  # noqa: BLE001  日志开不了就退到 stderr
         pass
     # 退路: stderr 可用就用它 (必须真有 fileno, 否则 faulthandler 会抛)
@@ -177,6 +264,7 @@ if sys.platform == "win32":
     os.environ.setdefault("QT_QPA_PLATFORM", "windows:dpiawareness=2")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import logkeep           # noqa: E402  日志保留策略 (启动时清理旧日志)
 import paths as _paths   # noqa: E402  (必须在 sys.path 设置之后)
 import sysinfo           # noqa: E402  机器配置摘要 (给 banner 用)
 import wdlog             # noqa: E402  分级日志 (尽早导入, 后面的启动日志都走它)
@@ -384,9 +472,18 @@ class _TeeLogger:
                     pass
 
 
-#: 本次运行的日志文件 (每次启动一个新名字, 永不删除)
-_log_file_path = str(_run_log_path())
-_TeeLogger.open_log(_log_file_path, _last_log_path())
+#: 本次运行的日志文件 (每次启动一个新名字)。
+#: **`None` = 本次不保存日志** (保留时间/数量里有一个是 0, 见 logkeep)。
+#: 注意别写成 `str(_run_log_path())` —— 那样 None 会变成字符串 "None",
+#: 于是真的建出一个名叫 `None` 的文件。
+_log_file_path = _run_log_path()
+_TeeLogger.open_log(_log_file_path,
+                    _last_log_path() if _log_file_path else None)
+if _log_file_path is None:
+    _drop_stale_last(_last_log_path())
+# 让设置窗口也能知道"哪个文件是本次运行正在写的" —— 它的「立即清理」要保护
+# 这个文件。见 paths.CURRENT_LOG 的说明 (ui 不该 import main)。
+_paths.CURRENT_LOG = _log_file_path
 sys.stdout = _TeeLogger(sys.stdout)
 sys.stderr = _TeeLogger(sys.stderr)
 
@@ -419,6 +516,38 @@ def _init_logging(plain=False, level=None):
             wdlog.log.warn("未知日志等级 %r, 用默认 info "
                   "(可选 fatal/error/warn/info/debug/trace/all/off)" % level, tag="log")
     return use_color
+
+
+def _prune_old_logs(cfg):
+    """按 cfg 里的保留策略清理旧日志 (**启动时调一次**)。
+
+    语义见 logkeep 的文件头 (两个维度独立、取交集、任一为 0 即不保存)。
+
+    几个刻意的选择:
+      - 本次不保存日志 (`_log_file_path is None`) 时直接返回: 没有候选,
+        也不该去动别人的文件。
+      - **只在真的删了东西时才打一行**。每次启动都报"删了 0 个"是纯噪音,
+        而这个程序默认一天要起好几次。
+      - 任何异常都吞掉: 日志清理失败绝不能挡住程序启动。
+    """
+    try:
+        if _log_file_path is None:
+            return
+        days = logkeep.as_int(cfg.get("log_keep_days"), logkeep.DEFAULT_DAYS)
+        count = logkeep.as_int(cfg.get("log_keep_count"),
+                               logkeep.DEFAULT_COUNT)
+        if not logkeep.enabled(days, count):
+            return
+        deleted, kept, errors = logkeep.prune(_log_file_path.parent,
+                                              _log_file_path, days, count)
+        if deleted:
+            wdlog.log.info("按保留策略清理了 %d 个旧日志 (保留 %d 个; %s)"
+                           % (deleted, kept, logkeep.describe(days, count)),
+                           tag="log")
+        for e in errors:
+            wdlog.log.warn("旧日志删不掉, 已跳过: %s" % e, tag="log")
+    except Exception as exc:  # noqa: BLE001
+        wdlog.log.warn("清理旧日志失败 (不影响使用): %s" % exc, tag="log")
 
 #: config.json 等**用户数据**跟在 exe (或项目根) 旁边。
 #: 打包后 `__file__` 指向临时解包目录, 直接用它会把配置写到一个马上被删掉的
@@ -513,6 +642,16 @@ DEFAULT_CFG = {
     # 写坏/留空 -> 自动退回 paths.LOG_NAME_FORMAT (年-月-日-时-分-秒)。
     # ⚠️ **只影响下一次启动**: 本次的文件在进程一起来就打开了, 改不了名。
     "log_name_format": _paths.LOG_NAME_FORMAT,
+    # 保留时间 (天) / 保留数量 (个)。两个维度**各自独立, 同时生效** (取交集):
+    #   -1 / -1   全留, 什么都不删
+    #   -1 / 30   只留最近 30 个文件                    <- 默认
+    #    7 / -1   只留最近 7 天内的
+    #    7 / 30   两个条件都要满足
+    #    0 / 任意  不保存日志   (任一为 0 就等于"一个都不留", 见 logkeep)
+    #    任意 / 0  不保存日志
+    # 清理发生在**启动时** (见 main() 里的 logkeep.prune 调用)。
+    "log_keep_days": logkeep.DEFAULT_DAYS,
+    "log_keep_count": logkeep.DEFAULT_COUNT,
 }
 
 
@@ -1149,6 +1288,10 @@ def main():
                   or _early_cfg_value("log_level", path=cfg_file))
 
     cfg = apply_args(load_config(cfg_file), args)
+
+    # 按保留策略清理旧日志。**放在 _init_logging 之后**: 清理结果本身要按用户
+    # 设的等级来记 (设成 off 就不该有这条)。失败不影响启动 (见 logkeep.prune)。
+    _prune_old_logs(cfg)
 
     # 单实例: 两个实例会叠两层全屏置顶的玻璃层, 你看到的那层可能是旧实例的
     # (旧代码/旧帧), 表现就是"画面静止, 怎么改都没用"。这个坑很难自查。
