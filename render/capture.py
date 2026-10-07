@@ -309,6 +309,12 @@ class _WgcSource:
                                   monitor_index=idx)
         self._latest = None
         self._ctrl = None
+        #: 会话是否已被系统关闭 (on_closed)。**旧实现只在回调里把 _latest 置
+        #: None 就完了** —— 会话其实已经死了, grab() 永远返回 None, 采集线程
+        #: 却一直以为"只是这一瞬没有新帧", 于是玻璃层停在最后一帧或干脆不更新
+        #: (改分辨率/全屏独占游戏之后最容易发生)。这里记一个标志, 让采集线程
+        #: 能发现"会话没了"并重建。
+        self.closed = False
 
         @self.cap.event
         def on_frame_arrived(frame, _ctx):
@@ -317,6 +323,7 @@ class _WgcSource:
         @self.cap.event
         def on_closed():
             self._latest = None
+            self.closed = True
 
         self._ctrl = self.cap.start_free_threaded()
 
@@ -340,6 +347,13 @@ class _WgcSource:
                                "按实际尺寸用" % (fw, fh, self.w, self.h), tag="capture")
             self.w, self.h = fw, fh
         return arr
+
+    def closed_by_system(self):
+        """会话是否已被系统关闭 (分辨率/显示模式变化、全屏独占切换等)。
+
+        供采集线程判定"该重建会话了" —— 见 on_closed 回调里的说明。
+        """
+        return bool(self.closed)
 
     def release(self):
         if self._ctrl is not None:
@@ -837,6 +851,44 @@ class CaptureWorker(threading.Thread):
     def _pump_once(self, seq):
         self._maybe_reopen()
         if self._wgc is not None:
+            # **会话死了要重建, 不能当成"这一瞬没有新帧"。**
+            # 分辨率/显示模式变化、全屏独占游戏切换之后, WGC 会话会被系统关掉
+            # (on_closed)。旧实现只把 _latest 置 None, 于是采集线程永远拿到
+            # None, 玻璃层停在最后一帧或干脆不更新 —— 而 _bad_backends 里还
+            # 留着 wgc "可用"的记录, 永远走不到回退分支。
+            if self._wgc.closed_by_system():
+                wdlog.log.warn("WGC 会话已被系统关闭 (分辨率/显示模式变化?), 重建",
+                               tag="capture")
+                old, self._wgc = self._wgc, None
+                try:
+                    old.release()
+                except Exception:  # noqa: BLE001
+                    pass
+                with self.lock:
+                    size, origin = self.size, self.origin
+                try:
+                    self._wgc = _WgcSource(size, origin=origin)
+                    self.backend = "wgc"
+                    wdlog.log.info("WGC 会话已重建, %dx%d @ 桌面坐标 %s"
+                                   % (size + (origin,)), tag="capture")
+                except Exception as exc:  # noqa: BLE001
+                    wdlog.log.error("WGC 重建失败, 回退 DXGI/mss: %s" % exc,
+                                    tag="capture")
+                    _remember_bad_backend("wgc")
+                if self._wgc is None:
+                    # **手动指定后端时不静默降级** —— 这是本文件反复强调的
+                    # 契约 (见 _open 的说明: 手动选就"完全听用户的", 起不来
+                    # 要明确报错, 否则用户以为在用 wgc 实际跑的是 mss)。
+                    # auto 模式才重新挑一个可用后端。
+                    if self.want_backend != "auto":
+                        wdlog.log.error(
+                            "手动指定的 WGC 会话已失效且无法重建。请检查显卡驱动, "
+                            "或在设置里换用其他采集后端。", tag="capture")
+                    else:
+                        self.backend = "?"
+                        # 交回 _open 重新挑一个可用后端 (它会跳过刚记下的 wgc)
+                        self._open()
+                return seq
             t0 = time.perf_counter()
             try:
                 arr = self._wgc.grab()
