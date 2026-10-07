@@ -11,14 +11,18 @@ import wdlog
 from paths import log_file
 from .widgets import BodyLabel, PlainTextEdit, PrimaryPushButton, TransparentPushButton, make_icon
 
-#: 日志文件: <数据目录>/diagnostics/debug/log/win_duo.log (打包后是 exe 旁边)
-LOG_FILE = log_file("win_duo.log")
+#: 日志文件: <数据目录>/diagnostics/debug/log/last.log (打包后是 exe 旁边)
+#:
+#: **用 last.log 而不是某个固定文件名** —— 日志现在一次运行一个文件, 名字是
+#: 启动时刻 (见 main._run_log_path), 硬编码一个名字只能看到那一次。last.log
+#: 通过硬链接始终指向**最新一次运行**的日志, 所以这里永远读到当前这一份。
+LOG_FILE = log_file("last.log")
 
 
 def get_all_logs() -> str:
     """读日志文件内容。
 
-    日志是 main.py 把 stdout 重定向到 `win_duo.log` 写的, 所以**唯一**的来源
+    日志是 main.py 把 stdout 重定向到日志文件写的, 所以**唯一**的来源
     就是那个文件 —— 原来还有一套 `_MEMORY_LOGS` 内存缓冲 + `record_log()`,
     但 `record_log()` 全项目从没被调用过, 缓冲永远是空的, 于是这里每次都得
     落到磁盘那条分支。那套东西是没接上的半成品, 已删除。
@@ -144,9 +148,10 @@ class LogDialog(QDialog):
         """新开一个原生控制台窗口, 实时 tail 日志文件。
 
         为什么这么做: 打包成 exe 是 **--windowed** 的, 进程没有控制台, 平时看不到
-        stdout。而 main.py 把所有 stdout/stderr 都 tee 进了 win_duo.log, 所以这里
+        stdout。而 main.py 把所有 stdout/stderr 都 tee 进了日志文件, 所以这里
         另起一个控制台窗口去实时跟随那个文件, 就等于"随时调出一个命令行日志窗"。
         (不动主进程的流, 只读文件 —— 安全、不影响运行。)
+        跟随的是 last.log: 它是**当前这次运行**的硬链接, 内容实时同步。
 
         - chcp 65001: 把控制台切到 UTF-8, 否则中文日志会乱码 (默认 cp936)。
         - Get-Content -Wait: PowerShell 的实时 tail, 新写入的行会自动冒出来。

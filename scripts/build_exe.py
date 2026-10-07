@@ -127,7 +127,9 @@ def build(onedir=False, clean=False, console=False, name=NAME):
   1. 双击 %s 即可 —— 默认驻留托盘, 不弹窗。
   2. 配置在 exe 旁边的 diagnostics\\config\\config.json, 首次启动自动生成。
      想在别的机器上用, 把 exe 和整个 diagnostics 目录一起拷过去。
-  3. 日志在 diagnostics\\debug\\log\\win_duo.log
+  3. 日志在 diagnostics\\debug\\log\\ 下, **每次启动一个文件**, 用启动时刻命名
+     (如 2026-10-07-21-35-48.log), 历史日志不删除。
+     last.log 始终指向最新一次运行, 看它就够了。
      (或界面里「高级设置 -> 调试 -> 查看运行日志」)。
   4. 关不掉时按 Ctrl+Alt+Shift+Esc (关玻璃层并退出)。
 """ % (name + ".exe"))

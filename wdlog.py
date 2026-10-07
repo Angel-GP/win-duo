@@ -3,12 +3,16 @@
 ═════════════════════════════════════════════════════════════════════════
 为什么不用标准库 logging
 ═════════════════════════════════════════════════════════════════════════
-项目原本全是裸 print(), 靠 main.py 的 _TeeLogger 把 stdout/stderr tee 进
-win_duo.log。改成标准库 logging 要么另开一套输出通道 (日志窗口/tee 读不到),
-要么 handler 写 stdout 再被 tee —— 绕一圈。本模块直接沿用 tee 通道:
+项目原本全是裸 print(), 靠 main.py 的 _TeeLogger 把 stdout/stderr tee 进日志
+文件。改成标准库 logging 要么另开一套输出通道 (日志窗口/tee 读不到), 要么
+handler 写 stdout 再被 tee —— 绕一圈。本模块直接沿用 tee 通道:
     log() -> stdout(已被 _TeeLogger 接管) -> 控制台(带 ANSI 颜色) + 日志文件
 这样 ui/log_dialog.py 和"弹出命令行日志"窗口**不需要任何改动**就能继续工作,
-文件里写的是剥掉颜色码的纯文本 (见 _strip_ansi)。
+文件里写的是剥掉 ANSI 控制序列的纯文本 (见 strip_ansi)。
+
+日志文件: **每次启动一个**, 用启动时刻命名 `年-月-日-时-分-秒.log`, 永不删除;
+另有 `last.log` 始终指向最新一次运行 (硬链接)。见 main._run_log_path。
+每行行首带 `[HH:MM:SS]` 24 小时制墙上时间 (见 Logger._emit)。
 
 ═════════════════════════════════════════════════════════════════════════
 等级
@@ -81,12 +85,28 @@ _COLORS = {
     TRACE: "90",          # 暗灰
 }
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+#: 匹配**所有 CSI 序列** (ESC [ 参数 中间字节 终结字节)。
+#:
+#: ⚠️ 原来这里是 `\x1b\[[0-9;]*m` —— 只认以 `m` 结尾的 SGR **颜色码**。于是
+#: `status_line` / `_emit` 用的 EL (`\x1b[K`, 擦到行尾) 和光标序列**原样落进
+#: 日志文件**, 破坏"文件里是纯文本"的约定 (实测: 从终端运行、color=True 时
+#: 写盘内容含 ESC 0x1B)。这里按 ECMA-48 的 CSI 语法放宽:
+#:     ESC [  <参数 0x30-0x3F>*  <中间 0x20-0x2F>*  <终结 0x40-0x7E>
+#: 覆盖颜色、EL、光标移动等全部 CSI。
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def strip_ansi(s):
-    """剥掉 ANSI 颜色码。_TeeLogger 写文件前用它, 日志文件保持纯文本。"""
-    return _ANSI_RE.sub("", s)
+    """剥掉 ANSI 控制序列, 让写进日志文件的内容是**纯文本**。
+
+    `_TeeLogger.write` 在写文件前调用它 (控制台仍收带颜色的原文)。
+    除了 CSI, 最后再扫一遍**孤立的 ESC** —— 宁可多删一个控制字符, 也不要让
+    二进制控制码混进日志 (grep / tail / 日志窗都会被它搞乱)。
+    """
+    s = _ANSI_RE.sub("", s)
+    if "\x1b" in s:
+        s = s.replace("\x1b", "")
+    return s
 
 
 class Logger:
@@ -125,6 +145,28 @@ class Logger:
                 out_write(s)
         except Exception:  # noqa: BLE001  控制台没了 (关窗) 也不能把业务代码带走
             pass
+
+    def _write_console(self, s):
+        """**只写控制台, 不进日志文件** —— 给原地刷新的状态行用。
+
+        ⚠️ 状态行不是一个"日志条目": 它靠 `\\r` 在终端最后一行原地刷新, 既没有
+        换行也没有时间戳。写进文件只会留下一堆残片, 还会把**下一行真正的日志
+        粘在它后面** (实测: 文件里出现 "trace 状态行[19:42:26] [INFO ...]")。
+
+        文件里的状态变化由 overlay 另外用 `log.info(..., tag="status")` 记录 ——
+        那才是完整的、带时间戳的一行。两条路各司其职。
+
+        被 _TeeLogger 接管时走它的 `write_console_only`; 没被接管 (独立使用
+        wdlog / 单元测试) 就照常写 stdout。
+        """
+        fn = getattr(sys.stdout, "write_console_only", None)
+        if callable(fn):
+            try:
+                fn(s)
+                return
+            except Exception:  # noqa: BLE001  退回到普通写
+                pass
+        self._write(s)
 
     @staticmethod
     def _terminal_cols():
@@ -194,7 +236,7 @@ class Logger:
         if self.color:
             # EL 在刷新频率高时也比对空格便宜
             self._status = text
-            self._write("\r" + text + _EL)
+            self._write_console("\r" + text + _EL)
         else:
             if self._status is not None:
                 old_w = _display_width(self._status)
@@ -202,7 +244,7 @@ class Logger:
                 if w < old_w:
                     text = text + " " * (old_w - w)
             self._status = text
-            self._write("\r" + text)
+            self._write_console("\r" + text)
 
     # ------------------------------------------------------------ 输出
     def _emit(self, level, tag, msg):
@@ -211,7 +253,16 @@ class Logger:
         now = time.time()
         dt = 0.0 if self._last is None else now - self._last
         self._last = now
-        stamp = "%6.1f (+%5.2f)" % (now - self._t0, dt)
+        # 行首三段计时, **全部框在 [] 里**便于一眼切分, 各有用处:
+        #   [HH:MM:SS]  —— **24 小时制墙上时间**。日志一次运行一个文件
+        #     (见 main._run_log_path), 跨文件对照、和系统事件/别的日志对齐靠它。
+        #   [4.5]       —— **相对进程启动**的秒数。判断"启动后多久才走到这一步"。
+        #   [+ 3.62]    —— **距上一行**的秒数。两行间隔一眼可见, 抓
+        #     "哪一步卡了两秒"最省事 (不用自己拿两个绝对时间去相减)。
+        # 相对秒**不补前导空格** (数字直接贴着方括号), 读起来更干净;
+        # 增量保留定宽右对齐, 让正负号和小数点在各行之间对得齐。
+        clock = time.strftime("%H:%M:%S", time.localtime(now))
+        stamp = "[%s] [%.1f] [+%5.2f]" % (clock, now - self._t0, dt)
         name = _NAMES.get(level, str(level))
 
         # 整行 "[LEVEL] [tag] 消息" 上色, 时间戳保持素色 —— 刷屏时眼睛扫的
@@ -230,15 +281,17 @@ class Logger:
         # 状态行"贴底"协议: 写日志前先把状态行擦掉 (\r 回行首 + EL 清到行尾,
         # plain 模式按显示宽度补空格), 写完日志再画回最后一行。效果:
         # 日志正常滚屏, 状态行永远停在屏幕底部原地刷新, 互不干扰。
+        # **擦/画都走 _write_console**: 它们是纯控制台动作, 不该进日志文件
+        # (否则文件里全是 \r 和空白残片)。只有下面那一行真正的日志进文件。
         if self._status is not None:
             if self.color:
-                self._write("\r" + _EL)
+                self._write_console("\r" + _EL)
             else:
-                self._write("\r" + " " * _display_width(self._status) + "\r")
+                self._write_console("\r" + " " * _display_width(self._status) + "\r")
         self._write(line)
         if self._status is not None:
-            self._write("\r" + self._status
-                        + (_EL if self.color else ""))
+            self._write_console("\r" + self._status
+                                + (_EL if self.color else ""))
 
 
 #: 全局单例。各模块 `from wdlog import log` 后 log.info("...", tag="glass")。

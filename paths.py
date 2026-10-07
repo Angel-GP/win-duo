@@ -12,7 +12,7 @@ PyInstaller 打包后 `__file__` 指向**临时解包目录**（onefile 模式�
 所以任何"把文件放在自己旁边"的代码，打包后都会**写到一个马上消失的目录** ——
 配置存不住、日志看不到、图标找不到。这个模块把这些路径统一收口：
 
-  `data_dir()`     用户数据 (config.json / win_duo.log / win-duo.ico …)
+  `data_dir()`     用户数据 (config.json / 日志 / win-duo.ico …)
   `resource_dir()` 只读资源 (打包进去的图标等, 位于解包目录)
 
 判定规则：

@@ -26,6 +26,41 @@ import sys
 import time
 from pathlib import Path
 
+# ═══════════════════════════════════════════════════════════════════════
+# 本次运行的日志文件 —— **每次启动一个新文件, 用启动时刻命名**
+# ═══════════════════════════════════════════════════════════════════════
+# 命名: `年-月-日-时-分-秒.log` (例: 2026-10-07-21-35-48.log), 放在
+# `<数据目录>/diagnostics/debug/log/` 下。
+#
+# **永不删除、不再轮转。** 旧实现是"单文件 + 超过 2MB 改名成 .1", 但那个上限
+# 在 Windows 上**本来就失效**: `_enable_faulthandler()` 启动时就打开了一个常开
+# 句柄 (faulthandler 持有, 永不关闭), 而被占用的文件 `rename` 必然抛
+# `PermissionError [WinError 32]` —— 该异常又被裸 except 静默吞掉。实测后果:
+#   1) 文件永不轮转, 无限增长;
+#   2) 越过阈值后**每写一行都白做一次 close + rename + open**。
+# 改成"一次运行一个文件"后这两个问题从根上消失, 也就不需要删除任何历史日志。
+#
+# `_RUN_START` 在模块导入的最早期取, 保证文件名反映的是**进程启动时刻**。
+_RUN_START = time.time()
+
+
+def _run_log_path():
+    """本次运行的日志文件路径。
+
+    **在启动时算一次就固定**: faulthandler 和 _TeeLogger 必须写同一个文件,
+    所以两边都从这里取, 不能各自 time.strftime 一次 (跨秒就会分成两个文件)。
+    局部 import paths: 本函数在模块级 `import paths` 之前就被调用。
+    """
+    import paths as _p
+    stamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(_RUN_START))
+    return _p.log_file(stamp + ".log")
+
+
+def _last_log_path():
+    """`last.log` —— 始终指向**最新一次运行**的日志 (见 _TeeLogger._link_last)。"""
+    import paths as _p
+    return _p.log_file("last.log")
+
 # **让 native 崩溃 (0xC0000409 / access violation) 也吐出 Python 栈。**
 # "Unhandled Python exception" 一行什么都说明不了 —— faulthandler 会在
 # 崩溃瞬间把所有线程的 Python 调用栈打到 stderr, 精确到是哪一行触发的。
@@ -42,11 +77,12 @@ def _enable_faulthandler():
     # 是 None (打包 windowed exe) 还是已被 _TeeLogger 接管 (没有 fileno, 见该类
     # 的 fileno 说明), 都能启用 —— 这正是本函数要保证的事。
     try:
-        # 局部 import paths: 本函数在第 52 行就被调用, 而模块级
-        # `import paths as _paths` 在更后面 —— 用模块级会 NameError, 被裸 except
-        # 吞掉, 于是 faulthandler 恰好在它唯一被需要的场景 (打包 exe) 从不启用。
-        import paths as _p
-        _log = _p.log_file("win_duo.log")
+        # 局部 import paths: 本函数在模块级 `import paths as _paths` 之前就被
+        # 调用 —— 用模块级会 NameError, 被裸 except 吞掉, 于是 faulthandler
+        # 恰好在它唯一被需要的场景 (打包 exe) 从不启用。
+        # 路径统一走 _run_log_path(): **必须和 _TeeLogger 打开的是同一个文件**
+        # (每次运行一个新文件), 否则崩溃栈会写到另一个文件里。
+        _log = _run_log_path()
         _log.parent.mkdir(parents=True, exist_ok=True)
         faulthandler.enable(file=open(_log, "a", encoding="utf-8"),
                             all_threads=True)
@@ -107,23 +143,19 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-#: 日志文件大小上限 (字节)。超过就轮转 —— 开机自启常驻时日志一直写, 不轮转会
-#: 无限增长 (实测见过 11MB+)。轮转时把当前日志改名成 `.1`、旧的 `.1` 丢弃, 所以
-#: 最多占 2 份。
-_LOG_MAX_BYTES = 2 * 1024 * 1024
-
-
 class _TeeLogger:
     """把 stdout/stderr 同时写到原流和日志文件。
 
-    stdout 和 stderr 两个实例**共享同一个文件句柄** (由 `_open_log` 打开), 否则
-    同一文件会被打开两次、写乱、轮转也各转各的。
+    stdout 和 stderr 两个实例**共享同一个文件句柄** (由 `open_log` 打开), 否则
+    同一文件会被打开两次、写乱。
     """
 
     #: 全进程共用的日志文件句柄 + 路径 (stdout/stderr 两个实例共用)
     _file = None
+    #: `last.log` 的兜底句柄 —— **只有硬链接不可用**时才会用到 (见 _link_last)
+    _last_file = None
     _path = None
-    _max = _LOG_MAX_BYTES
+    _last_path = None
 
     def __init__(self, primary):
         self.primary = primary
@@ -163,55 +195,93 @@ class _TeeLogger:
         return False
 
     @classmethod
-    def open_log(cls, log_path, max_bytes=_LOG_MAX_BYTES):
-        """打开(追加)日志文件; 已超上限则先轮转。失败就退化成只写原流。"""
-        cls._path = log_path
-        cls._max = int(max_bytes)
-        try:
-            p = Path(log_path)
+    def open_log(cls, log_path, last_path=None):
+        """打开**本次运行**的日志文件, 并让 `last.log` 指向它。
+
+        **没有轮转。** 一次运行一个文件 (文件名 = 启动时刻), 所以同一个文件
+        不会无限增长; 历史日志一律保留, 不主动删除。
+        失败就退化成只写原流 (控制台), 不挡启动。
+        """
+        cls._path = Path(log_path) if log_path is not None else None
+        cls._last_path = Path(last_path) if last_path is not None else None
+        cls._file = None
+        cls._last_file = None
+        if cls._path is not None:
             try:
-                if p.exists() and p.stat().st_size >= cls._max:
-                    rot = p.with_name(p.name + ".1")
-                    if rot.exists():
-                        rot.unlink()
-                    p.rename(rot)
-            except Exception:  # noqa: BLE001  轮转失败就继续追加
-                pass
-            cls._file = open(log_path, "a", encoding="utf-8", buffering=1)
-        except Exception:  # noqa: BLE001
-            cls._file = None
+                cls._path.parent.mkdir(parents=True, exist_ok=True)
+                cls._file = open(cls._path, "a", encoding="utf-8", buffering=1)
+            except Exception:  # noqa: BLE001
+                cls._file = None
+        cls._link_last()
 
     @classmethod
-    def _maybe_rotate(cls, s):
-        """写完一行后若超上限就轮转 (在行尾做, 不把一行劈两半)。"""
-        f = cls._file
-        if f is None or cls._max <= 0 or not s.endswith("\n"):
+    def _link_last(cls):
+        """让 `last.log` 指向本次运行的日志 (硬链接优先, 退化到双写)。
+
+        优先做**硬链接**: NTFS 支持且不需要管理员权限, 两个名字指向同一个文件
+        —— `last.log` 永远与当前日志**逐字节一致**, 零额外 I/O、零额外占用。
+        文件系统不支持硬链接 (FAT/exFAT), 或 `last.log` 正被别的程序占用
+        (Windows 上删不掉) 时, 退化成**双写**: 多开一个句柄, 每次写文件时同时
+        写过去。两条路都保证 `last.log` 存在且是最新的; 都失败也只是没有
+        `last.log`, 不影响本次日志本身。
+        """
+        if cls._path is None or cls._last_path is None or cls._file is None:
             return
         try:
-            if f.tell() >= cls._max:
-                f.close()
-                cls._file = None
-                cls.open_log(cls._path, cls._max)
-        except Exception:  # noqa: BLE001
+            # 摘掉旧名字 (只摘目录项, 不动上一次运行的那个数据文件本身)
+            if os.path.exists(cls._last_path):
+                os.unlink(cls._last_path)
+            os.link(cls._path, cls._last_path)
+            return
+        except Exception:  # noqa: BLE001  不支持硬链接 / 被占用 -> 双写
             pass
+        try:
+            cls._last_file = open(cls._last_path, "w", encoding="utf-8",
+                                  buffering=1)
+        except Exception:  # noqa: BLE001
+            cls._last_file = None
 
     def write(self, s):
         # 控制台 (primary) 收**原始文本** (含 ANSI 颜色); 日志文件收**剥掉
-        # ANSI** 的纯文本 —— 两边受众不同。先剥再写文件, 轮转判据
-        # (endswith("\n")) 用原始 s, 不受影响。
+        # ANSI** 的纯文本 —— 两边受众不同。
         if self.primary is not None:
             try:
                 self.primary.write(s)
             except Exception:  # noqa: BLE001
                 pass
         clean = wdlog.strip_ansi(s) if "\x1b" in s else s
+        # **裸 \r 也要去掉。** status_line / _emit 用 "\r + EL" 在控制台上原地
+        # 刷新状态行; 那个 \r 对文件毫无意义, 留着会让日志里出现行内回车
+        # (grep / tail / 日志窗显示都会受影响)。ANSI 剥掉之后剩下的 \r 正好
+        # 就是这个, 直接删干净 —— 文件里只留真正的换行。
+        if "\r" in clean:
+            clean = clean.replace("\r", "")
         f = type(self)._file
         if f is not None:
             try:
                 f.write(clean)
             except Exception:  # noqa: BLE001
                 pass
-        type(self)._maybe_rotate(s)
+        # 双写兜底路径 (硬链接可用时 _last_file 恒为 None, 这里是空转)
+        lf = type(self)._last_file
+        if lf is not None:
+            try:
+                lf.write(clean)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def write_console_only(self, s):
+        """**只写控制台, 不写日志文件。**
+
+        wdlog 的原地刷新状态行 (以及"擦掉状态行/画回状态行") 走这里。那些内容
+        靠 `\\r` 在终端最后一行刷新, 不是日志条目 —— 写进文件只会留下没有
+        时间戳、没有换行的残片, 还会把下一行真正的日志粘在它后面。
+        """
+        if self.primary is not None:
+            try:
+                self.primary.write(s)
+            except Exception:  # noqa: BLE001
+                pass
 
     def flush(self):
         if self.primary is not None:
@@ -219,16 +289,17 @@ class _TeeLogger:
                 self.primary.flush()
             except Exception:  # noqa: BLE001
                 pass
-        f = type(self)._file
-        if f is not None:
-            try:
-                f.flush()
-            except Exception:  # noqa: BLE001
-                pass
+        for f in (type(self)._file, type(self)._last_file):
+            if f is not None:
+                try:
+                    f.flush()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
-_log_file_path = str(_paths.log_file("win_duo.log"))
-_TeeLogger.open_log(_log_file_path)
+#: 本次运行的日志文件 (每次启动一个新名字, 永不删除)
+_log_file_path = str(_run_log_path())
+_TeeLogger.open_log(_log_file_path, _last_log_path())
 sys.stdout = _TeeLogger(sys.stdout)
 sys.stderr = _TeeLogger(sys.stderr)
 
