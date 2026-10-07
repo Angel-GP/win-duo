@@ -6,8 +6,8 @@ import time
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QTextCursor
-from PyQt6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QSizePolicy,
+                             QVBoxLayout, QWidget)
 
 import paths
 import wdlog
@@ -261,7 +261,7 @@ class LogSettingsDialog(QDialog):
         self._save_cb = save
         self.setWindowTitle("win-duo 日志")
         self.setWindowIcon(make_icon())
-        self.resize(460, 330)
+        self.resize(470, 300)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         lay = QVBoxLayout(self)
@@ -280,8 +280,7 @@ class LogSettingsDialog(QDialog):
         self.cmb_level.currentIndexChanged.connect(self._on_level)
         lay.addLayout(self._row("日志等级", self.cmb_level))
 
-        self.lbl_level = CaptionLabel("")
-        self.lbl_level.setObjectName("hint")
+        self.lbl_level = self._hint_label()
         lay.addWidget(self.lbl_level)
 
         # ── 日志文件名模板 ────────────────────────────────────────
@@ -298,16 +297,10 @@ class LogSettingsDialog(QDialog):
         lay.addLayout(self._row("文件名模板", self._hrow(self.edt_fmt,
                                                          btn_default)))
 
-        self.lbl_preview = CaptionLabel("")
-        self.lbl_preview.setObjectName("hint")
-        self.lbl_preview.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_preview = self._hint_label()
         lay.addWidget(self.lbl_preview)
 
-        self.lbl_cur = CaptionLabel("")
-        self.lbl_cur.setObjectName("hint")
-        self.lbl_cur.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl_cur = self._hint_label()
         lay.addWidget(self.lbl_cur)
 
         # ── 查看 / 保存 ───────────────────────────────────────────
@@ -328,13 +321,9 @@ class LogSettingsDialog(QDialog):
         row2.addStretch(1)
         lay.addLayout(row2)
 
+        # **没有「关闭」按钮**: 标题栏本来就有 X, 再加一个纯属重复占地方。
+        # (原来这里还有一行右对齐的关闭按钮, 已去掉。)
         lay.addStretch(1)
-        row3 = QHBoxLayout()
-        row3.addStretch(1)
-        btn_close = PrimaryPushButton("关闭")
-        btn_close.clicked.connect(self.accept)
-        row3.addWidget(btn_close)
-        lay.addLayout(row3)
 
         self._update_preview(self.edt_fmt.text())
         self._update_level_hint()
@@ -361,6 +350,26 @@ class LogSettingsDialog(QDialog):
         for w in widgets:
             h.addWidget(w)
         return box
+
+    @staticmethod
+    def _hint_label():
+        """一行灰色小字提示 —— **宽度完全交给布局, 不参与撑窗**。
+
+        这些提示里有完整路径和用户写的模板, 长度不可控:
+          - 不换行 -> sizeHint 直接把弹窗最小宽度顶到 800+ (实测 872);
+          - 只换行也不够 -> 一个没有断点的长串 (比如模板写成 80 个 `%Y`) 折不了,
+            sizeHint 照样顶到 1040。
+        所以再补一条**横向 Ignored**: 忽略它自己的宽度提示, 布局给多宽就多宽,
+        多出来的文字自己换行/裁掉。弹窗宽度因此完全由那些固定控件决定。
+        """
+        lbl = CaptionLabel("")
+        lbl.setObjectName("hint")
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lbl.setSizePolicy(QSizePolicy.Policy.Ignored,
+                          QSizePolicy.Policy.Preferred)
+        return lbl
 
     # ------------------------------------------------------------ 等级
     def _on_level(self, _idx):
