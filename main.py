@@ -153,6 +153,7 @@ if sys.platform == "win32":
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths as _paths   # noqa: E402  (必须在 sys.path 设置之后)
+import sysinfo           # noqa: E402  机器配置摘要 (给 banner 用)
 import wdlog             # noqa: E402  分级日志 (尽早导入, 后面的启动日志都走它)
 
 # 输出被重定向(管道)时 Windows 按 cp936 编码, 中文会乱码; 强制 UTF-8。
@@ -668,6 +669,37 @@ def make_qsurface_format():
     return fmt
 
 
+def print_hardware(w):
+    """机器配置摘要 (CPU / 内存 / 显卡), 接在 banner 的"系统"下面。
+
+    为什么和版本信息一样重要: 这个程序是"OpenGL 覆盖层 + 摄像头测角", 而
+    混合显卡笔记本上 GL 上下文落在核显还是独显由驱动决定, 投屏/远程/串流
+    软件装的虚拟显示适配器也会混在适配器列表里 —— 覆盖层画不出来、截屏抓到
+    黑屏时, 必须先知道这台机器上到底有几块适配器。内存和 CPU 线程数则分别是
+    低内存模式和截屏/ORB 匹配的判据。
+
+    **每项各自兜底**: 取不到就整行跳过, 不写"(未知)"占位 —— 一排占位只是噪音,
+    少一行反而更容易看出哪项真的没查到。全部取不到时这里一行都不出。
+    """
+    name = sysinfo.cpu_name()
+    threads = sysinfo.cpu_threads()
+    if name or threads:
+        w("  CPU       : %s%s"
+          % (name or "(未知)", ("   %d 线程" % threads) if threads else ""),
+          tag="banner")
+    mem = sysinfo.memory()
+    if mem is not None:
+        total, avail, load = mem
+        w("  内存      : %s (可用 %s, 已用 %d%%)"
+          % (sysinfo.format_bytes(total), sysinfo.format_bytes(avail), load),
+          tag="banner")
+    # 多块适配器时第一块跟在"显卡"标签后, 其余缩进对齐成续行
+    for i, (desc, drv) in enumerate(sysinfo.gpus()):
+        w("%s%s%s" % ("  显卡      : " if i == 0 else "              ",
+                      desc or "(未知)",
+                      ("   (驱动 %s)" % drv) if drv else ""), tag="banner")
+
+
 def print_banner(cfg, region):
     w = wdlog.log.info
     w("=" * 68, tag="banner")
@@ -687,11 +719,15 @@ def print_banner(cfg, region):
         else:
             form = "源码运行"
             py = platform.python_version()
+        _bits = sysinfo.bits()
         w("  版本      : %s   %s" % (_paths.__version__, form), tag="banner")
         w("  Python    : %s" % py, tag="banner")
-        w("  系统      : %s" % platform.platform(), tag="banner")
+        w("  系统      : %s%s" % (platform.platform(),
+                                  ("   %d 位" % _bits) if _bits else ""),
+          tag="banner")
     except Exception as exc:  # noqa: BLE001
         w("  环境摘要  : 取不到 (%s)" % exc, tag="banner")
+    print_hardware(w)
     w("-" * 68, tag="banner")
     w("  角度源    : %s" % cfg["source"], tag="banner")
     if cfg["source"] == "camera":
