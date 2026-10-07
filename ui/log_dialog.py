@@ -261,6 +261,8 @@ class LogSettingsDialog(QDialog):
         self._save_cb = save
         self.setWindowTitle("win-duo 日志")
         self.setWindowIcon(make_icon())
+        # 只定**宽度**; 高度由 _fit_height() 贴合内容 (末尾会调一次)。
+        # 这里给的高度只是个初始值, 随后就被 setFixedHeight 覆盖。
         self.resize(470, 300)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
@@ -322,9 +324,9 @@ class LogSettingsDialog(QDialog):
         lay.addLayout(row2)
 
         # **没有「关闭」按钮**: 标题栏本来就有 X, 再加一个纯属重复占地方。
-        # (原来这里还有一行右对齐的关闭按钮, 已去掉。)
-        lay.addStretch(1)
-
+        # **也不留底部 stretch**: 删掉关闭按钮后它就是纯粹的一块空白 —— 内容
+        # 只有 ~250px, 而窗口给的是 300px, 多出来的全被 stretch 吞到底部。
+        # 高度改由 _fit_height() 贴合内容 (见那里的说明)。
         self._update_preview(self.edt_fmt.text())
         self._update_level_hint()
 
@@ -371,6 +373,24 @@ class LogSettingsDialog(QDialog):
                           QSizePolicy.Policy.Preferred)
         return lbl
 
+    def _fit_height(self):
+        """把窗口高度贴合内容 —— **每次提示文字变化都要调**。
+
+        为什么必须做这件事, 而不是给个固定高度了事:
+
+          - 高度写死 300 而内容只要 ~250 -> 多出来的 50px 要么被底部 stretch
+            吞成一块空白 (原来就是这样), 要么被布局均分到各控件之间, 变成
+            一片片空隙。两种都难看。
+          - 提示的行数**是会变的**: 模板写坏时预览会多出"已自动退回默认"那一行。
+            QDialog **不会**自己跟着长 (实测: 把 layout 设成 SetFixedSize 也不跟),
+            不管的话第二行直接被裁掉 —— 那行正是"告诉你模板没生效"的提示,
+            裁掉等于没提示。
+
+        所以: 高度设成固定的内容高 (setFixedHeight), 内容一变就重算。**宽度保持
+        可调**, 只锁高度。
+        """
+        self.setFixedHeight(self.sizeHint().height())
+
     # ------------------------------------------------------------ 等级
     def _on_level(self, _idx):
         val = self.cmb_level.currentData()
@@ -389,6 +409,7 @@ class LogSettingsDialog(QDialog):
         else:
             txt = "已生效: 等级 %s —— 立即生效, 无需重启" % val
         self.lbl_level.setText(txt)
+        self._fit_height()          # 提示变长可能多占一行, 高度要跟上
 
     # ------------------------------------------------------------ 文件名
     def _update_preview(self, text):
@@ -403,6 +424,7 @@ class LogSettingsDialog(QDialog):
         self.lbl_cur.setText(
             "本次运行:  %s\n(文件名只影响下一次启动; 本次的文件已打开)"
             % LOG_FILE)
+        self._fit_height()          # 坏模板会多出"已退回默认"那一行
 
     def _reset_fmt(self):
         self.edt_fmt.setText(paths.LOG_NAME_FORMAT)
