@@ -73,9 +73,18 @@ MAX_TAPS = 32             # 模糊盘式采样数上限
 BACKDROP_BLUR = 1.0       # 背景兜底图相对前景的模糊比例
 LOCK_AT_CLOSE = False     # 合盖到底 (浓度接近满) 时锁屏
 #: 玻璃层显隐的三个阈值 (双阈值 + 最短驻留, 防止死区边缘反复闪)
+#
+#: ⚠️ **IDLE_SHOW_ABOVE 不能太大。** 浓度是"非负且单调"的: pitch<=0 恒为 0,
+#: 而 pitch 每转 1 度只涨约 0.6% 浓度 (scale=1.1)。原来 0.02 意味着要转过
+#: **7.7 度**才肯显示 —— 前 7.7 度的合盖完全没有动画, 而测角噪声又刚好在这一
+#: 区间抖动, 于是玻璃层反复穿越阈值快速显隐 (用户看到的就是"屏幕一闪一闪 /
+#: 像在反复重启")。降到 0.008 后起步只需约 3 度, 既保留了"浓度≈0 就隐藏"
+#: 的省电/不卡顿效果, 又把死区压掉了一大半。
 IDLE_HIDE_BELOW = 0.004   # 浓度低于它 -> 隐藏整个玻璃层 (露出真实桌面)
-IDLE_SHOW_ABOVE = 0.02    # 浓度高于它 -> 显示
-IDLE_DWELL_SEC = 0.35     # 两次显隐最短间隔
+IDLE_SHOW_ABOVE = 0.008   # 浓度高于它 -> 显示
+#: 两次显隐最短间隔。原来 0.35s 太短: 死区边缘抖动时每 0.35s 就能翻一次,
+#: 一次开合能看到好几闪。0.6s 明显压掉闪烁, 又不影响真实开合的响应。
+IDLE_DWELL_SEC = 0.6
 
 
 def _display_width(s):
@@ -247,9 +256,11 @@ class GlassOverlay(QOpenGLWidget):
         atexit.register(self._atexit_stats)
 
         # 渲染参数全部收进 apply_config(), 这样设置窗口改完能就地生效
-        self.idle_hide = 0.004
-        self.idle_show = 0.02
-        self.idle_dwell = 0.35
+        # (这里给和模块常量一致的初值, 避免 __init__ 与 apply_config 之间
+        #  出现两套阈值 —— 曾经就是这里写死 0.004/0.02 而常量改了不生效)
+        self.idle_hide = IDLE_HIDE_BELOW
+        self.idle_show = IDLE_SHOW_ABOVE
+        self.idle_dwell = IDLE_DWELL_SEC
         self._last_vis_change = 0.0
         self.render_interval = 1.0 / 30.0
         self._last_draw_req = 0.0
