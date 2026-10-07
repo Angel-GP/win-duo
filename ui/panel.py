@@ -24,7 +24,7 @@ import wdlog
 from angles.hub import LABELS
 
 from . import autostart, monitors
-from .log_dialog import LogDialog
+from .log_dialog import LogDialog, LogSettingsDialog
 from .widgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, LineEdit,
                       NumberField, PrimaryPushButton, SegmentBar, StrongBodyLabel,
                       SwitchButton, TransparentPushButton, card_layout, make_icon, row)
@@ -532,10 +532,13 @@ class SettingsPanel(QWidget):
 
         self.btn_debug = TransparentPushButton("打开匹配调试窗")
         self.btn_debug.clicked.connect(self._quick_debug)
-        self.btn_log = PrimaryPushButton("查看运行日志...")
-        self.btn_log.clicked.connect(self._open_log_dialog_clicked)
+        # 「日志...」是**二级弹窗**的入口: 等级 / 文件名模板 / 查看 / 保存 都收在
+        # 里面那一层。原来是直接开"查看运行日志"窗 —— 现在点开的是设置层, 从那里
+        # 再进查看窗 (见 LogSettingsDialog)。
+        self.btn_log = PrimaryPushButton("日志...")
+        self.btn_log.clicked.connect(self._open_log_settings_clicked)
         l3.addWidget(self._labeled("特征匹配", self.btn_debug))
-        l3.addWidget(self._labeled("运行日志", self.btn_log))
+        l3.addWidget(self._labeled("日志", self.btn_log))
 
         # 低内存模式: 玻璃层不可见够久就把 GL 窗口销毁, 把显存/交换链还回去。
         # 用 _labeled 和其它项一样左对齐标签 (label_w 和其它行一致, 否则这一行
@@ -1269,6 +1272,16 @@ class SettingsPanel(QWidget):
         self.cfg["low_memory_mode"] = bool(checked)
         self.controller.save()
         self.controller.apply_low_memory_mode()
+
+    def _open_log_settings_clicked(self):
+        """调试页「日志...」-> 二级弹窗 (等级 / 文件名模板 / 查看 / 保存)。
+
+        把 cfg 和落盘回调一起传进去: 弹窗里改等级要**立即生效**并且**记住**,
+        它自己不该去猜配置存在哪、怎么存。
+        """
+        wdlog.log.debug("用户操作: 打开日志设置", tag="ui")
+        dlg = LogSettingsDialog(self, cfg=self.cfg, save=self.controller.save)
+        dlg.exec()
 
     def _open_log_dialog_clicked(self):
         wdlog.log.debug("用户操作: 打开运行日志窗口", tag="ui")

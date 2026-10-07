@@ -49,6 +49,27 @@ _RUN_START = time.time()
 _RUN_LOG_PATH = None
 
 
+def _early_cfg_value(key, default=None, path=None):
+    """在 `load_config()` 可用之前, 直接从 config.json 里读**一个**键。
+
+    为什么需要它: `_run_log_path()` 必须在**模块导入时**就定下来 (faulthandler
+    和日志 tee 都要用它), 而那时 `load_config` / `DEFAULT_CFG` 都还没定义 ——
+    它们在本文件更靠下的位置。所以这里自己开一次 json, 只读不写。
+
+    **任何异常都退回 default**: 文件不存在、JSON 坏了、没这个键 —— 启动路径上
+    不能因为读不到一个配置项就抛出去。
+    局部 import paths: 本函数在模块级 `import paths` 之前就被调用。
+    """
+    try:
+        import json as _json
+        import paths as _p
+        target = path if path is not None else _p.config_file("config.json")
+        with open(target, "r", encoding="utf-8-sig") as fh:
+            return _json.load(fh).get(key, default)
+    except Exception:  # noqa: BLE001
+        return default
+
+
 def _run_log_path():
     """本次运行的日志文件路径。
 
@@ -57,11 +78,15 @@ def _run_log_path():
     也**不能各自探测一次"名字有没有被占"** —— `_enable_faulthandler()` 在模块级
     先把文件建出来, 第二次探测就会以为撞名而另起一个文件, 崩溃栈和正文又分家了。
     局部 import paths: 本函数在模块级 `import paths` 之前就被调用。
+
+    名字由配置里的 `log_name_format` 模板生成 (设置窗口可改)。**模板改动只影响
+    下一次启动** —— 本次的文件在进程一起来就打开了, 没法改名。
     """
     global _RUN_LOG_PATH
     if _RUN_LOG_PATH is None:
         import paths as _p
-        stamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(_RUN_START))
+        fmt = _early_cfg_value("log_name_format", _p.LOG_NAME_FORMAT)
+        stamp = _p.format_log_name(fmt, _RUN_START)
         # **同一秒里起第二次要错开。** 文件名只精确到秒, 而 open_log 用的是
         # "a" (追加): 崩溃后被守护进程/用户立刻重启, 第二次运行会**追加**到
         # 第一次的文件里, last.log 也指向这个混合文件 —— 重启前后的因果就糊
@@ -480,6 +505,14 @@ DEFAULT_CFG = {
     # (旧名 auto_zero_on_negative 仍会被识别, 见 angles/camera.py。)
     "auto_zero_beyond_open": True,
     "low_memory_mode": False,
+    # ── 日志 (设置窗口「高级设置 -> 调试 -> 日志」可改) ──────────────
+    # 等级: fatal/error/warn/info/debug/trace/all/off。**改完立即生效**。
+    # 命令行 --log-level 优先于它 (见 main(): args.log_level or 配置值)。
+    "log_level": "info",
+    # 文件名模板 (strftime 记法)。一次运行一个文件, 名字由它生成。
+    # 写坏/留空 -> 自动退回 paths.LOG_NAME_FORMAT (年-月-日-时-分-秒)。
+    # ⚠️ **只影响下一次启动**: 本次的文件在进程一起来就打开了, 改不了名。
+    "log_name_format": _paths.LOG_NAME_FORMAT,
 }
 
 
@@ -1106,10 +1139,15 @@ def main():
                     help="直接指定玻璃浓度 0..1 (手动模式, 不用按键)")
     args = ap.parse_args()
 
-    # 日志配置要赶在任何业务日志之前 (初始化本身可能打日志)
-    _init_logging(plain=args.plain, level=args.log_level)
-
     cfg_file = config_path(args.config)
+
+    # 日志配置要赶在任何业务日志之前 (初始化本身可能打日志)。
+    # 等级存在 config.json 里 (设置窗口可改), 但这时还不能建 cfg —— 所以先把
+    # 配置文件路径解析出来, 直接从它读那一个键。**命令行优先于配置**。
+    _init_logging(plain=args.plain,
+                  level=args.log_level
+                  or _early_cfg_value("log_level", path=cfg_file))
+
     cfg = apply_args(load_config(cfg_file), args)
 
     # 单实例: 两个实例会叠两层全屏置顶的玻璃层, 你看到的那层可能是旧实例的

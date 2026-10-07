@@ -24,6 +24,7 @@ PyInstaller 打包后 `__file__` 指向**临时解包目录**（onefile 模式�
 """
 import os
 import sys
+import time
 from pathlib import Path
 
 import wdlog
@@ -149,3 +150,79 @@ def debug_file(name):
 def resource_file(name):
     """只读资源目录里的一个文件路径。"""
     return resource_dir() / name
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 日志文件名 —— 模板可自定义 (见设置窗口「高级设置 -> 调试 -> 日志」)
+# ═══════════════════════════════════════════════════════════════════════
+#: 默认模板 (strftime 记法): `2026-10-07-20-30-15.log`。
+#: 一次运行一个日志文件, 名字由这个模板生成 —— 用户可以在设置里改。
+LOG_NAME_FORMAT = "%Y-%m-%d-%H-%M-%S"
+
+#: Windows 文件名里不允许出现的字符 (含路径分隔符 —— 模板里带 `/` 的话
+#: 会试图写到别的目录去)。
+_BAD_NAME_CHARS = '\\/:*?"<>|'
+
+#: Windows 的保留设备名。叫 CON.log 的文件根本建不出来 (报错很费解), 加前缀躲开。
+_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + ["com%d" % i for i in range(1, 10)]
+    + ["lpt%d" % i for i in range(1, 10)])
+
+
+def sanitize_log_stem(stem):
+    """把模板产出的一段文本收拾成**安全的文件名主干** (不含 `.log`)。
+
+    用户可编辑的模板必须当作不可信输入: 里面可能有路径分隔符 (会写到别的目录)、
+    非法字符、控制字符, 或者干脆产出一个空串。这里一律替换/剥离, 让它只可能
+    落成一个本目录下的普通文件名。
+    """
+    s = "".join("_" if (ch in _BAD_NAME_CHARS or ord(ch) < 32) else ch
+                for ch in str(stem or ""))
+    # 结尾的点和空格在 Windows 上会被**静默吃掉**, 导致"界面显示的名字"和
+    # "磁盘上真正的名字"对不上 —— 提前剥掉。
+    s = s.strip().rstrip(".")
+    if s.lower() in _RESERVED_NAMES:
+        s = "_" + s
+    # NTFS 单个名字上限 255; 后面还要接 ".log" 和可能的 "-2" 去重后缀, 留足余量。
+    return s[:80]
+
+
+def format_log_name(fmt=None, when=None):
+    """按模板生成日志文件名主干 (不含 `.log`)。
+
+    `fmt` 是 strftime 模板 (如 `%Y-%m-%d-%H-%M-%S`)。**任何情况下都会返回一个
+    可用的名字**: 模板为空、不是字符串、strftime 报错、或者收拾完变成空串,
+    都退回内置的 `LOG_NAME_FORMAT`。
+
+    为什么要这么兜: 这个名字是在**进程启动最早期**算的 (faulthandler 和日志 tee
+    都要用它), 那时还没有任何界面能把错误显示给用户。一个写坏的模板绝不能变成
+    "启动时抛异常"或者"日志凭空消失"。
+    """
+    when = time.time() if when is None else when
+    stem = ""
+    if fmt:
+        try:
+            stem = time.strftime(str(fmt), time.localtime(when))
+        except Exception:  # noqa: BLE001  模板里有非法指令等
+            stem = ""
+    stem = sanitize_log_stem(stem)
+    if not stem:
+        stem = time.strftime(LOG_NAME_FORMAT, time.localtime(when))
+    return stem
+
+
+def log_name_custom_ok(fmt):
+    """这个模板能不能产出一个可用的名字? (给设置界面做提示用)
+
+    设置窗口要在用户**还没保存**时就告诉他"你写的模板其实会被退回默认" ——
+    光看 `format_log_name` 的返回值分不出来 (退回默认时它照样返回一个合法名字,
+    那正是它该做的)。
+    """
+    if not fmt or not str(fmt).strip():
+        return False
+    try:
+        raw = time.strftime(str(fmt), time.localtime())
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(sanitize_log_stem(raw))
