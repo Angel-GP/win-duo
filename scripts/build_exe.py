@@ -70,6 +70,70 @@ EXCLUDE = [
 ]
 
 
+def _version_tuple(ver):
+    """`'1.4.0'` -> `(1, 4, 0, 0)`。Windows 的文件版本号固定 4 段。"""
+    out = []
+    for chunk in str(ver).split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    while len(out) < 4:
+        out.append(0)
+    return tuple(out[:4])
+
+
+#: PyInstaller 的版本资源模板 (写成 exe 的"属性 -> 详细信息")。
+#:
+#: ⚠️ **刻意全用 ASCII。** PyInstaller 解析这个文件走的是 `eval()` + 平台默认
+#: 编码 (Windows 上是 cp936/cp1252), **不是 UTF-8** —— 里面写中文在部分版本上
+#: 会直接解析失败, 整个打包就挂了。这些字符串只出现在文件属性里, 用英文没有
+#: 实际损失。要改中文请先在 CI 上试一次。
+_VERSION_FILE = """\
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=%(tup)s,
+    prodvers=%(tup)s,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [StringStruct('CompanyName', 'win-duo'),
+         StringStruct('FileDescription', 'win-duo - foldable screen glass overlay'),
+         StringStruct('FileVersion', '%(ver)s'),
+         StringStruct('InternalName', 'win-duo'),
+         StringStruct('LegalCopyright', 'GPL-3.0'),
+         StringStruct('OriginalFilename', 'win-duo.exe'),
+         StringStruct('ProductName', 'win-duo'),
+         StringStruct('ProductVersion', '%(ver)s')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"""
+
+
+def write_version_file(path, ver):
+    """按 `paths.__version__` 生成 PyInstaller 版本资源文件, 返回路径。
+
+    版本号**只有一个来源** (`paths.__version__`, banner 打的也是它) —— 不在这
+    另设一份, 否则迟早对不上。
+
+    显式用 `newline="\\n"`: `Path.write_text(newline=...)` 是 3.10 才有的参数,
+    而本机 venv 是 3.9 (CI 是 3.11) —— 用它会在这台机器上直接 TypeError。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = _VERSION_FILE % {"tup": _version_tuple(ver), "ver": ver}
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    return path
+
+
 def build(onedir=False, clean=False, console=False, name=NAME):
     if clean:
         for d in (ROOT / "build", ROOT / "dist"):
@@ -91,6 +155,19 @@ def build(onedir=False, clean=False, console=False, name=NAME):
         # 注意: 不再打包 config.json。它是用户数据, 首次启动时由 main.DEFAULT_CFG
         # 在 exe 旁边现生成 (见 main.load_config / _seed_config_if_missing)。
     ]
+
+    # ---- 版本资源 ----
+    # 让 exe 的"属性 -> 详细信息"里显示真实版本, 而不是一片 0.0.0.0
+    # (以前就是空的 —— 收到一份日志时无从判断是哪个版本)。
+    # **必须在 --clean 之后生成**: clean 会把整个 build/ 删掉。
+    try:
+        import paths
+        _ver = paths.__version__
+    except Exception as exc:  # noqa: BLE001  版本号只是锦上添花, 不该挡住打包
+        _ver = "0.0.0"
+        print("[warn] 读不到 paths.__version__ (%s), exe 版本号留空" % exc)
+    _vpath = write_version_file(ROOT / "build" / "version_info.txt", _ver)
+    cmd += ["--version-file", str(_vpath)]
 
     for m in HIDDEN:
         cmd += ["--hidden-import", m]
@@ -120,6 +197,7 @@ def build(onedir=False, clean=False, console=False, name=NAME):
             if onedir else out.stat().st_size)
     print("\n" + "=" * 66)
     print("产物: %s" % out)
+    print("版本: %s (写进了 exe 属性, 也是 banner 打的那个)" % _ver)
     print("大小: %.1f MB" % (size / 1048576))
     print("=" * 66)
     print("""
@@ -130,7 +208,8 @@ def build(onedir=False, clean=False, console=False, name=NAME):
   3. 日志在 diagnostics\\debug\\log\\ 下, **每次启动一个文件**, 用启动时刻命名
      (如 2026-10-07-21-35-48.log), 历史日志不删除。
      last.log 始终指向最新一次运行, 看它就够了。
-     (或界面里「高级设置 -> 调试 -> 查看运行日志」)。
+     文件名模板和日志等级可以在界面里改:
+     「高级设置 -> 调试 -> 日志...」(等级改完立即生效, 文件名下次启动生效)。
   4. 关不掉时按 Ctrl+Alt+Shift+Esc (关玻璃层并退出)。
 """ % (name + ".exe"))
     return 0
