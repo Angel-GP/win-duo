@@ -1,4 +1,4 @@
-# setup_env.ps1 -- create the in-workspace venv and install win-duo dependencies.
+﻿# setup_env.ps1 -- create the in-workspace venv and install win-duo dependencies.
 #
 # ASCII only on purpose: Windows PowerShell 5.1 reads .ps1 as ANSI when there is
 # no BOM, so non-ASCII comments would be mangled.
