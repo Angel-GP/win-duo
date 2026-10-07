@@ -34,6 +34,15 @@ def is_frozen():
     return bool(getattr(sys, "frozen", False))
 
 
+#: 应用版本 —— **单一来源**, 发版时与 git tag 同步 (当前最新 tag 是 v1.3.3)。
+#:
+#: 为什么要有它: 打包出来的 exe 文件属性里版本号是空的 (0.0.0.0), 收到一份
+#: 运行日志时无从判断"这是哪个版本", 只能靠猜。banner 每次启动都把它打出来,
+#: 日志本身就带上了版本身份。放在 paths.py 是因为它是唯一没有内部依赖的模块,
+#: 谁都能 import 而不会绕出循环。
+__version__ = "1.3.3"
+
+
 def _exe_dir():
     """exe 所在目录 (打包后)。"""
     return Path(sys.executable).resolve().parent

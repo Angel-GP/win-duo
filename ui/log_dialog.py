@@ -1,4 +1,5 @@
 """日志查看与导出弹窗。"""
+import shutil
 import subprocess
 import sys
 import time
@@ -19,8 +20,16 @@ from .widgets import BodyLabel, PlainTextEdit, PrimaryPushButton, TransparentPus
 LOG_FILE = log_file("last.log")
 
 
-def get_all_logs() -> str:
-    """读日志文件内容。
+#: 日志窗最多读文件**末尾**这么多字节。
+#: 日志"不轮转、不删除", 一次长时间运行可以到几十 MB; 每次都整份读进内存、
+#: 再整段塞进 QPlainTextEdit, 会让 UI 线程卡住。日志是**只追加**的, 排查时看
+#: 的也永远是末尾 —— 读尾部就够, 完整文件留给"保存日志文件"和控制台 tail。
+#: 512KB 大约几千行, 在弹窗里翻已经是绰绰有余。
+TAIL_BYTES = 512 * 1024
+
+
+def get_all_logs(max_bytes=TAIL_BYTES) -> str:
+    """读日志文件内容 (超长时**只读末尾** max_bytes 字节)。
 
     日志是 main.py 把 stdout 重定向到日志文件写的, 所以**唯一**的来源
     就是那个文件 —— 原来还有一套 `_MEMORY_LOGS` 内存缓冲 + `record_log()`,
@@ -30,7 +39,21 @@ def get_all_logs() -> str:
     if not LOG_FILE.exists():
         return ""
     try:
-        return LOG_FILE.read_text(encoding="utf-8", errors="replace")
+        size = LOG_FILE.stat().st_size
+        with open(LOG_FILE, "rb") as fh:
+            if max_bytes is not None and size > max_bytes:
+                fh.seek(size - max_bytes)
+                # 起点可能落在半个 UTF-8 字符上 —— errors="replace" 兜住它,
+                # 再把第一个换行之前那半行 (被截断的) 整行丢掉, 免得日志窗
+                # 开头挂一行乱码残片。
+                text = fh.read().decode("utf-8", errors="replace")
+                nl = text.find("\n")
+                if nl >= 0:
+                    text = text[nl + 1:]
+                return ("... [只显示末尾 %d KB, 全文共 %d KB; "
+                        "完整日志请点「保存日志文件」]\n"
+                        % (max_bytes // 1024, size // 1024)) + text
+            return fh.read().decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -142,6 +165,8 @@ class LogDialog(QDialog):
         else:
             # 日志是只追加的, 顶部内容不变, 所以原来的滚动位置仍指向同一批行 ——
             # 恢复它, 用户就停在原地不被弹走。
+            # (唯一例外: 文件超过 TAIL_BYTES 后窗口会往前滑, 顶部内容确实变了,
+            #  这时行号会漂一点。宁可漂也不要每秒把翻历史的用户拽回底部。)
             sb.setValue(min(prev, sb.maximum()))
 
     def _open_console(self):
@@ -179,9 +204,11 @@ class LogDialog(QDialog):
             "日志文件 (*.log);;文本文件 (*.txt);;所有文件 (*)")
         if not target:
             return
-        content = self.text_edit.toPlainText()
+        # **存的是文件本身, 不是控件里的文本。** 日志窗为了不卡顿只加载末尾
+        # 一段 (见 TAIL_BYTES), 拿 toPlainText() 去存就会把用户要发出去排查的
+        # 日志**悄悄截断** —— 前面正好是启动、设备枚举、后端选择这些最要紧的
+        # 上下文。整份拷贝又快又不会漏。
         try:
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(content)
+            shutil.copyfile(LOG_FILE, target)
         except Exception as exc:  # noqa: BLE001
             wdlog.log.error("保存日志失败: %s" % exc, tag="log")

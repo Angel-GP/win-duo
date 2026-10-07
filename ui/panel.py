@@ -879,7 +879,7 @@ class SettingsPanel(QWidget):
         try:
             self.controller.set_source(target)
         except Exception as exc:  # noqa: BLE001
-            print("[ui] 切换角度源失败: %s" % exc)
+            wdlog.log.error("切换角度源失败: %s" % exc, tag="ui")
             return
         self.controller.save()
         # 切源后热键会重新注册 —— 刷新界面各处 (含本页快捷键文案)
@@ -1147,7 +1147,8 @@ class SettingsPanel(QWidget):
             pass
         if getattr(self, "btn_hinge", None) is not None:
             self.btn_hinge.set_flipped(new, animate=True)
-        print("[ui] 铰链方向 -> %s" % ("顶边 (反着用)" if new else "底边"))
+        wdlog.log.info("铰链方向 -> %s"
+                       % ("顶边 (反着用)" if new else "底边"), tag="ui")
 
     def _quick_calibrate(self):
         wdlog.log.debug("用户操作: 标定基准帧", tag="ui")

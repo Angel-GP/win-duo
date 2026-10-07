@@ -82,7 +82,7 @@ class AppController(QObject):
         try:
             self.capture.open_now(timeout=6.0)
         except Exception as exc:  # noqa: BLE001
-            print("[capture] 启动时等待后端打开超时: %s" % exc)
+            wdlog.log.warn("启动时等待后端打开超时: %s" % exc, tag="capture")
         self.overlay = None
         self.glass_on = False
         self._scan_was_running = False
@@ -278,7 +278,7 @@ class AppController(QObject):
             return True
         # 先校验名字合法 (免得建了线程才发现是拼错的)
         if backend not in ("auto", "wgc", "dxgi", "mss"):
-            print("[capture] 未知后端 %r" % backend)
+            wdlog.log.error("未知后端 %r" % backend, tag="capture")
             self.notified.emit("未知采集后端: %s" % backend)
             return False
 
@@ -300,12 +300,12 @@ class AppController(QObject):
                 self.overlay._last_drawn_seq = -1
                 self.overlay.apply_config()
             self.save()
-            print("[capture] 已切换后端 %s -> %s (实际在用 %s)"
-                  % (old_backend, backend, actual))
+            wdlog.log.info("已切换后端 %s -> %s (实际在用 %s)"
+                           % (old_backend, backend, actual), tag="capture")
             return True
         except Exception as exc:  # noqa: BLE001
-            print("[capture] 切换后端失败 (%s -> %s): %s"
-                  % (old_backend, backend, exc))
+            wdlog.log.error("切换后端失败 (%s -> %s): %s"
+                            % (old_backend, backend, exc), tag="capture")
             # **回滚**: 恢复旧配置, 并把旧后端的采集重新建起来 —— 否则
             # 用户点了一下失败的下拉项, 采集就彻底没了。
             self.cfg["capture_backend"] = old_backend
@@ -321,7 +321,7 @@ class AppController(QObject):
                     self.overlay.apply_config()
                 self.capture.open_now(timeout=6.0)
             except Exception as exc2:  # noqa: BLE001
-                print("[capture] 回滚也失败: %s" % exc2)
+                wdlog.log.error("回滚也失败: %s" % exc2, tag="capture")
             self.notified.emit("切换采集后端失败: %s" % exc)
             return False
 

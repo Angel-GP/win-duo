@@ -21,6 +21,7 @@ import ctypes
 import faulthandler
 import json
 import os
+import platform
 import shutil
 import sys
 import time
@@ -44,16 +45,35 @@ from pathlib import Path
 _RUN_START = time.time()
 
 
+#: 本次运行的日志路径 —— **只算一次**, 见 _run_log_path()。
+_RUN_LOG_PATH = None
+
+
 def _run_log_path():
     """本次运行的日志文件路径。
 
     **在启动时算一次就固定**: faulthandler 和 _TeeLogger 必须写同一个文件,
-    所以两边都从这里取, 不能各自 time.strftime 一次 (跨秒就会分成两个文件)。
+    所以两边都从这里取, 不能各自 time.strftime 一次 (跨秒就会分成两个文件);
+    也**不能各自探测一次"名字有没有被占"** —— `_enable_faulthandler()` 在模块级
+    先把文件建出来, 第二次探测就会以为撞名而另起一个文件, 崩溃栈和正文又分家了。
     局部 import paths: 本函数在模块级 `import paths` 之前就被调用。
     """
-    import paths as _p
-    stamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(_RUN_START))
-    return _p.log_file(stamp + ".log")
+    global _RUN_LOG_PATH
+    if _RUN_LOG_PATH is None:
+        import paths as _p
+        stamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(_RUN_START))
+        # **同一秒里起第二次要错开。** 文件名只精确到秒, 而 open_log 用的是
+        # "a" (追加): 崩溃后被守护进程/用户立刻重启, 第二次运行会**追加**到
+        # 第一次的文件里, last.log 也指向这个混合文件 —— 重启前后的因果就糊
+        # 在一起了, 而这恰恰是排查"反复重启"时最需要分清的东西。
+        # 撞名就往后加序号, 保证一次运行一个文件。
+        path = _p.log_file(stamp + ".log")
+        n = 2
+        while path.exists():
+            path = _p.log_file("%s-%d.log" % (stamp, n))
+            n += 1
+        _RUN_LOG_PATH = path
+    return _RUN_LOG_PATH
 
 
 def _last_log_path():
@@ -156,6 +176,10 @@ class _TeeLogger:
     _last_file = None
     _path = None
     _last_path = None
+    #: 日志文件当前是否处于"写不进去"的状态 —— 用来在**状态翻转时各喊一次**,
+    #: 既不静默丢失, 也不逐行刷屏 (见 write)。
+    _file_broken = False
+    _last_broken = False
 
     def __init__(self, primary):
         self.primary = primary
@@ -206,6 +230,10 @@ class _TeeLogger:
         cls._last_path = Path(last_path) if last_path is not None else None
         cls._file = None
         cls._last_file = None
+        # 换了文件就重新开始记"坏没坏", 否则上一次运行留下的 True 会让新文件
+        # 第一次真的写失败时一声不吭。
+        cls._file_broken = False
+        cls._last_broken = False
         if cls._path is not None:
             try:
                 cls._path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,6 +269,35 @@ class _TeeLogger:
         except Exception:  # noqa: BLE001
             cls._last_file = None
 
+    def _note_write(self, attr, what, exc):
+        """记录一次日志文件写失败/恢复 —— **状态翻转时才吭声**。
+
+        原来这里是裸 `except: pass`: 磁盘满、目录被杀软或同步盘锁住时, 日志会
+        无声无息地断在这里 —— 界面一切正常, 等真出问题去翻日志, 才发现后面
+        根本没有内容。既不能静默, 也不能每行都喊 (一秒钟几十行 = 刷屏),
+        所以只在**坏掉**和**恢复**这两个瞬间各写一次控制台。
+
+        只写控制台: 日志文件本身正是坏掉的那个, 写它没意义。
+        """
+        cls = type(self)
+        broken = getattr(cls, attr)
+        if exc is not None:
+            if broken:
+                return
+            setattr(cls, attr, True)
+            msg = "%s 写入失败, 后续内容只写控制台: %s" % (what, exc)
+        else:
+            if not broken:
+                return
+            setattr(cls, attr, False)
+            msg = "%s 写入已恢复" % what
+        if self.primary is not None:
+            try:
+                self.primary.write("[wdlog] " + msg + "\n")
+                self.primary.flush()
+            except Exception:  # noqa: BLE001  连控制台都没了就算了
+                pass
+
     def write(self, s):
         # 控制台 (primary) 收**原始文本** (含 ANSI 颜色); 日志文件收**剥掉
         # ANSI** 的纯文本 —— 两边受众不同。
@@ -260,15 +317,19 @@ class _TeeLogger:
         if f is not None:
             try:
                 f.write(clean)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self._note_write("_file_broken", "日志文件", exc)
+            else:
+                self._note_write("_file_broken", "日志文件", None)
         # 双写兜底路径 (硬链接可用时 _last_file 恒为 None, 这里是空转)
         lf = type(self)._last_file
         if lf is not None:
             try:
                 lf.write(clean)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                self._note_write("_last_broken", "last.log", exc)
+            else:
+                self._note_write("_last_broken", "last.log", None)
 
     def write_console_only(self, s):
         """**只写控制台, 不写日志文件。**
@@ -611,6 +672,26 @@ def print_banner(cfg, region):
     w = wdlog.log.info
     w("=" * 68, tag="banner")
     w("win-duo -- 折叠屏悬浮玻璃 (摄像头测角 + Duo 逆投影着色器)", tag="banner")
+    w("-" * 68, tag="banner")
+    # **版本 + 运行形态 + 环境。** 打包出来的 exe 文件属性里版本号是空的,
+    # 收到的日志若没有这一段, 就无从判断是哪一版、跑在什么环境上。而"源码
+    # 运行还是打包 exe"直接决定了很多行为: sys.stderr 存不存在、路径解析到
+    # 哪、Python 是系统装的还是随 exe 封进去的 —— 排查时这些都要先知道。
+    # 单独一个 try: 任何一项取不到 (裁剪过的环境) 也不能把 banner 打断。
+    try:
+        if _paths.is_frozen():
+            form = "打包 exe (%s)" % sys.executable
+            py = "%s (随 exe 封装)" % platform.python_version()
+        else:
+            form = "源码运行 (%s)" % _paths.data_dir()
+            py = platform.python_version()
+        w("  版本      : %s   %s" % (_paths.__version__, form), tag="banner")
+        w("  Python    : %s" % py, tag="banner")
+        w("  系统      : %s" % platform.platform(), tag="banner")
+        w("  日志      : %s" % _log_file_path, tag="banner")
+        w("  配置      : %s" % DEFAULT_CONFIG, tag="banner")
+    except Exception as exc:  # noqa: BLE001
+        w("  环境摘要  : 取不到 (%s)" % exc, tag="banner")
     w("-" * 68, tag="banner")
     w("  角度源    : %s" % cfg["source"], tag="banner")
     if cfg["source"] == "camera":
