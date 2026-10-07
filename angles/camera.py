@@ -515,25 +515,39 @@ VISIT_MIN_INLIERS = 14
 MAX_SAMPLES = 72
 
 # ═══════════════════════════════════════════════════════════════════
-# 负读数处理: 钳底 + 自动归零 (状态层, 不是输出层)
+# "越过完全展开基准"的读数处理: 钳底 + 自动归零 (状态层, 不是输出层)
 # ═══════════════════════════════════════════════════════════════════
 # ⚠️ **必须做在状态层 (这里), 做在输出层是空操作。**
-# `angle_to_level()` 里已经有 `clip(180 + sign*scale*pitch, 0, 180)`, 也就是说
-# pitch<0 本来就被压成和 0 完全一样的结果 —— 在它外面再 `max(0, ...)` 一次,
-# 逐点输出完全相同 (用 probe_clamp_sim.py 验过)。真正的问题是**负读数意味着
-# 基准标晚了**: 标定时上盖并不完全展开, 于是完全展开时读数为负、整个读数表
-# 朝负方向平移。只有把"负"这件事写回**参考基准**, 后面的累积才会跟着被拉正。
+# `angle_to_level()` 里已经有 `clip(180 + sign*scale*pitch, 0, 180)`, 也就是
+# 落在"无效侧"的读数本来就被压成和 0 完全一样的结果 —— 在它外面再钳一次,
+# 逐点输出完全相同。真正的问题是**基准标晚了**: 标定时上盖并不完全展开,
+# 于是完全展开时读数落在无效侧、整张读数表整体平移。只有把这件事写回
+# **参考基准**, 后面的累积才会跟着被拉正。
+#
+# ⚠️⚠️ **"无效侧"是 sign 相关的, 不是简单的"负角度"。**
+# 合盖方向 = 让 fold 变小 (浓度变大) 的方向。fold = 180 + sign*scale*pitch,
+# 所以合盖方向是"pitch 与 sign **反号**":
+#     camera_sign = -1 (默认)          -> 合盖使 pitch 变**正**;
+#                                         无效侧 = pitch < 0
+#     camera_sign = +1 (点「反转开合方向」) -> 合盖使 pitch 变**负**;
+#                                         无效侧 = pitch > 0
+# 也就是说 sign=+1 时**全部有效浓度都来自负角度** —— 按"负角度"去钳底会把
+# 这个功能整个废掉 (实测: 浓度恒 0, 动画完全不出现)。
+# 所以判据统一换算到"合盖为正"的坐标系:
+#     eff = -sign * pitch        (eff > 0 = 合盖方向 = 有效)
+# 无效侧就是 eff < 0, 两种 sign 共用同一套逻辑。
 #
 # 两道处理, 互补:
-#   1. **钳底** (立即生效): angle 不允许为负。代价是把"真的把上盖反着掰过去"
+#   1. **钳底** (立即生效): eff 不允许为负。代价是把"真的把上盖反着掰过去"
 #      也当成 0 —— 但那本来就是无意义姿态 (屏幕朝下), 当 0 是对的。
-#   2. **自动归零** (自愈): 连续多帧持续为负 -> 认定基准标晚了, 把**当前帧**
-#      重设为"完全展开"的新基准, 并把所有已记录的绝对角度一并平移。
+#   2. **自动归零** (自愈): 连续多帧 eff 持续为负 -> 认定基准标晚了, 把
+#      **当前帧**重设为"完全展开"的新基准, 并把所有已记录的绝对角度一并平移。
 #      比只钳底更彻底: 钳底后前若干度的合盖仍然没有反应 (死区), 自动归零
 #      把这段死区也消掉了。持续多帧才触发, 单帧噪声不会误判。
-#: 连续这么多帧读数为负才触发自动归零。
+#: 连续这么多帧落在无效侧才触发自动归零。
 AUTO_ZERO_CONFIRM = 10
-#: 负到这个程度 (度) 才计入。取比死区略大的值, 避免噪声在 0 附近来回触发。
+#: 越过无效侧这么多度 (绝对值) 才计入。取比死区略大的值, 避免噪声在 0 附近
+#: 来回触发。
 AUTO_ZERO_TRIGGER_DEG = 2.0
 
 
@@ -583,11 +597,15 @@ class OrbTracker:
         #: 按角度均匀采样的"回访点", 用于绝对校正
         self._samples = []
 
-        #: 连续负读数计数 + 是否启用自动归零 (见 AUTO_ZERO_* 的说明)。
+        #: 连续落在无效侧的帧数 + 是否启用自动归零 (见 AUTO_ZERO_* 的说明)。
         #: `auto_zero` 由上层按 config 传入; 关掉时只保留钳底。
         self._neg_streak = 0
         self.auto_zero = True
         self._auto_zero_count = 0
+        #: 角度符号 (config 的 camera_sign, ±1)。**决定哪一侧是"无效侧"** ——
+        #: 见 AUTO_ZERO_* 的说明。默认 -1 与内置默认配置一致; 上层构造后立刻
+        #: 用真实 config 覆盖。
+        self.sign = -1
         #: 画面稳定判据用: 上一帧的降采样灰度
         self._prev_small = None
 
@@ -847,42 +865,56 @@ class OrbTracker:
                 self._install_reference(prepared, kp, des, self.angle)
 
         self._maybe_sample(kp, des, self.angle)
-        self._settle_negative(self.angle, prepared, kp, des)
+        self._settle_beyond_open(self.angle, prepared, kp, des)
 
         if dt is None:
             dt = 1.0 / 30.0
         dt = float(np.clip(dt, 1e-3, 0.2))
         return self._oneuro.filter(self.angle, dt)
 
-    # ---------------- 负读数处理 (见 AUTO_ZERO_* 的说明) ----------------
-    def _settle_negative(self, raw_angle, prepared, kp, des):
-        """把负读数收敛到 0: 先钳底, 持续为负则自动归零 (重建展开基准)。
+    # ---------------- 越过展开基准的处理 (见 AUTO_ZERO_* 的说明) ----------------
+    def _settle_beyond_open(self, raw_angle, prepared, kp, des):
+        """把"越过完全展开基准"的读数收敛到 0: 先钳底, 持续越界则自动归零。
 
         **只在状态层做** —— 输出层 (`angle_to_level`) 的 clip 已经等价, 在那里
-        再钳一次是空操作 (见文件里 AUTO_ZERO_* 的说明与 probe_clamp_sim.py)。
+        再钳一次是空操作 (见文件里 AUTO_ZERO_* 的说明)。
+
+        ⚠️ **判据是"越过完全展开基准", 不是"负角度"。** 上盖不可能比"完全
+        展开"更开, 所以朝那个方向的读数一定是基准标晚了。但那个方向是哪一侧
+        **由 camera_sign 决定**:
+            sign = -1 -> 合盖使 pitch 变正 -> 越界侧是 pitch < 0
+            sign = +1 -> 合盖使 pitch 变负 -> 越界侧是 pitch > 0
+        (sign=+1 就是设置里的「反转开合方向」, 那时**全部有效浓度都来自负
+        角度** —— 按"负角度"钳底会把这个功能整个废掉。)
+        因此统一换算到"合盖为正"的坐标系:  eff = -sign * pitch,
+        越界侧恒为 eff < 0。
 
         `raw_angle` 是**钳底之前**的原始读数 (弧度)。判据必须用它: `self.angle`
-        在本函数里马上会被钳成 0, 拿它判断永远是"不为负", 自动归零永不触发。
+        在本函数里马上会被钳成 0, 拿它判断永远判不出越界, 自动归零永不触发。
 
         钳底会**顺带把 `_ref_base` 一起钳** —— 它记录"参考帧对应的绝对角度",
         是下一帧 `guess = _ref_base + step` 的起点。只钳 `self.angle` 而不钳它,
-        下一帧又会从负的起点算起, 钳底当场失效。
+        下一帧又会从越界的起点算起, 钳底当场失效。
         """
         raw = float(raw_angle)
-        if raw >= 0.0:
+        sign = -1 if self.sign < 0 else 1
+        # 换算到"合盖为正"的坐标系: eff > 0 = 正常的合盖方向 (有效)
+        eff = -sign * raw
+        if eff >= 0.0:
             self._neg_streak = 0
             return
 
-        # 1) 立即钳底 (连同参考基准的结算点)
+        # 1) 立即钳底 (连同参考基准的结算点)。钳到 0 在两种 sign 下都正确:
+        #    0 是"恰好完全展开", 不属于任何一侧。
         self.angle = 0.0
-        if self._ref_base < 0.0:
+        if -sign * self._ref_base < 0.0:
             self._ref_base = 0.0
 
-        # 2) 持续为负 -> 自动归零: 把**当前帧**重设为"完全展开"的新基准。
-        #    用原始读数判断, 且要求负得够明显 (躲开 0 附近的噪声)。
+        # 2) 持续越界 -> 自动归零: 把**当前帧**重设为"完全展开"的新基准。
+        #    用原始读数判断, 且要求越界得够明显 (躲开 0 附近的噪声)。
         if not self.auto_zero:
             return
-        if np.degrees(raw) >= -AUTO_ZERO_TRIGGER_DEG:
+        if np.degrees(eff) >= -AUTO_ZERO_TRIGGER_DEG:
             return
         self._neg_streak += 1
         if self._neg_streak < AUTO_ZERO_CONFIRM:
@@ -890,7 +922,8 @@ class OrbTracker:
         self._neg_streak = 0
         self._auto_zero_count += 1
         # 坐标平移量: 旧坐标系里"当前姿态"读作 raw。新坐标系里它必须读作 0,
-        # 所以把所有旧的绝对角度统一减去 raw (raw 为负 -> 整体上移)。
+        # 所以把所有旧的绝对角度统一减去 raw。**与 sign 无关** —— 平移的目标
+        # 就是"让当前姿态读作 0", 这一件事在两种符号约定下都成立。
         shift = -raw
         # 已记录的采样点存的是"绝对角度 + 该角度的描述子"。基准一挪, 旧角度
         # 全部作废 —— **必须一起平移**, 否则回访校正会把读数拽回错误的旧坐标系。
@@ -901,8 +934,9 @@ class OrbTracker:
         self.angle = 0.0
         self._ref_base = 0.0
         self._oneuro.reset()
-        wdlog.log.info("检测到持续负读数, 已自动归零基准 (第 %d 次)"
-                       % self._auto_zero_count, tag="camera")
+        wdlog.log.info("检测到读数越过完全展开基准 (camera_sign=%+d), "
+                       "已自动归零基准 (第 %d 次)"
+                       % (sign, self._auto_zero_count), tag="camera")
 
     # ---------------- 调试 ----------------
     def draw_matches(self, cur_gray=None):
@@ -944,9 +978,12 @@ class CameraAngleSource(AngleSource):
         self.deadzone = CAMERA_DEADZONE
         # 自动标定由用户在设置里控制 (autocal_on_glass_open); 源码常量只是默认。
         self.autocal = bool(cfg.get("autocal_on_glass_open", CAMERA_AUTOCAL))
-        # 负读数自动归零 (见 AUTO_ZERO_* 的说明)。默认开 —— 它只修"基准标晚
-        # 了"这种情况, 用户想完全手动控制基准时可以关掉。
-        self.auto_zero = bool(cfg.get("auto_zero_on_negative", True))
+        # 越界自动归零 (见 AUTO_ZERO_* 的说明)。默认开 —— 它只修"基准标晚了"
+        # 这种情况, 用户想完全手动控制基准时可以关掉。
+        # 键名是 auto_zero_beyond_open; 兼容刚引入时用过的旧名
+        # auto_zero_on_negative (那名字在 camera_sign=+1 下是错的)。
+        self.auto_zero = bool(cfg.get("auto_zero_beyond_open",
+                                      cfg.get("auto_zero_on_negative", True)))
         self.target_fps = CAMERA_FPS
         self.min_cutoff = CAMERA_MIN_CUTOFF
         self.beta = CAMERA_BETA
@@ -1108,7 +1145,20 @@ class CameraAngleSource(AngleSource):
         return self.scale
 
     def flip_sign(self):
+        """反转开合方向 (camera_sign ±1) —— 设置窗口的「反转开合方向」。
+
+        ⚠️ **必须同步给正在跑的 tracker**: "哪一侧是无效侧"由 sign 决定 (见
+        `_settle_beyond_open` 的说明)。只改 self.sign 而不改 tracker 的话,
+        反转之后自动归零仍按**旧符号**判断, 会把刚变成有效的那一侧继续钳死 ——
+        表现就是"点了反转方向后动画没了"。
+        """
         self.sign = -self.sign
+        if self._tracker is not None:
+            self._tracker.sign = self.sign
+            # 反转后"哪一侧越界"立刻变了, 之前累计的越界计数必须清零 ——
+            # 否则它可能带着**旧符号**下攒的计数在新符号下凑满阈值, 触发一次
+            # 莫名其妙的自动归零 (把当前姿态当成"完全展开"), 把基准弄歪。
+            self._tracker._neg_streak = 0
         return self.sign
 
     def pop_debug(self):
@@ -1139,6 +1189,10 @@ class CameraAngleSource(AngleSource):
                 threads=self.threads, axis=self.axis)
             # 负读数自动归零由 config 控制 (见 AUTO_ZERO_* 的说明)
             self._tracker.auto_zero = self.auto_zero
+            # **必须把 sign 交给 tracker**: "哪一侧是无效侧"由它决定 ——
+            # camera_sign=+1 (「反转开合方向」) 时全部有效浓度都来自负角度,
+            # 不告诉 tracker 就会把该功能钳死。见 _settle_beyond_open 的说明。
+            self._tracker.sign = self.sign
         except Exception as exc:  # noqa: BLE001
             self._open_error = str(exc)
             with self._lock:
