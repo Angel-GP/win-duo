@@ -1012,6 +1012,17 @@ class AppController(QObject):
                 cam.scale = float(self.cfg.get("camera_scale", cam.scale))
             except Exception:  # noqa: BLE001
                 pass
+            # 置信度门控同理: 它也缓存在 tracker 实例上。兜底用 cam 自己的当前值
+            # (而不是再写一遍字面默认值) —— 缺键时保持原样, 不会意外改变行为。
+            try:
+                cam.apply_confidence(
+                    self.cfg.get("camera_min_inliers", cam.min_inliers),
+                    self.cfg.get("camera_min_inlier_ratio",
+                                 cam.min_inlier_ratio),
+                    self.cfg.get("camera_max_residual_deg",
+                                 cam.max_residual_deg))
+            except Exception:  # noqa: BLE001
+                pass
         if self.overlay is None:
             return
         self.overlay.apply_config()

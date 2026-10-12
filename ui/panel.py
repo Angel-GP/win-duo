@@ -321,6 +321,8 @@ class SettingsPanel(QWidget):
         root.addWidget(self._build_source_card())
         root.addWidget(self._build_advanced_card())
         root.addWidget(self._build_status())
+        # 置信度行放在状态行**下面** —— 也就是窗口里最靠下的元素。
+        root.addWidget(self._build_conf())
         # **末尾留伸缩**: 否则窗口变高时, 多出来的空间会全塞给"最后那个控件"
         # —— 也就是底部状态行, 把它从一行高 (17px) 拉到 60+px, 白占一大块。
         # 加了 stretch 之后多余空间落到底部空白, 状态行只占它需要的一行。
@@ -565,6 +567,43 @@ class SettingsPanel(QWidget):
         self.lbl_capture_state.setObjectName("hint")
         l3.addWidget(self.lbl_capture_state)
 
+        # ── 识别置信度 (摄像头测角门控) ──────────────────────────────
+        # 一帧画面要先通过这几道门, 测出来的角度才被采信; 通不过就丢弃该帧
+        # (保持上一读数)。用途: **场景一变 (光照渐变/有人走过) 玻璃层自己动**。
+        # 语义见 angles/camera.py 里 MIN_INLIER_RATIO / MAX_RESIDUAL_DEG 的说明。
+        #
+        # ⚠️ **不要 import angles.camera 取默认常量**: 它顶层 import cv2, 而
+        # opencv 的 DLL 有 ~116MB —— 面板一构造就会把它拉进来, 而"不走摄像头
+        # 路径的进程不该加载 opencv"是明确优化过的 (见 angles/hub.py 的懒导入
+        # 说明)。这里直接从 cfg 取; `load_config` 会用 DEFAULT_CFG 补齐缺的键,
+        # 所以正常运行时一定存在, 兜底值只是给"手工拼一个 cfg"的场合 (测试) 用。
+        l3.addWidget(StrongBodyLabel("识别置信度"))
+        self.num_inliers = NumberField(0, 500, 0, "个", show_range=False)
+        self.num_inliers.setValue(
+            int(self.cfg.get("camera_min_inliers", 10)), emit=False)
+        self.num_inliers.changed.connect(self._on_confidence)
+        l3.addWidget(self._labeled("最少内点", self.num_inliers))
+
+        # 内点率用**百分比**填 (0~100): 让用户填 "0.15" 太别扭, 还容易和 15% 搞混。
+        self.num_inl_ratio = NumberField(0, 100, 0, "%", show_range=False)
+        self.num_inl_ratio.setValue(
+            int(round(float(self.cfg.get("camera_min_inlier_ratio", 0.5))
+                      * 100.0)), emit=False)
+        self.num_inl_ratio.changed.connect(self._on_confidence)
+        l3.addWidget(self._labeled("内点率下限", self.num_inl_ratio))
+
+        self.num_resid = NumberField(0, 20, 2, "°", show_range=False)
+        self.num_resid.setValue(
+            float(self.cfg.get("camera_max_residual_deg", 1.0)), emit=False)
+        self.num_resid.changed.connect(self._on_confidence)
+        l3.addWidget(self._labeled("残差上限", self.num_resid))
+
+        self.lbl_conf_hint = CaptionLabel("")
+        self.lbl_conf_hint.setObjectName("hint")
+        self._auto_height_label(self.lbl_conf_hint)
+        l3.addWidget(self.lbl_conf_hint)
+        self._refresh_conf_hint()
+
         # ── 键盘模式 (调试功能) ──────────────────────────────────────
         # **键盘模式的快捷键本质就是调试功能**: 它只在"键盘手动"角度源下
         # 才注册, 用来在没有摄像头/陀螺仪时手动拉浓度、开调试窗。所以整块
@@ -605,6 +644,20 @@ class SettingsPanel(QWidget):
                                       QSizePolicy.Policy.Fixed)
         self.lbl_status.setObjectName("hint")
         return self.lbl_status
+
+    def _build_conf(self):
+        """主窗**最下方**那行: 实时识别置信度。
+
+        为什么单独一行而不是塞进状态行: 状态行已经有源名/状态/pitch/匹配/后端/
+        浓度, 再往里加就会被 elide 掉 —— 而置信度恰恰是判断"玻璃层为什么自己动"
+        时最需要看的数字。单独一行也便于一眼扫到。
+        """
+        self.lbl_conf = CaptionLabel("")
+        self.lbl_conf.setWordWrap(False)
+        self.lbl_conf.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                    QSizePolicy.Policy.Fixed)
+        self.lbl_conf.setObjectName("hint")
+        return self.lbl_conf
 
     # ================================================================ 小工具
     #: 标签列的固定宽度 (像素)。
@@ -984,6 +1037,9 @@ class SettingsPanel(QWidget):
         fm = self.lbl_status.fontMetrics()
         avail = max(80, self.lbl_status.width() or (self.width() - 36))
         self.lbl_status.setText(fm.elidedText(text, Qt.TextElideMode.ElideRight, avail))
+        # 主窗**最下方**那行: 实时识别置信度 (内点/内点率/残差 + 丢弃原因)。
+        # 放在状态行之后, 所以它就是窗口里最靠下的元素。
+        self._refresh_conf(detail)
         # 这几行原本是 _refresh_glass() 的重复实现, 且 _loading 没用 try/finally
         # —— 中间任一句抛异常, _loading 就永久卡在 True, 之后所有用户交互都被
         # `if self._loading: return` 静默吞掉, 界面像死了。这里改成: 复用
@@ -994,6 +1050,78 @@ class SettingsPanel(QWidget):
             self._refresh_refresh_max()
         finally:
             self._loading = False
+
+    def _refresh_conf(self, detail):
+        """主窗最下方那行: 采信/丢弃 + 内点 / 内点率 / 残差 (+ 丢弃原因)。
+
+        只对**摄像头**角度源有意义 (串口/键盘没有特征匹配这回事), 别的源显示一行
+        说明 —— 而不是留着上一次摄像头的数字误导人。
+
+        ⚠️ **顺序是有意的: 状态放最前。** 这行会被 elide (主窗默认只有 470px 宽),
+        所以最要紧的"这一帧到底采信没有"必须排在前面 —— 放后面就会被截掉。
+        同理去掉了"置信度"这个前缀 (这行本身就是置信度) 和没测到时的残差占位。
+        """
+        if getattr(self, "lbl_conf", None) is None:
+            return
+        if not detail or "inliers" not in detail:
+            self.lbl_conf.setText("——  当前角度源不是摄像头测角, 无匹配置信度")
+            return
+        n_inl = int(detail.get("inliers", 0))
+        n_match = int(detail.get("matches", 0))
+        ratio = float(detail.get("inlier_ratio", 0.0)) * 100.0
+        resid = float(detail.get("resid_deg", float("inf")))
+        ok = bool(detail.get("conf_ok"))
+        bits = ["采信" if ok else "丢弃",
+                "内点 %d/%d" % (n_inl, n_match),
+                "%.0f%%" % ratio]
+        # 残差未知 = 在更早的门就被挡下了, 这时不占位置显示 "—"
+        if resid != float("inf"):
+            bits.append("残差 %.2f°" % resid)
+        why = detail.get("conf_why") or ""
+        if why and not ok:
+            bits.append(why)
+        text = "  ·  ".join(bits)
+        fm = self.lbl_conf.fontMetrics()
+        avail = max(80, self.lbl_conf.width() or (self.width() - 36))
+        self.lbl_conf.setText(
+            fm.elidedText(text, Qt.TextElideMode.ElideRight, avail))
+
+    # ---------------------------------------------------------- 识别置信度
+    def _on_confidence(self, *_a):
+        """置信度门控改了 -> 写回 cfg、**立即推给正在跑的 tracker**、并落盘。
+
+        不用重启: `controller.apply_effect_settings()` 会把这三个值同步到
+        CameraAngleSource (和「灵敏度」走同一条通道, 见那里的说明)。
+        """
+        if self._loading:
+            return
+        self.cfg["camera_min_inliers"] = int(self.num_inliers.value())
+        # 界面填的是百分比, config 里存 0~1 的比值
+        self.cfg["camera_min_inlier_ratio"] = (
+            float(self.num_inl_ratio.value()) / 100.0)
+        self.cfg["camera_max_residual_deg"] = float(self.num_resid.value())
+        wdlog.log.debug(
+            "用户操作: 识别置信度 -> 内点>=%d, 内点率>=%.0f%%, 残差<=%.2f°"
+            % (self.cfg["camera_min_inliers"],
+               self.cfg["camera_min_inlier_ratio"] * 100.0,
+               self.cfg["camera_max_residual_deg"]), tag="ui")
+        self.controller.apply_effect_settings()
+        self.controller.save()
+        self._refresh_conf_hint()
+
+    def _refresh_conf_hint(self):
+        """把当前门控策略说清楚 —— 尤其是"两项都设 0 会退回旧行为"。"""
+        mi = int(self.num_inliers.value())
+        mr = float(self.num_inl_ratio.value())
+        rd = float(self.num_resid.value())
+        bits = ["内点 >= %d 个" % mi,
+                ("内点率 >= %.0f%%" % mr) if mr > 0 else "内点率 不限",
+                ("残差 <= %.2f°" % rd) if rd > 0 else "残差 不限"]
+        tail = ""
+        if mr <= 0 and rd <= 0:
+            tail = "\n两项额外门控都关了 —— 退回旧行为 (只看内点绝对数)"
+        self.lbl_conf_hint.setText("不达标就丢弃该帧: " + ", ".join(bits) + tail)
+        self._fit_adv_page()
 
     # ================================================================ 交互
     def _fit_height(self):

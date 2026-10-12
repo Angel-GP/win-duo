@@ -498,8 +498,33 @@ def angle_about_axis(R, axis):
 
 #: 一帧里至少要有这么多对匹配才敢用它算角度。
 MIN_INLIERS = 10
+#: **内点率下限**: 内点数 / 匹配数。0 = 不检查。
+#:
+#: 只看内点的**绝对数**是不够的: 场景一变 (光照渐变、有人走过、背景换了个样子),
+#: ORB 照样能匹配到一大堆点 —— 背景相似处、光照相近的纹理 —— 但它们在几何上
+#: 并不一致。500 对匹配里只有 12 对真一致, 内点数 12 ≥ MIN_INLIERS 就被采信了,
+#: 算出来的"旋转"纯属噪声, 于是玻璃层自己动。
+#: 加上比例判据就能把这类帧挡掉: 真·纯旋转下绝大多数匹配都该是一致的。
+#:
+#: 默认 0.5 的依据 —— 本机真实摄像头实测 362 帧静止场景:
+#:   内点率 最小 0.955 / 中位 0.997 / 最大 1.000   (< 0.5 的帧: 0/362)
+#: 也就是说正常场景有 ~2 倍余量, 而场景一变会明显掉下来。
+#: **丢帧是良性的** (参考帧立刻换成当前帧, 下一帧重新锚定), 误采信才是要防的
+#: —— 所以这个不对称允许把门槛收得比"灾难级"紧。
+MIN_INLIER_RATIO = 0.5
+#: **内点中位角误差上限 (度)**。0 = 不检查。
+#:
+#: `solve_rotation` 本来就会返回内点的中位角误差 (最能反映"这次估得准不准"),
+#: 但以前算完就扔了 (`R2, _ = ...`)。
+#:
+#: 默认 1.0 的依据 —— 同一批实测: 残差 最小 0.0012 / 中位 0.013 / 最大 0.416 度
+#: (> 0.5 度的帧: 0/362)。取 1.0 留了 ~2.4 倍余量; 取 0.5 就只有 1.2 倍, 太贴。
+MAX_RESIDUAL_DEG = 1.0
 #: 单帧增量超过这个值 (弧度) 视为误匹配, 丢弃并重建参考帧。~17 度。
 #: 真实开合每帧不会跳这么多, 跳了就是匹配错了。
+#:
+#: ⚠️ 它只挡**单帧大跳**, 挡不住"每帧偏 3~5 度"的**渐进漂移** —— 而场景渐变
+#: 产生的正是后者。渐进漂移要靠上面的内点率/残差门控挡 (见它们的说明)。
 MAX_STEP_RAD = 0.30
 #: 参考帧重建阈值 (弧度): 相对参考帧转了这么多就把参考帧换成当前帧。~9 度。
 #: 太小 -> 频繁重建, 累积误差大; 太大 -> 画面重叠不够, 匹配失败。
@@ -513,6 +538,20 @@ VISIT_WINDOW_RAD = 0.52
 VISIT_MIN_INLIERS = 14
 #: 最多保留多少个采样点 (防止长时间运行后无限增长)。
 MAX_SAMPLES = 72
+
+
+def _fmt_resid(resid):
+    """残差格式化 —— 未知时显示 `?`, 不要显示 `inf`。
+
+    `_measure` 在还没走到"解出旋转"那一步时用 `float("inf")` 表示"残差未知"
+    (匹配失败/内点不够/内点率不够), 直接打进日志会很难看。
+    """
+    try:
+        if resid == float("inf"):
+            return "?"
+        return "%.2f°" % float(resid)
+    except (TypeError, ValueError):
+        return "?"
 
 # ═══════════════════════════════════════════════════════════════════
 # "越过完全展开基准"的读数处理: 钳底 + 自动归零 (状态层, 不是输出层)
@@ -561,7 +600,9 @@ class OrbTracker:
     def __init__(self, camera_index=0, nfeatures=1200, ratio=0.75,
                  with_camera=True, min_cutoff=1.0, beta=0.05, d_cutoff=1.0,
                  backend="auto", threads=DEFAULT_OPENCV_THREADS,
-                 axis=(1.0, 0.0, 0.0)):
+                 axis=(1.0, 0.0, 0.0), min_inliers=MIN_INLIERS,
+                 min_inlier_ratio=MIN_INLIER_RATIO,
+                 max_residual_deg=MAX_RESIDUAL_DEG):
         self.cap = None
         self.backend_name = None
         if with_camera:
@@ -574,6 +615,16 @@ class OrbTracker:
         self.orb = cv2.ORB_create(nfeatures=nfeatures)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self.ratio = ratio
+        # ---- 置信度门控 (见 MIN_INLIER_RATIO / MAX_RESIDUAL_DEG 的说明) ----
+        #: 内点**绝对数**下限
+        self.min_inliers = int(min_inliers)
+        #: 内点**率**下限 (内点/匹配)。<= 0 表示不检查
+        self.min_inlier_ratio = float(min_inlier_ratio)
+        #: 内点中位角误差上限 (度)。<= 0 表示不检查
+        self.max_residual_deg = float(max_residual_deg)
+        #: 最近一帧的置信度指标, 给界面显示用:
+        #: `{"matches", "inliers", "ratio", "resid_deg", "ok", "why"}`
+        self.last_conf = {}
         # CLAHE: 局部对比度归一化, 抗自动曝光漂移 (开灯/关灯后画面亮度变了,
         # 但纹理结构没变, 归一化后特征点还能匹配上)
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -687,14 +738,39 @@ class OrbTracker:
                 good.append(p[0])
         return good, good
 
+    def _conf(self, matches, inliers, ratio, resid, ok, why):
+        """记下这一帧的置信度指标 (给界面显示用, 见 `last_conf`)。"""
+        self.last_conf = {
+            "matches": int(matches),
+            "inliers": int(inliers),
+            "ratio": float(ratio),
+            "resid_deg": float(resid),
+            "ok": bool(ok),
+            "why": why,
+        }
+
     def _measure(self, ref_des, ref_kp, des, kp, min_inliers):
         """量出"当前帧相对参考帧"的旋转角。
 
-        返回 (角度 或 None, 内点数, 匹配列表, 当前帧用到的点, 参考帧用到的点)。
+        返回 `(角度 或 None, 内点数, 匹配列表, 当前帧的点, 参考帧的点,
+        内点率, 内点中位残差(度))`。
+
+        角度为 None 时, **原因**会写进 `self.last_conf["why"]` —— 界面上要能
+        区分"场景太差所以丢了这帧"和"阈值设太严所以丢了这帧", 否则用户只看到
+        数字不动, 完全无从判断该往哪边调。
+
+        三道门控, 按代价从低到高:
+          1. 匹配数 < MIN_INLIERS        —— 点都不够, 直接放弃
+          2. 内点数 < min_inliers        —— RANSAC 找不到一致子集
+          3. 内点率 < min_inlier_ratio   —— **场景变动主要靠这道挡**
+          4. 残差 > max_residual_deg     —— 拟合勉强成立, 不该采信
         """
         good, _ = self._good_matches(ref_des, des)
-        if len(good) < MIN_INLIERS:
-            return None, len(good), good, None, None
+        n_good = len(good)
+        if n_good < MIN_INLIERS:
+            self._conf(n_good, 0, 0.0, float("inf"), False,
+                       "匹配点太少 (%d)" % n_good)
+            return None, n_good, good, None, None, 0.0, float("inf")
 
         a_px = np.float32([ref_kp[m.queryIdx].pt for m in good])
         b_px = np.float32([kp[m.trainIdx].pt for m in good])
@@ -705,16 +781,36 @@ class OrbTracker:
         # RANSAC: 随机取 4 对求 R, 数内点。纯旋转模型下内点判据是
         # "把这个方向转过去, 和目标的夹角够小"。
         R, inl = self._ransac_rotation(a, b)
-        if R is None or inl.sum() < min_inliers:
-            n = int(inl.sum()) if inl is not None else 0
-            return None, n, good, a_px, b_px
+        n_inl = int(inl.sum()) if inl is not None else 0
+        ratio = (n_inl / float(n_good)) if n_good else 0.0
+        if R is None or n_inl < min_inliers:
+            self._conf(n_good, n_inl, ratio, float("inf"), False,
+                       "内点太少 (%d < %d)" % (n_inl, min_inliers))
+            return None, n_inl, good, a_px, b_px, ratio, float("inf")
 
-        # 用内点重解一次 (最小二乘意义上的最优)
-        R2, _ = solve_rotation(a[inl], b[inl])
+        # **内点率门控**: 匹配很多但几何一致的很少 = 场景变了, 不是盖子动了。
+        if self.min_inlier_ratio > 0 and ratio < self.min_inlier_ratio:
+            self._conf(n_good, n_inl, ratio, float("inf"), False,
+                       "内点率太低 (%.0f%% < %.0f%%)"
+                       % (ratio * 100.0, self.min_inlier_ratio * 100.0))
+            return None, n_inl, good, a_px, b_px, ratio, float("inf")
+
+        # 用内点重解一次 (最小二乘意义上的最优), 顺手拿到中位残差
+        R2, resid = solve_rotation(a[inl], b[inl])
         if R2 is None:
-            return None, int(inl.sum()), good, a_px, b_px
-        return (angle_about_axis(R2, self.axis), int(inl.sum()),
-                good, a_px, b_px)
+            self._conf(n_good, n_inl, ratio, float("inf"), False, "解旋转失败")
+            return None, n_inl, good, a_px, b_px, ratio, float("inf")
+
+        # **残差门控**: 内点中位角误差贴着 RANSAC 阈值 = 拟合只是勉强成立。
+        if self.max_residual_deg > 0 and resid > self.max_residual_deg:
+            self._conf(n_good, n_inl, ratio, resid, False,
+                       "残差太大 (%.2f° > %.2f°)"
+                       % (resid, self.max_residual_deg))
+            return None, n_inl, good, a_px, b_px, ratio, resid
+
+        self._conf(n_good, n_inl, ratio, resid, True, "")
+        return (angle_about_axis(R2, self.axis), n_inl,
+                good, a_px, b_px, ratio, resid)
 
     def _ransac_rotation(self, a, b, thresh_deg=2.5, iters=64, seed=None):
         """纯旋转的 RANSAC。返回 (最优 R, 内点布尔数组)。
@@ -777,8 +873,8 @@ class OrbTracker:
 
         best_angle, best_inl = None, -1
         for s in near[:2]:
-            d, inl, _, _, _ = self._measure(s["des"], s["kp"], des, kp,
-                                            VISIT_MIN_INLIERS)
+            d, inl, _, _, _, _, _ = self._measure(s["des"], s["kp"], des, kp,
+                                                  VISIT_MIN_INLIERS)
             if d is not None and inl > best_inl:
                 best_inl, best_angle = inl, s["angle"] + d
         if best_angle is None or best_inl < VISIT_MIN_INLIERS:
@@ -809,15 +905,18 @@ class OrbTracker:
         """返回滤波后的绝对俯仰角 (弧度); 这帧无法估计时返回 None。"""
         self.last_good = []
         if not self.has_reference:
+            self._conf(0, 0, 0.0, float("inf"), False, "等待标定")
             return None
 
         prepared = self._prepare(gray)
         kp, des = self.orb.detectAndCompute(prepared, None)
         if des is None or len(kp) < 10:
+            self._conf(0, 0, 0.0, float("inf"), False,
+                       "画面特征太少 (%d)" % (0 if des is None else len(kp)))
             return None
 
-        step, inliers, good, a_px, b_px = self._measure(
-            self._ref_des, self._ref_kp, des, kp, MIN_INLIERS)
+        step, inliers, good, a_px, b_px, ratio, resid = self._measure(
+            self._ref_des, self._ref_kp, des, kp, self.min_inliers)
 
         self.last_good = good
         self.dbg_ref_gray = self._ref_gray
@@ -827,17 +926,25 @@ class OrbTracker:
         self.dbg_matches = good
 
         if step is None:
-            # 匹配失败: 画面可能已经转太远, 把参考帧换到当前帧让下一帧能跟上。
+            # 匹配失败 / 置信度不足 (原因见 last_conf["why"]): 画面可能已经转太远,
+            # 或者场景本身变了 —— 两种都把参考帧换到当前帧让下一帧能跟上。
             # **不结算角度** —— 没有可信增量, 硬加会引入漂移。
-            wdlog.log.debug("匹配不足 (%d good), 重建参考帧 @ %.1f°"
-                            % (inliers, np.degrees(self.angle)), tag="camera.cv")
+            wdlog.log.debug("丢弃该帧: %s (匹配 %d, 内点 %d = %.0f%%, 残差 %s) @ %.1f°"
+                            % (self.last_conf.get("why", "匹配不足"),
+                               self.last_conf.get("matches", 0), inliers,
+                               ratio * 100.0, _fmt_resid(resid),
+                               np.degrees(self.angle)),
+                            tag="camera.cv")
             self._install_reference(prepared, kp, des, self.angle)
             return None
         if abs(step) > MAX_STEP_RAD:
             # 单帧跳太多 = 匹配错了。同样重建参考帧, 不采信这个增量。
-            wdlog.log.debug("单帧跳变 %.1f° (> %.0f°), 丢弃增量并重建参考帧"
-                            % (np.degrees(abs(step)), np.degrees(MAX_STEP_RAD)),
-                            tag="camera.cv")
+            # (渐进漂移不归这里管, 归 _measure 的内点率/残差门控。)
+            self.last_conf["ok"] = False
+            self.last_conf["why"] = ("单帧跳变 %.1f° (> %.0f°)"
+                                     % (np.degrees(abs(step)),
+                                        np.degrees(MAX_STEP_RAD)))
+            wdlog.log.debug("丢弃该帧: %s" % self.last_conf["why"], tag="camera.cv")
             self._install_reference(prepared, kp, des, self.angle)
             return None
 
@@ -972,6 +1079,16 @@ class CameraAngleSource(AngleSource):
         if self.backend not in BACKEND_CHOICES:
             wdlog.log.warn("未知 camera_backend=%r, 回退到 auto" % (self.backend,), tag="camera")
             self.backend = "auto"
+        # ── 置信度门控 ────────────────────────────────────────────────
+        # **这三个进 config.json**: 它们是"信不信这一帧"的判据, 而不同场景
+        # (背景纹理多少、光照稳不稳、有没有人走来走去) 需要的松紧程度差别很大。
+        # 用户遇到"场景一变玻璃层就动"时必须能自己调 —— 入口在设置窗口的
+        # 调试页 (见 MIN_INLIER_RATIO / MAX_RESIDUAL_DEG 的说明)。
+        self.min_inliers = int(cfg.get("camera_min_inliers", MIN_INLIERS))
+        self.min_inlier_ratio = float(cfg.get("camera_min_inlier_ratio",
+                                              MIN_INLIER_RATIO))
+        self.max_residual_deg = float(cfg.get("camera_max_residual_deg",
+                                              MAX_RESIDUAL_DEG))
         # 下面这些是算法/滤波微调, 普通用户几乎不动 —— 写死为源码常量,
         # 不再进 config.json (见本文件顶部的 CAMERA_* 常量)。
         self.nfeatures = CAMERA_NFEATURES
@@ -1166,6 +1283,29 @@ class CameraAngleSource(AngleSource):
         with self._lock:
             return self._dbg_img, self._dbg_seq
 
+    def apply_confidence(self, min_inliers=None, min_inlier_ratio=None,
+                         max_residual_deg=None):
+        """把置信度门控参数推给**正在跑的** tracker (改完即时生效, 不用重启)。
+
+        为什么要主动推: tracker 在构造时把这三个缓存成了实例属性 (见
+        `OrbTracker.__init__`), 光改 cfg 不会生效 —— 和 `scale` 是同一个道理
+        (见 `controller.apply_effect_settings`)。
+
+        None 表示"这一项不动"。只写三个 int/float, 在 CPython 下是原子的,
+        不必和采集线程抢锁。
+        """
+        if min_inliers is not None:
+            self.min_inliers = int(min_inliers)
+        if min_inlier_ratio is not None:
+            self.min_inlier_ratio = float(min_inlier_ratio)
+        if max_residual_deg is not None:
+            self.max_residual_deg = float(max_residual_deg)
+        t = self._tracker
+        if t is not None:
+            t.min_inliers = self.min_inliers
+            t.min_inlier_ratio = self.min_inlier_ratio
+            t.max_residual_deg = self.max_residual_deg
+
     # ---------- 对外读数 ----------
     def level(self):
         with self._lock:
@@ -1186,7 +1326,10 @@ class CameraAngleSource(AngleSource):
                 self.index, self.nfeatures,
                 min_cutoff=self.min_cutoff, beta=self.beta,
                 d_cutoff=self.d_cutoff, backend=self.backend,
-                threads=self.threads, axis=self.axis)
+                threads=self.threads, axis=self.axis,
+                min_inliers=self.min_inliers,
+                min_inlier_ratio=self.min_inlier_ratio,
+                max_residual_deg=self.max_residual_deg)
             # 负读数自动归零由 config 控制 (见 AUTO_ZERO_* 的说明)
             self._tracker.auto_zero = self.auto_zero
             # **必须把 sign 交给 tracker**: "哪一侧是无效侧"由它决定 ——
@@ -1273,6 +1416,7 @@ class CameraAngleSource(AngleSource):
                 pitch_rad = tracker.estimate(gray, dt)
 
                 with self._lock:
+                    conf = dict(tracker.last_conf or {})
                     if pitch_rad is not None:
                         self._pitch_deg = float(np.degrees(pitch_rad))
                         lvl, fold = angle_to_level(
@@ -1288,8 +1432,12 @@ class CameraAngleSource(AngleSource):
                         # 而且它**每帧都被重新赋值**, 配合状态行刷新会在日志里
                         # 反复出现。改成明确的阶段名: 相机已就绪、等一次标定。
                         self._matches = len(tracker.last_good)
-                        self._status = ("预备启动(等待标定)" if not tracker.has_reference
-                                        else "匹配不足")
+                        # **丢弃原因直接当状态。** 以前一律写"匹配不足", 但被
+                        # 内点率/残差门控丢掉的帧匹配数其实很多, 那句话是错的 ——
+                        # 而"到底为什么丢"正是用户调阈值时唯一需要的信息。
+                        self._status = ("预备启动(等待标定)"
+                                        if not tracker.has_reference
+                                        else (conf.get("why") or "匹配不足"))
                     self.detail = {
                         "pitch": self._pitch_deg,
                         "fold": self._fold_angle,
@@ -1297,6 +1445,12 @@ class CameraAngleSource(AngleSource):
                         "scale": self.scale,
                         "sign": self.sign,
                         "backend": tracker.backend_name,
+                        # ── 置信度 (界面最下方那行显示的就是这些) ──────
+                        "inliers": int(conf.get("inliers", 0)),
+                        "inlier_ratio": float(conf.get("ratio", 0.0)),
+                        "resid_deg": float(conf.get("resid_deg", float("inf"))),
+                        "conf_ok": bool(conf.get("ok", False)),
+                        "conf_why": conf.get("why", ""),
                     }
 
                 # 调试画面在采集线程里生成, 显示交给主线程 (避免跨线程调 cv2)
