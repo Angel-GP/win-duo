@@ -20,6 +20,7 @@ from PyQt6.QtGui import QColor, QPainter, QPen, QTransform
 from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QPushButton,
                              QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
+import confidence
 import wdlog
 from angles.hub import LABELS
 
@@ -568,35 +569,25 @@ class SettingsPanel(QWidget):
         l3.addWidget(self.lbl_capture_state)
 
         # ── 识别置信度 (摄像头测角门控) ──────────────────────────────
-        # 一帧画面要先通过这几道门, 测出来的角度才被采信; 通不过就丢弃该帧
+        # 一帧画面要先通过门控, 测出来的角度才被采信; 通不过就丢弃该帧
         # (保持上一读数)。用途: **场景一变 (光照渐变/有人走过) 玻璃层自己动**。
-        # 语义见 angles/camera.py 里 MIN_INLIER_RATIO / MAX_RESIDUAL_DEG 的说明。
+        #
+        # **只给一个 0~100 的档位** —— 它同时决定两道门 (内点率 / 残差) 的松紧。
+        # 收成一个的理由与完整映射见 confidence.py 的文件头; 下面的提示会实时
+        # 显示"这一档等于什么", 所以简化不会让人不知道它在干什么。
         #
         # ⚠️ **不要 import angles.camera 取默认常量**: 它顶层 import cv2, 而
         # opencv 的 DLL 有 ~116MB —— 面板一构造就会把它拉进来, 而"不走摄像头
         # 路径的进程不该加载 opencv"是明确优化过的 (见 angles/hub.py 的懒导入
-        # 说明)。这里直接从 cfg 取; `load_config` 会用 DEFAULT_CFG 补齐缺的键,
-        # 所以正常运行时一定存在, 兜底值只是给"手工拼一个 cfg"的场合 (测试) 用。
+        # 说明)。confidence.py 是纯计算模块, 没有这个负担。
         l3.addWidget(StrongBodyLabel("识别置信度"))
-        self.num_inliers = NumberField(0, 500, 0, "个", show_range=False)
-        self.num_inliers.setValue(
-            int(self.cfg.get("camera_min_inliers", 10)), emit=False)
-        self.num_inliers.changed.connect(self._on_confidence)
-        l3.addWidget(self._labeled("最少内点", self.num_inliers))
-
-        # 内点率用**百分比**填 (0~100): 让用户填 "0.15" 太别扭, 还容易和 15% 搞混。
-        self.num_inl_ratio = NumberField(0, 100, 0, "%", show_range=False)
-        self.num_inl_ratio.setValue(
-            int(round(float(self.cfg.get("camera_min_inlier_ratio", 0.5))
-                      * 100.0)), emit=False)
-        self.num_inl_ratio.changed.connect(self._on_confidence)
-        l3.addWidget(self._labeled("内点率下限", self.num_inl_ratio))
-
-        self.num_resid = NumberField(0, 20, 2, "°", show_range=False)
-        self.num_resid.setValue(
-            float(self.cfg.get("camera_max_residual_deg", 1.0)), emit=False)
-        self.num_resid.changed.connect(self._on_confidence)
-        l3.addWidget(self._labeled("残差上限", self.num_resid))
+        self.num_conf = NumberField(confidence.MIN_LEVEL, confidence.MAX_LEVEL,
+                                    0, "", show_range=False)
+        self.num_conf.setValue(
+            confidence.as_level(self.cfg.get("camera_confidence",
+                                             confidence.DEFAULT)), emit=False)
+        self.num_conf.changed.connect(self._on_confidence)
+        l3.addWidget(self._labeled("置信度", self.num_conf))
 
         self.lbl_conf_hint = CaptionLabel("")
         self.lbl_conf_hint.setObjectName("hint")
@@ -1088,39 +1079,28 @@ class SettingsPanel(QWidget):
 
     # ---------------------------------------------------------- 识别置信度
     def _on_confidence(self, *_a):
-        """置信度门控改了 -> 写回 cfg、**立即推给正在跑的 tracker**、并落盘。
+        """置信度档位改了 -> 写回 cfg、**立即推给正在跑的 tracker**、并落盘。
 
-        不用重启: `controller.apply_effect_settings()` 会把这三个值同步到
+        不用重启: `controller.apply_effect_settings()` 会把档位同步到
         CameraAngleSource (和「灵敏度」走同一条通道, 见那里的说明)。
         """
         if self._loading:
             return
-        self.cfg["camera_min_inliers"] = int(self.num_inliers.value())
-        # 界面填的是百分比, config 里存 0~1 的比值
-        self.cfg["camera_min_inlier_ratio"] = (
-            float(self.num_inl_ratio.value()) / 100.0)
-        self.cfg["camera_max_residual_deg"] = float(self.num_resid.value())
-        wdlog.log.debug(
-            "用户操作: 识别置信度 -> 内点>=%d, 内点率>=%.0f%%, 残差<=%.2f°"
-            % (self.cfg["camera_min_inliers"],
-               self.cfg["camera_min_inlier_ratio"] * 100.0,
-               self.cfg["camera_max_residual_deg"]), tag="ui")
+        lvl = confidence.as_level(self.num_conf.value())
+        self.cfg["camera_confidence"] = lvl
+        wdlog.log.debug("用户操作: 识别置信度 -> %d 档 (%s)"
+                        % (lvl, confidence.describe(lvl)), tag="ui")
         self.controller.apply_effect_settings()
         self.controller.save()
         self._refresh_conf_hint()
 
     def _refresh_conf_hint(self):
-        """把当前门控策略说清楚 —— 尤其是"两项都设 0 会退回旧行为"。"""
-        mi = int(self.num_inliers.value())
-        mr = float(self.num_inl_ratio.value())
-        rd = float(self.num_resid.value())
-        bits = ["内点 >= %d 个" % mi,
-                ("内点率 >= %.0f%%" % mr) if mr > 0 else "内点率 不限",
-                ("残差 <= %.2f°" % rd) if rd > 0 else "残差 不限"]
-        tail = ""
-        if mr <= 0 and rd <= 0:
-            tail = "\n两项额外门控都关了 —— 退回旧行为 (只看内点绝对数)"
-        self.lbl_conf_hint.setText("不达标就丢弃该帧: " + ", ".join(bits) + tail)
+        """实时显示**这一档等于什么** —— 收成一个值的前提是它仍然透明。"""
+        lvl = confidence.as_level(self.num_conf.value())
+        self.lbl_conf_hint.setText(
+            "不达标就丢弃该帧: %s\n"
+            "0 = 关闭门控（退回旧行为）; 调太高会让合盖动作跟不上。"
+            % confidence.describe(lvl))
         self._fit_adv_page()
 
     # ================================================================ 交互

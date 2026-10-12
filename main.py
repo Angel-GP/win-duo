@@ -264,6 +264,7 @@ if sys.platform == "win32":
     os.environ.setdefault("QT_QPA_PLATFORM", "windows:dpiawareness=2")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import confidence        # noqa: E402  识别置信度档位 -> 门控阈值的映射
 import logkeep           # noqa: E402  日志保留策略 (启动时清理旧日志)
 import paths as _paths   # noqa: E402  (必须在 sys.path 设置之后)
 import sysinfo           # noqa: E402  机器配置摘要 (给 banner 用)
@@ -602,27 +603,17 @@ DEFAULT_CFG = {
     "camera_scale": 1.1,
     "camera_sign": -1,
     # ── 识别置信度门控 (入口: 设置窗口 -> 高级设置 -> 调试) ──────────
-    # 一帧画面要先通过这几道门, 测出来的角度才被采信; 通不过就**丢弃该帧**
-    # (保持上一读数, 并把参考帧换到当前帧)。语义见 angles/camera.py 里
-    # MIN_INLIER_RATIO / MAX_RESIDUAL_DEG 的说明。
+    # 一帧画面要先通过门控, 测出来的角度才被采信; 通不过就**丢弃该帧**
+    # (保持上一读数, 并把参考帧换到当前帧)。
     #
-    # 为什么需要它们: 场景一变 (光照渐变、有人走过、背景换样子), ORB 照样能
+    # **一个 0~100 的档位**同时决定两道门的松紧 —— 档位越高越严, 0 = 关闭
+    # (退回旧行为, 只看内点绝对数)。完整映射、默认值 50 的实测依据、以及
+    # "为什么收成一个"都在 confidence.py 的文件头。
+    #
+    # 为什么要这道门: 场景一变 (光照渐变、有人走过、背景换样子), ORB 照样能
     # 匹配到一大堆点, 但几何上并不一致 —— 只看内点的**绝对数**会把这些帧当成
     # 有效帧, 算出来的"旋转"纯属噪声, 表现就是"玻璃层自己动"。
-    #
-    # camera_min_inliers: 内点**绝对数**下限。
-    # camera_min_inlier_ratio: 内点**率**下限 (内点/匹配)。0 = 不检查。
-    # camera_max_residual_deg: 内点中位角误差上限 (度)。0 = 不检查。
-    # 调严 -> 更稳但合盖动作可能跟不上; 调松 -> 跟手但容易误动。
-    # **两个额外门控都设成 0 就退回到旧行为** (只看内点绝对数)。
-    #
-    # 默认值 0.5 / 1.0 的依据: 本机真实摄像头实测 362 帧静止场景, 内点率
-    # 最小 0.955、残差最大 0.416 度 —— 留了约 2 倍余量。**丢帧是良性的**
-    # (参考帧立刻换成当前帧, 下一帧重新锚定), 误采信才是要防的, 所以收得
-    # 比"灾难级"紧。若玻璃层出现"跟不上/卡住", 把这两项调小或设 0 即可。
-    "camera_min_inliers": 10,
-    "camera_min_inlier_ratio": 0.5,
-    "camera_max_residual_deg": 1.0,
+    "camera_confidence": confidence.DEFAULT,
     "port": "COM3",
     "baud": 115200,
     # 重截频率 (截屏上限, 帧/秒)。**-1 = 不设限 (默认)** —— 自动按"当前选中

@@ -69,6 +69,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import confidence
 import wdlog
 from .base import AngleSource
 
@@ -497,29 +498,16 @@ def angle_about_axis(R, axis):
 # ═══════════════════════════════════════════════════════════════════
 
 #: 一帧里至少要有这么多对匹配才敢用它算角度。
+#: ⚠️ 名字是历史遗留: 它实际卡的是**匹配数**, 不是内点数 (见 _measure 的第一道)。
+#: 内点数另有 min_inliers (由置信度档位决定, 见 confidence.py)。
 MIN_INLIERS = 10
-#: **内点率下限**: 内点数 / 匹配数。0 = 不检查。
+#: **内点率下限** / **内点中位角误差上限 (度)**: 0 = 不检查。
 #:
-#: 只看内点的**绝对数**是不够的: 场景一变 (光照渐变、有人走过、背景换了个样子),
-#: ORB 照样能匹配到一大堆点 —— 背景相似处、光照相近的纹理 —— 但它们在几何上
-#: 并不一致。500 对匹配里只有 12 对真一致, 内点数 12 ≥ MIN_INLIERS 就被采信了,
-#: 算出来的"旋转"纯属噪声, 于是玻璃层自己动。
-#: 加上比例判据就能把这类帧挡掉: 真·纯旋转下绝大多数匹配都该是一致的。
-#:
-#: 默认 0.5 的依据 —— 本机真实摄像头实测 362 帧静止场景:
-#:   内点率 最小 0.955 / 中位 0.997 / 最大 1.000   (< 0.5 的帧: 0/362)
-#: 也就是说正常场景有 ~2 倍余量, 而场景一变会明显掉下来。
-#: **丢帧是良性的** (参考帧立刻换成当前帧, 下一帧重新锚定), 误采信才是要防的
-#: —— 所以这个不对称允许把门槛收得比"灾难级"紧。
-MIN_INLIER_RATIO = 0.5
-#: **内点中位角误差上限 (度)**。0 = 不检查。
-#:
-#: `solve_rotation` 本来就会返回内点的中位角误差 (最能反映"这次估得准不准"),
-#: 但以前算完就扔了 (`R2, _ = ...`)。
-#:
-#: 默认 1.0 的依据 —— 同一批实测: 残差 最小 0.0012 / 中位 0.013 / 最大 0.416 度
-#: (> 0.5 度的帧: 0/362)。取 1.0 留了 ~2.4 倍余量; 取 0.5 就只有 1.2 倍, 太贴。
-MAX_RESIDUAL_DEG = 1.0
+#: 这两道门控的松紧由**一个 0~100 的置信度档位**统一决定 —— 映射、默认值的
+#: 实测依据、以及"为什么收成一个"都在 confidence.py 的文件头。这里只是取
+#: **默认档位 (50)** 对应的那一组, 供"调用方没显式传参"时当默认值。
+#: 用户入口是 config 里的 `camera_confidence`。
+MIN_INLIER_RATIO, MAX_RESIDUAL_DEG = confidence.to_gates(confidence.DEFAULT)
 #: 单帧增量超过这个值 (弧度) 视为误匹配, 丢弃并重建参考帧。~17 度。
 #: 真实开合每帧不会跳这么多, 跳了就是匹配错了。
 #:
@@ -1079,16 +1067,18 @@ class CameraAngleSource(AngleSource):
         if self.backend not in BACKEND_CHOICES:
             wdlog.log.warn("未知 camera_backend=%r, 回退到 auto" % (self.backend,), tag="camera")
             self.backend = "auto"
-        # ── 置信度门控 ────────────────────────────────────────────────
-        # **这三个进 config.json**: 它们是"信不信这一帧"的判据, 而不同场景
-        # (背景纹理多少、光照稳不稳、有没有人走来走去) 需要的松紧程度差别很大。
-        # 用户遇到"场景一变玻璃层就动"时必须能自己调 —— 入口在设置窗口的
-        # 调试页 (见 MIN_INLIER_RATIO / MAX_RESIDUAL_DEG 的说明)。
-        self.min_inliers = int(cfg.get("camera_min_inliers", MIN_INLIERS))
-        self.min_inlier_ratio = float(cfg.get("camera_min_inlier_ratio",
-                                              MIN_INLIER_RATIO))
-        self.max_residual_deg = float(cfg.get("camera_max_residual_deg",
-                                              MAX_RESIDUAL_DEG))
+        # ── 识别置信度门控 ────────────────────────────────────────────
+        # **一个 0~100 的档位**决定两道门的松紧 (映射与实测依据见 confidence.py)。
+        # 为什么收成一个: 内点率与残差是同一套匹配流程里逐层筛出来的量, 一起松
+        # 一起紧 —— 让用户同时调三个数字, 等于把一件"整体松紧"的事拆成三件,
+        # 调了一个不知道另外两个要不要跟着动。
+        self.confidence = confidence.as_level(
+            cfg.get("camera_confidence", confidence.DEFAULT))
+        self.min_inlier_ratio, self.max_residual_deg = confidence.to_gates(
+            self.confidence)
+        # 内点**绝对数**下限仍走源码常量: 它是最粗的一道 (画面太暗/太糊/纹理太少),
+        # 与"整体松紧"不是一回事, 不值得再占一个用户旋钮。
+        self.min_inliers = MIN_INLIERS
         # 下面这些是算法/滤波微调, 普通用户几乎不动 —— 写死为源码常量,
         # 不再进 config.json (见本文件顶部的 CAMERA_* 常量)。
         self.nfeatures = CAMERA_NFEATURES
@@ -1283,26 +1273,20 @@ class CameraAngleSource(AngleSource):
         with self._lock:
             return self._dbg_img, self._dbg_seq
 
-    def apply_confidence(self, min_inliers=None, min_inlier_ratio=None,
-                         max_residual_deg=None):
-        """把置信度门控参数推给**正在跑的** tracker (改完即时生效, 不用重启)。
+    def apply_confidence(self, level):
+        """把**置信度档位**推给正在跑的 tracker (改完即时生效, 不用重启)。
 
-        为什么要主动推: tracker 在构造时把这三个缓存成了实例属性 (见
+        为什么要主动推: tracker 在构造时把阈值缓存成了实例属性 (见
         `OrbTracker.__init__`), 光改 cfg 不会生效 —— 和 `scale` 是同一个道理
         (见 `controller.apply_effect_settings`)。
 
-        None 表示"这一项不动"。只写三个 int/float, 在 CPython 下是原子的,
-        不必和采集线程抢锁。
+        只写几个 float, 在 CPython 下是原子的, 不必和采集线程抢锁。
         """
-        if min_inliers is not None:
-            self.min_inliers = int(min_inliers)
-        if min_inlier_ratio is not None:
-            self.min_inlier_ratio = float(min_inlier_ratio)
-        if max_residual_deg is not None:
-            self.max_residual_deg = float(max_residual_deg)
+        self.confidence = confidence.as_level(level, self.confidence)
+        self.min_inlier_ratio, self.max_residual_deg = confidence.to_gates(
+            self.confidence)
         t = self._tracker
         if t is not None:
-            t.min_inliers = self.min_inliers
             t.min_inlier_ratio = self.min_inlier_ratio
             t.max_residual_deg = self.max_residual_deg
 
