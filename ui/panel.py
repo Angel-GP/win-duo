@@ -322,8 +322,6 @@ class SettingsPanel(QWidget):
         root.addWidget(self._build_source_card())
         root.addWidget(self._build_advanced_card())
         root.addWidget(self._build_status())
-        # 置信度行放在状态行**下面** —— 也就是窗口里最靠下的元素。
-        root.addWidget(self._build_conf())
         # **末尾留伸缩**: 否则窗口变高时, 多出来的空间会全塞给"最后那个控件"
         # —— 也就是底部状态行, 把它从一行高 (17px) 拉到 60+px, 白占一大块。
         # 加了 stretch 之后多余空间落到底部空白, 状态行只占它需要的一行。
@@ -527,31 +525,52 @@ class SettingsPanel(QWidget):
         # 显示对应设置 (摄像头选择 / 串口), 比藏在高级设置里直观得多。
         self.stack_adv.addWidget(p2)
 
-        # 页面 3: 调试 (匹配调试窗、查看日志)
+        # 页面 3: 调试
+        # **按主题分组**, 每组一个小标题。以前是"匹配窗 / 日志 / 低内存 /
+        # 采集后端 / 置信度"平铺下来, 顺序像是随手加的, 找一样东西得逐行扫。
         p3 = QWidget()
         l3 = QVBoxLayout(p3)
         l3.setContentsMargins(0, 4, 0, 0)
         l3.setSpacing(10)
 
+        # ── 摄像头测角 ───────────────────────────────────────────────
+        l3.addWidget(StrongBodyLabel("摄像头测角"))
+
+        # 一帧画面要先通过门控, 测出来的角度才被采信; 通不过就丢弃该帧
+        # (保持上一读数)。用途: **场景一变 (光照渐变/有人走过) 玻璃层自己动**。
+        #
+        # **只给一个 0~100 的档位** —— 它同时决定两道门 (内点率 / 残差) 的松紧。
+        # 收成一个的理由、完整映射、以及默认值的实测依据都在 confidence.py。
+        #
+        # ⚠️ **不要 import angles.camera 取默认常量**: 它顶层 import cv2, 而
+        # opencv 的 DLL 有 ~116MB —— 面板一构造就会把它拉进来, 而"不走摄像头
+        # 路径的进程不该加载 opencv"是明确优化过的 (见 angles/hub.py 的懒导入
+        # 说明)。confidence.py 是纯计算模块, 没有这个负担。
+        self.num_conf = NumberField(confidence.MIN_LEVEL, confidence.MAX_LEVEL,
+                                    0, "", show_range=False)
+        self.num_conf.setValue(
+            confidence.as_level(self.cfg.get("camera_confidence",
+                                             confidence.DEFAULT)), emit=False)
+        self.num_conf.changed.connect(self._on_confidence)
+        l3.addWidget(self._labeled("置信度", self.num_conf))
+
+        # **实时采信值**: 这一帧到底采信没有、内点率与残差各是多少。
+        # 放在档位**正下方**而不是主窗最下方 —— 它和档位是同一件事的两面
+        # (一个用来调、一个用来看), 摆在一起才能对着数字调。
+        # 单行 + 不换行: 否则文字长短一变, 弹窗高度跟着跳。
+        self.lbl_conf = CaptionLabel("")
+        self.lbl_conf.setWordWrap(False)
+        self.lbl_conf.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                    QSizePolicy.Policy.Fixed)
+        self.lbl_conf.setObjectName("hint")
+        l3.addWidget(self._labeled("当前", self.lbl_conf))
+
         self.btn_debug = TransparentPushButton("打开匹配调试窗")
         self.btn_debug.clicked.connect(self._quick_debug)
-        # 「日志...」是**二级弹窗**的入口: 等级 / 文件名模板 / 查看 / 保存 都收在
-        # 里面那一层。原来是直接开"查看运行日志"窗 —— 现在点开的是设置层, 从那里
-        # 再进查看窗 (见 LogSettingsDialog)。
-        self.btn_log = PrimaryPushButton("日志...")
-        self.btn_log.clicked.connect(self._open_log_settings_clicked)
-        l3.addWidget(self._labeled("特征匹配", self.btn_debug))
-        l3.addWidget(self._labeled("日志", self.btn_log))
+        l3.addWidget(self._labeled("匹配调试", self.btn_debug))
 
-        # 低内存模式: 玻璃层不可见够久就把 GL 窗口销毁, 把显存/交换链还回去。
-        # 用 _labeled 和其它项一样左对齐标签 (label_w 和其它行一致, 否则这一行
-        # 的"低内存模式"会比上面的"特征匹配/运行日志"更靠左, 看起来是错的)。
-        self.sw_lowmem = SwitchButton()
-        self.sw_lowmem.setOnText("开")
-        self.sw_lowmem.setOffText("关")
-        l3.addWidget(self._labeled("低内存模式", self.sw_lowmem))
-
-        # ── 采集后端 ─────────────────────────────────────────────────
+        # ── 桌面采集 ─────────────────────────────────────────────────
+        l3.addWidget(StrongBodyLabel("桌面采集"))
         # 三种抓屏方式性能差很多 (实测: wgc ~0.5ms/帧 < dxgi ~1.1ms <<
         # mss ~27ms), 所以默认 auto 让系统挑最优; 想强制某个后端 (排查问题时
         # 对比行为) 就在这里选。**改完立即生效**, 不用重启。
@@ -568,32 +587,21 @@ class SettingsPanel(QWidget):
         self.lbl_capture_state.setObjectName("hint")
         l3.addWidget(self.lbl_capture_state)
 
-        # ── 识别置信度 (摄像头测角门控) ──────────────────────────────
-        # 一帧画面要先通过门控, 测出来的角度才被采信; 通不过就丢弃该帧
-        # (保持上一读数)。用途: **场景一变 (光照渐变/有人走过) 玻璃层自己动**。
-        #
-        # **只给一个 0~100 的档位** —— 它同时决定两道门 (内点率 / 残差) 的松紧。
-        # 收成一个的理由与完整映射见 confidence.py 的文件头; 下面的提示会实时
-        # 显示"这一档等于什么", 所以简化不会让人不知道它在干什么。
-        #
-        # ⚠️ **不要 import angles.camera 取默认常量**: 它顶层 import cv2, 而
-        # opencv 的 DLL 有 ~116MB —— 面板一构造就会把它拉进来, 而"不走摄像头
-        # 路径的进程不该加载 opencv"是明确优化过的 (见 angles/hub.py 的懒导入
-        # 说明)。confidence.py 是纯计算模块, 没有这个负担。
-        l3.addWidget(StrongBodyLabel("识别置信度"))
-        self.num_conf = NumberField(confidence.MIN_LEVEL, confidence.MAX_LEVEL,
-                                    0, "", show_range=False)
-        self.num_conf.setValue(
-            confidence.as_level(self.cfg.get("camera_confidence",
-                                             confidence.DEFAULT)), emit=False)
-        self.num_conf.changed.connect(self._on_confidence)
-        l3.addWidget(self._labeled("置信度", self.num_conf))
+        # ── 日志 ─────────────────────────────────────────────────────
+        l3.addWidget(StrongBodyLabel("日志"))
+        # 「日志...」是**二级弹窗**的入口: 等级 / 文件名模板 / 保留策略 / 查看 /
+        # 保存 都收在里面那一层 (见 LogSettingsDialog)。
+        self.btn_log = PrimaryPushButton("日志...")
+        self.btn_log.clicked.connect(self._open_log_settings_clicked)
+        l3.addWidget(self._labeled("设置", self.btn_log))
 
-        self.lbl_conf_hint = CaptionLabel("")
-        self.lbl_conf_hint.setObjectName("hint")
-        self._auto_height_label(self.lbl_conf_hint)
-        l3.addWidget(self.lbl_conf_hint)
-        self._refresh_conf_hint()
+        # ── 其他 ─────────────────────────────────────────────────────
+        l3.addWidget(StrongBodyLabel("其他"))
+        # 低内存模式: 玻璃层不可见够久就把 GL 窗口销毁, 把显存/交换链还回去。
+        self.sw_lowmem = SwitchButton()
+        self.sw_lowmem.setOnText("开")
+        self.sw_lowmem.setOffText("关")
+        l3.addWidget(self._labeled("低内存模式", self.sw_lowmem))
 
         # ── 键盘模式 (调试功能) ──────────────────────────────────────
         # **键盘模式的快捷键本质就是调试功能**: 它只在"键盘手动"角度源下
@@ -635,20 +643,6 @@ class SettingsPanel(QWidget):
                                       QSizePolicy.Policy.Fixed)
         self.lbl_status.setObjectName("hint")
         return self.lbl_status
-
-    def _build_conf(self):
-        """主窗**最下方**那行: 实时识别置信度。
-
-        为什么单独一行而不是塞进状态行: 状态行已经有源名/状态/pitch/匹配/后端/
-        浓度, 再往里加就会被 elide 掉 —— 而置信度恰恰是判断"玻璃层为什么自己动"
-        时最需要看的数字。单独一行也便于一眼扫到。
-        """
-        self.lbl_conf = CaptionLabel("")
-        self.lbl_conf.setWordWrap(False)
-        self.lbl_conf.setSizePolicy(QSizePolicy.Policy.Preferred,
-                                    QSizePolicy.Policy.Fixed)
-        self.lbl_conf.setObjectName("hint")
-        return self.lbl_conf
 
     # ================================================================ 小工具
     #: 标签列的固定宽度 (像素)。
@@ -1043,14 +1037,14 @@ class SettingsPanel(QWidget):
             self._loading = False
 
     def _refresh_conf(self, detail):
-        """主窗最下方那行: 采信/丢弃 + 内点 / 内点率 / 残差 (+ 丢弃原因)。
+        """调试页「当前」那行: 采信/丢弃 + 内点 / 内点率 / 残差 (+ 丢弃原因)。
 
         只对**摄像头**角度源有意义 (串口/键盘没有特征匹配这回事), 别的源显示一行
         说明 —— 而不是留着上一次摄像头的数字误导人。
 
-        ⚠️ **顺序是有意的: 状态放最前。** 这行会被 elide (主窗默认只有 470px 宽),
-        所以最要紧的"这一帧到底采信没有"必须排在前面 —— 放后面就会被截掉。
-        同理去掉了"置信度"这个前缀 (这行本身就是置信度) 和没测到时的残差占位。
+        ⚠️ **顺序是有意的: 状态放最前。** 这行会被 elide, 所以最要紧的"这一帧
+        到底采信没有"必须排在前面 —— 放后面就会被截掉。同理去掉了"置信度"这个
+        前缀 (这行本身就是置信度) 和没测到时的残差占位。
         """
         if getattr(self, "lbl_conf", None) is None:
             return
@@ -1073,9 +1067,14 @@ class SettingsPanel(QWidget):
             bits.append(why)
         text = "  ·  ".join(bits)
         fm = self.lbl_conf.fontMetrics()
-        avail = max(80, self.lbl_conf.width() or (self.width() - 36))
+        # 这行现在在**高级设置弹窗**里, 不在主窗 —— 宽度要按弹窗估, 用主窗宽度
+        # 会算出一个不存在的可用宽度 (标签还没布局出来时尤其明显)。
+        w = self.lbl_conf.width()
+        if not w:
+            d = getattr(self, "_adv_dialog", None)
+            w = (d.width() if d is not None else self.width()) - 36
         self.lbl_conf.setText(
-            fm.elidedText(text, Qt.TextElideMode.ElideRight, avail))
+            fm.elidedText(text, Qt.TextElideMode.ElideRight, max(80, w)))
 
     # ---------------------------------------------------------- 识别置信度
     def _on_confidence(self, *_a):
@@ -1092,16 +1091,6 @@ class SettingsPanel(QWidget):
                         % (lvl, confidence.describe(lvl)), tag="ui")
         self.controller.apply_effect_settings()
         self.controller.save()
-        self._refresh_conf_hint()
-
-    def _refresh_conf_hint(self):
-        """实时显示**这一档等于什么** —— 收成一个值的前提是它仍然透明。"""
-        lvl = confidence.as_level(self.num_conf.value())
-        self.lbl_conf_hint.setText(
-            "不达标就丢弃该帧: %s\n"
-            "0 = 关闭门控（退回旧行为）; 调太高会让合盖动作跟不上。"
-            % confidence.describe(lvl))
-        self._fit_adv_page()
 
     # ================================================================ 交互
     def _fit_height(self):
